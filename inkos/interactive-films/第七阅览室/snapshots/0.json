@@ -1,0 +1,330 @@
+{
+  "schemaVersion": 1,
+  "projectId": "第七阅览室",
+  "title": "第七阅览室",
+  "characters": [],
+  "variables": [
+    {
+      "name": "trust_level",
+      "type": "counter",
+      "default": 0,
+      "desc": "对超自然档案的信任度，0-3"
+    },
+    {
+      "name": "has_key",
+      "type": "flag",
+      "default": 0,
+      "desc": "是否拿到第七阅览室钥匙"
+    },
+    {
+      "name": "rain_memory",
+      "type": "flag",
+      "default": 0,
+      "desc": "是否触发过雨夜回忆"
+    },
+    {
+      "name": "door_state",
+      "type": "counter",
+      "default": 0,
+      "desc": "门状态：0=未开，1=已开"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "start",
+      "title": "雨夜值班",
+      "type": "start",
+      "sceneDesc": "城市老档案馆，深夜11时，窗外大雨滂沱。值班室灯光昏黄，一张旧木桌，台灯，翻到一半的登记簿。我低头整理文件，手碰到一本落满灰的旧借阅卡。",
+      "dialogue": [
+        {
+          "speaker": "我",
+          "text": "这种卡不是早就淘汰了吗……怎么还在这？",
+          "emotion": "neutral"
+        }
+      ],
+      "choices": [
+        {
+          "id": "choice1A",
+          "text": "仔细查看借阅卡",
+          "targetNodeId": "examine_card",
+          "effects": [
+            {
+              "var": "trust_level",
+              "op": "add",
+              "value": 1
+            }
+          ]
+        },
+        {
+          "id": "choice1B",
+          "text": "放回原位，继续值班",
+          "targetNodeId": "ignore_card",
+          "effects": []
+        }
+      ],
+      "act": ""
+    },
+    {
+      "id": "examine_card",
+      "title": "查看卡片",
+      "type": "branch",
+      "sceneDesc": "我凑近台灯，眯眼看着卡片背面手写字迹：'第七阅览室不存于任何记录。找到它的人，请记住——那扇门永远为你敞开。' 正在思索时，走廊深处传来沉闷声响。",
+      "dialogue": [
+        {
+          "speaker": "我",
+          "text": "第七阅览室？我在四楼工作了一年，从来没听过这个阅览室。",
+          "emotion": "curious"
+        },
+        {
+          "speaker": "旁白",
+          "text": "雨声渐大，灯光忽明忽暗。走廊那头传来书架倒下的动静。",
+          "emotion": "neutral"
+        }
+      ],
+      "choices": [
+        {
+          "id": "choice2A",
+          "text": "独自走向声响来源",
+          "targetNodeId": "investigate_sound",
+          "effects": [
+            {
+              "var": "has_key",
+              "op": "add",
+              "value": 1
+            },
+            {
+              "var": "rain_memory",
+              "op": "add",
+              "value": 1
+            },
+            {
+              "var": "trust_level",
+              "op": "add",
+              "value": 1
+            }
+          ]
+        },
+        {
+          "id": "choice2B",
+          "text": "返回值班室查看档案记录",
+          "targetNodeId": "check_records",
+          "effects": [
+            {
+              "var": "trust_level",
+              "op": "add",
+              "value": 2
+            }
+          ]
+        }
+      ],
+      "act": ""
+    },
+    {
+      "id": "ignore_card",
+      "title": "置之不理",
+      "type": "branch",
+      "sceneDesc": "我耸耸肩，把借阅卡夹回登记簿里。窗外雨声忽然变得很大，灯光闪烁了一瞬。片刻后，走廊尽头传来沉闷的声响。",
+      "dialogue": [
+        {
+          "speaker": "我",
+          "text": "雨真大……希望不会停电。",
+          "emotion": "neutral"
+        },
+        {
+          "speaker": "旁白",
+          "text": "突然，走廊深处传来像书架被碰倒的声音。",
+          "emotion": "suspense"
+        }
+      ],
+      "choices": [
+        {
+          "id": "choice2A_alt",
+          "text": "独自走向声响来源",
+          "targetNodeId": "investigate_sound",
+          "effects": [
+            {
+              "var": "has_key",
+              "op": "add",
+              "value": 1
+            },
+            {
+              "var": "rain_memory",
+              "op": "add",
+              "value": 1
+            },
+            {
+              "var": "trust_level",
+              "op": "add",
+              "value": 1
+            }
+          ]
+        },
+        {
+          "id": "choice2B_alt",
+          "text": "返回值班室查看档案记录",
+          "targetNodeId": "check_records",
+          "effects": [
+            {
+              "var": "trust_level",
+              "op": "add",
+              "value": 2
+            }
+          ]
+        }
+      ],
+      "act": ""
+    },
+    {
+      "id": "investigate_sound",
+      "title": "走廊尽头",
+      "type": "branch",
+      "sceneDesc": "我拿起手电筒走进走廊。雨声在两侧回响，像低语。尽头是一扇灰绿色铁门，标牌模糊，门把手上挂着一把老式铜钥匙。",
+      "dialogue": [
+        {
+          "speaker": "我",
+          "text": "这把钥匙……是开这扇门的吗？",
+          "emotion": "curious"
+        },
+        {
+          "speaker": "旁白",
+          "text": "背后突然传来档案架倒塌的巨响，我猛地回头——什么都没有。",
+          "emotion": "shock"
+        }
+      ],
+      "choices": [
+        {
+          "id": "choice3A",
+          "text": "拿起钥匙，走向铁门",
+          "targetNodeId": "ending_A",
+          "effects": [
+            {
+              "var": "door_state",
+              "op": "add",
+              "value": 1
+            }
+          ]
+        },
+        {
+          "id": "choice3B",
+          "text": "尝试推门，发现锁着，放弃",
+          "targetNodeId": "ending_B",
+          "effects": [
+            {
+              "var": "door_state",
+              "op": "add",
+              "value": 0
+            }
+          ]
+        },
+        {
+          "id": "choice3C",
+          "text": "决定下班时间到了，离开",
+          "targetNodeId": "ending_C",
+          "effects": []
+        }
+      ],
+      "act": ""
+    },
+    {
+      "id": "check_records",
+      "title": "档案记录",
+      "type": "branch",
+      "sceneDesc": "我回到值班室翻找旧档案柜，找到一摞编号‘1963—1987’的记录簿。里面有一行记录：'第七阅览室，事故报告：1984年11月13日，一名工作人员于雨夜值班后失踪。档案室予以封存。' 窗外的雨声更大了。",
+      "dialogue": [
+        {
+          "speaker": "我",
+          "text": "失踪……封存？那扇门后面到底有什么？",
+          "emotion": "fear"
+        },
+        {
+          "speaker": "旁白",
+          "text": "我放下记录簿，手心冒汗。走廊那头的声音消失了，但不安感更重。",
+          "emotion": "suspense"
+        }
+      ],
+      "choices": [
+        {
+          "id": "choice3B_alt",
+          "text": "前往铁门，尝试推门",
+          "targetNodeId": "ending_B",
+          "effects": []
+        },
+        {
+          "id": "choice3C_alt",
+          "text": "决定下班时间到了，离开",
+          "targetNodeId": "ending_C",
+          "effects": []
+        }
+      ],
+      "act": ""
+    },
+    {
+      "id": "ending_A",
+      "title": "发现真相",
+      "type": "ending",
+      "sceneDesc": "钥匙插入锁孔，咔哒一声，门开了。面前是一条更深的走廊，尽头有微光。我坚定地走向那光。档案架倒塌的巨响在身后回荡，但我没有回头。我走进了第七阅览室——一个不属于任何记录的空间，里面存放着这座档案馆真正的秘密：每一本泛黄的档案都记载着无数个雨夜中的迷失者，而我的名字正出现在最后一页的空白处。",
+      "dialogue": [
+        {
+          "speaker": "旁白",
+          "text": "从那一刻起，我再也没有离开过第七阅览室。",
+          "emotion": "neutral"
+        }
+      ],
+      "choices": [],
+      "act": ""
+    },
+    {
+      "id": "ending_B",
+      "title": "迷失档案",
+      "type": "ending",
+      "sceneDesc": "门锁着，推不动。我转身想回去，却发现走廊变了样：书架排列扭曲，窗子位置不对。我越走越快，但走廊无限延伸，两侧档案的字迹模糊成漩涡。雨声在四面八方回响，像无数个我在呼喊。我分不清方向，也分不清现实与幻觉——最终，我成为了那本事故报告中新的一页。",
+      "dialogue": [
+        {
+          "speaker": "旁白",
+          "text": "档案馆的灯光一盏盏熄灭，只有雨声永不停息。",
+          "emotion": "neutral"
+        }
+      ],
+      "choices": [],
+      "act": ""
+    },
+    {
+      "id": "ending_C",
+      "title": "雨夜离开",
+      "type": "ending",
+      "sceneDesc": "我收起借阅卡，写好下班记录，关灯，穿雨衣。走出档案馆大门，雨打在脸上，清凉真实。锁好门，头也不回地走入雨夜。身后的大楼沉默矗立，第七阅览室的秘密被雨水冲刷，渐渐模糊。我带着疑问和一丝庆幸，回到了平凡的世界。但那本旧借阅卡的轮廓，一直烙在我的记忆里。",
+      "dialogue": [
+        {
+          "speaker": "旁白",
+          "text": "有些门，或许不该打开。有些夜晚，注定留下未解之谜。",
+          "emotion": "neutral"
+        }
+      ],
+      "choices": [],
+      "act": ""
+    }
+  ],
+  "endings": [
+    {
+      "id": "ending_A",
+      "nodeId": "ending_A",
+      "title": "发现真相",
+      "type": "secret",
+      "description": "进入第七阅览室，揭开档案馆的秘密，但自己也永远留在了那里。"
+    },
+    {
+      "id": "ending_B",
+      "nodeId": "ending_B",
+      "title": "迷失档案",
+      "type": "bad",
+      "description": "在档案馆的幻觉中迷失，成为事故报告的新增受害者。"
+    },
+    {
+      "id": "ending_C",
+      "nodeId": "ending_C",
+      "title": "雨夜离开",
+      "type": "neutral",
+      "description": "放弃探究，带着疑问和庆幸回到日常生活。"
+    }
+  ]
+}

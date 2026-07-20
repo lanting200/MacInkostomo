@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "kind": "storyboard_assets",
+  "title": "回声剧场",
+  "projectId": "回声剧场",
+  "baseDir": "interactive-films/回声剧场",
+  "storyboardPath": "interactive-films/回声剧场/storyboard.md",
+  "imagePromptsPath": "interactive-films/回声剧场/image-prompts.md",
+  "assetsDir": "interactive-films/回声剧场/assets",
+  "sourceDir": "interactive-films/回声剧场/assets/source",
+  "generatedDir": "interactive-films/回声剧场/assets/generated",
+  "selectedDir": "interactive-films/回声剧场/assets/selected",
+  "createdAt": "2026-06-24T15:59:12.545Z",
+  "assets": []
+}

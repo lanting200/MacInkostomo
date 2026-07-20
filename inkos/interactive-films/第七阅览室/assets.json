@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "kind": "storyboard_assets",
+  "title": "第七阅览室",
+  "projectId": "第七阅览室",
+  "baseDir": "interactive-films/第七阅览室",
+  "storyboardPath": "interactive-films/第七阅览室/storyboard.md",
+  "imagePromptsPath": "interactive-films/第七阅览室/image-prompts.md",
+  "assetsDir": "interactive-films/第七阅览室/assets",
+  "sourceDir": "interactive-films/第七阅览室/assets/source",
+  "generatedDir": "interactive-films/第七阅览室/assets/generated",
+  "selectedDir": "interactive-films/第七阅览室/assets/selected",
+  "createdAt": "2026-06-27T07:52:37.641Z",
+  "assets": []
+}

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "kind": "storyboard_assets",
+  "title": "午夜胶片馆",
+  "projectId": "午夜胶片馆",
+  "baseDir": "interactive-films/午夜胶片馆",
+  "storyboardPath": "interactive-films/午夜胶片馆/storyboard.md",
+  "imagePromptsPath": "interactive-films/午夜胶片馆/image-prompts.md",
+  "assetsDir": "interactive-films/午夜胶片馆/assets",
+  "sourceDir": "interactive-films/午夜胶片馆/assets/source",
+  "generatedDir": "interactive-films/午夜胶片馆/assets/generated",
+  "selectedDir": "interactive-films/午夜胶片馆/assets/selected",
+  "createdAt": "2026-06-24T17:09:29.978Z",
+  "assets": []
+}

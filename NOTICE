@@ -1,0 +1,12 @@
+MacInkostomo
+Copyright (C) 2026 lanting200
+
+This distribution includes a vendored and modified copy of InkOS:
+
+  Upstream: https://github.com/Narcooo/inkos
+  Base commit: c885d972f628de0410470c64ca4ef584a82c0005
+  License: GNU Affero General Public License v3.0 only
+
+Copyright remains with the InkOS contributors. The upstream license text is
+preserved at inkos/LICENSE. MacInkostomo's compatibility changes are described
+in INKOS_COMPATIBILITY_AUDIT.md and are distributed under the same license.

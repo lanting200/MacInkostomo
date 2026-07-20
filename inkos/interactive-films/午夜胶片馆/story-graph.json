@@ -1,0 +1,516 @@
+{
+  "schemaVersion": 1,
+  "projectId": "午夜胶片馆",
+  "title": "午夜胶片馆",
+  "characters": [],
+  "variables": [
+    {
+      "name": "secret_type",
+      "type": "counter",
+      "default": 0,
+      "desc": "秘密类型：0未定，1老板贪污，2观众创伤"
+    },
+    {
+      "name": "expose_secret",
+      "type": "counter",
+      "default": 0,
+      "desc": "是否公开秘密：0否，1是"
+    },
+    {
+      "name": "help_or_use",
+      "type": "counter",
+      "default": 0,
+      "desc": "帮助或利用：0未定，1帮助，2利用"
+    },
+    {
+      "name": "owner_trust",
+      "type": "counter",
+      "default": 0,
+      "desc": "老板信任度0-2"
+    },
+    {
+      "name": "guilt_level",
+      "type": "counter",
+      "default": 0,
+      "desc": "内疚程度0-2"
+    },
+    {
+      "name": "film_intact",
+      "type": "counter",
+      "default": 1,
+      "desc": "胶片是否完好：0损坏，1完好"
+    },
+    {
+      "name": "audience_thanks",
+      "type": "counter",
+      "default": 0,
+      "desc": "观众是否感激：0否，1是"
+    },
+    {
+      "name": "evidence_chain",
+      "type": "counter",
+      "default": 0,
+      "desc": "证据链长度"
+    },
+    {
+      "name": "crisis_flag",
+      "type": "counter",
+      "default": 0,
+      "desc": "是否引发更大秘密失控：0否，1是"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "node1",
+      "title": "发现异常胶片",
+      "type": "start",
+      "sceneDesc": "午夜电影院放映厅内，放映员林远检查旧胶片时发现一卷无标签的胶片，好奇播放后看到观众甲的秘密。",
+      "dialogue": [
+        {
+          "speaker": "林远（内心）",
+          "text": "这卷胶片……从没见过。上面还贴着“1957”的手写标。",
+          "emotion": "好奇"
+        },
+        {
+          "speaker": "观众甲",
+          "text": "（独坐后排，神情紧张）",
+          "emotion": "紧张"
+        }
+      ],
+      "choices": [
+        {
+          "id": "c1a",
+          "text": "调查秘密来源：去档案室查看胶片记录",
+          "targetNodeId": "node2",
+          "effects": [
+            {
+              "var": "secret_type",
+              "op": "add",
+              "value": 1
+            },
+            {
+              "var": "evidence_chain",
+              "op": "add",
+              "value": 1
+            }
+          ]
+        },
+        {
+          "id": "c1b",
+          "text": "直接找观众甲问话",
+          "targetNodeId": "node3",
+          "effects": [
+            {
+              "var": "secret_type",
+              "op": "add",
+              "value": 2
+            }
+          ]
+        }
+      ],
+      "act": "",
+      "position": {
+        "x": 27,
+        "y": 133
+      }
+    },
+    {
+      "id": "node2",
+      "title": "调查秘密来源",
+      "type": "branch",
+      "sceneDesc": "林远在档案室找到1957年的登记簿，发现胶片是张老板寄存的捐款账目，画面显示观众甲在数钱——原来老板私吞了孤儿院捐款。",
+      "dialogue": [
+        {
+          "speaker": "林远",
+          "text": "这卷胶片记录的是……老板的罪证。观众甲就是当年的会计。",
+          "emotion": "震惊"
+        }
+      ],
+      "choices": [
+        {
+          "id": "c2a",
+          "text": "公开秘密：保存胶片作为证据报警",
+          "targetNodeId": "node4",
+          "effects": [
+            {
+              "var": "expose_secret",
+              "op": "add",
+              "value": 1
+            },
+            {
+              "var": "film_intact",
+              "op": "add",
+              "value": 0
+            },
+            {
+              "var": "evidence_chain",
+              "op": "add",
+              "value": 1
+            }
+          ]
+        },
+        {
+          "id": "c2b",
+          "text": "隐瞒秘密：销毁胶片并警告老板",
+          "targetNodeId": "node5",
+          "effects": [
+            {
+              "var": "expose_secret",
+              "op": "add",
+              "value": 0
+            },
+            {
+              "var": "film_intact",
+              "op": "add",
+              "value": -1
+            },
+            {
+              "var": "owner_trust",
+              "op": "add",
+              "value": 1
+            },
+            {
+              "var": "guilt_level",
+              "op": "add",
+              "value": 1
+            }
+          ]
+        }
+      ],
+      "act": ""
+    },
+    {
+      "id": "node3",
+      "title": "直接问话观众",
+      "type": "branch",
+      "sceneDesc": "林远在走廊询问观众甲，观众甲坦白曾参加战争，胶片记录了他未说出的创伤回忆。",
+      "dialogue": [
+        {
+          "speaker": "观众甲",
+          "text": "我以前是军人……那部老纪录片让我想起战友的死。我从没对人说过。",
+          "emotion": "悲伤"
+        },
+        {
+          "speaker": "林远",
+          "text": "我看到你在战壕里哭泣的画面……",
+          "emotion": "同情"
+        }
+      ],
+      "choices": [
+        {
+          "id": "c3a",
+          "text": "帮助他：安慰并建议参加互助小组",
+          "targetNodeId": "node6",
+          "effects": [
+            {
+              "var": "help_or_use",
+              "op": "add",
+              "value": 1
+            },
+            {
+              "var": "audience_thanks",
+              "op": "add",
+              "value": 1
+            }
+          ]
+        },
+        {
+          "id": "c3b",
+          "text": "利用他：以胶片保密为条件要求他帮忙",
+          "targetNodeId": "node7",
+          "effects": [
+            {
+              "var": "help_or_use",
+              "op": "add",
+              "value": 2
+            },
+            {
+              "var": "film_intact",
+              "op": "add",
+              "value": -1
+            },
+            {
+              "var": "guilt_level",
+              "op": "add",
+              "value": 1
+            }
+          ]
+        }
+      ],
+      "act": ""
+    },
+    {
+      "id": "node4",
+      "title": "公开秘密后的余波",
+      "type": "normal",
+      "sceneDesc": "林远将证据交给警方，张老板被调查，但威胁林远。林远面临选择：坚持正义还是退缩。",
+      "dialogue": [
+        {
+          "speaker": "刑警",
+          "text": "我们会调查，但请林先生暂时保密。",
+          "emotion": "严肃"
+        },
+        {
+          "speaker": "张老板",
+          "text": "你会后悔的。",
+          "emotion": "愤怒"
+        }
+      ],
+      "choices": [
+        {
+          "id": "c4a",
+          "text": "坚持正义：继续收集更多证据",
+          "targetNodeId": "endA",
+          "effects": [
+            {
+              "var": "evidence_chain",
+              "op": "add",
+              "value": 1
+            },
+            {
+              "var": "owner_trust",
+              "op": "add",
+              "value": -1
+            }
+          ]
+        },
+        {
+          "id": "c4b",
+          "text": "害怕逃跑：辞职离开影院",
+          "targetNodeId": "endC",
+          "effects": [
+            {
+              "var": "guilt_level",
+              "op": "add",
+              "value": 1
+            },
+            {
+              "var": "crisis_flag",
+              "op": "add",
+              "value": 1
+            }
+          ]
+        }
+      ],
+      "act": ""
+    },
+    {
+      "id": "node5",
+      "title": "隐瞒秘密后的煎熬",
+      "type": "normal",
+      "sceneDesc": "林远销毁胶片，老板感谢他并承诺升职，但林远内心不安。",
+      "dialogue": [
+        {
+          "speaker": "张老板",
+          "text": "你懂事，以后升你当主管。",
+          "emotion": "满意"
+        },
+        {
+          "speaker": "林远（内心）",
+          "text": "我保全了老板，但良心不安……",
+          "emotion": "矛盾"
+        }
+      ],
+      "choices": [
+        {
+          "id": "c5a",
+          "text": "主动坦白：向警方说明真相",
+          "targetNodeId": "endA",
+          "effects": [
+            {
+              "var": "expose_secret",
+              "op": "add",
+              "value": 1
+            },
+            {
+              "var": "guilt_level",
+              "op": "add",
+              "value": -1
+            }
+          ]
+        },
+        {
+          "id": "c5b",
+          "text": "继续隐瞒：接受升职，保持沉默",
+          "targetNodeId": "endB",
+          "effects": [
+            {
+              "var": "guilt_level",
+              "op": "add",
+              "value": 0
+            }
+          ]
+        }
+      ],
+      "act": ""
+    },
+    {
+      "id": "node6",
+      "title": "帮助观众后的进展",
+      "type": "normal",
+      "sceneDesc": "观众甲感激林远的帮助，并透露还有更多秘密胶片藏在影院暗室。林远面临是否继续调查的选择。",
+      "dialogue": [
+        {
+          "speaker": "观众甲",
+          "text": "谢谢你……其实影院里还有其他秘密胶片，牵扯到更大的阴谋。",
+          "emotion": "感激"
+        },
+        {
+          "speaker": "林远",
+          "text": "什么秘密？",
+          "emotion": "好奇"
+        }
+      ],
+      "choices": [
+        {
+          "id": "c6a",
+          "text": "继续调查：深入挖掘更大阴谋",
+          "targetNodeId": "endA",
+          "effects": [
+            {
+              "var": "evidence_chain",
+              "op": "add",
+              "value": 2
+            },
+            {
+              "var": "audience_thanks",
+              "op": "add",
+              "value": 1
+            }
+          ]
+        },
+        {
+          "id": "c6b",
+          "text": "停止调查：就此收手，回归平静",
+          "targetNodeId": "endB",
+          "effects": [
+            {
+              "var": "evidence_chain",
+              "op": "add",
+              "value": 0
+            }
+          ]
+        }
+      ],
+      "act": ""
+    },
+    {
+      "id": "node7",
+      "title": "利用观众后的失控",
+      "type": "normal",
+      "sceneDesc": "林远利用观众甲去偷老板保险柜记录，但触发警报，老板发现后大怒。胶片被毁但秘密已泄露。",
+      "dialogue": [
+        {
+          "speaker": "张老板",
+          "text": "你们两个都完了！",
+          "emotion": "暴怒"
+        },
+        {
+          "speaker": "林远",
+          "text": "（慌忙销毁剩余胶片）",
+          "emotion": "恐惧"
+        }
+      ],
+      "choices": [
+        {
+          "id": "c7a",
+          "text": "威胁公开一切：破罐破摔",
+          "targetNodeId": "endC",
+          "effects": [
+            {
+              "var": "crisis_flag",
+              "op": "add",
+              "value": 1
+            }
+          ]
+        },
+        {
+          "id": "c7b",
+          "text": "服软求饶：恳求老板放过",
+          "targetNodeId": "endB",
+          "effects": [
+            {
+              "var": "guilt_level",
+              "op": "add",
+              "value": 2
+            },
+            {
+              "var": "audience_thanks",
+              "op": "add",
+              "value": 0
+            }
+          ]
+        }
+      ],
+      "act": ""
+    },
+    {
+      "id": "endA",
+      "title": "真相之光",
+      "type": "ending",
+      "sceneDesc": "法庭外黄昏，张老板被判刑，孤儿院获赔偿。林远虽失去放映员工作，但成为荣誉顾问，内心坦然。",
+      "dialogue": [
+        {
+          "speaker": "林远（内心）",
+          "text": "胶片记录的，是人心最不愿面对的真实。而我选择了让它见光。",
+          "emotion": "释然"
+        }
+      ],
+      "choices": [],
+      "act": ""
+    },
+    {
+      "id": "endB",
+      "title": "秘密之影",
+      "type": "ending",
+      "sceneDesc": "影院放映室凌晨，林远将胶片碎片扫入垃圾桶，老板升他为主管。他继续放映老电影，但银幕上只看到自己孤独的影子。",
+      "dialogue": [
+        {
+          "speaker": "林远（内心）",
+          "text": "我保全了所有人的体面，却弄丢了自己的光。",
+          "emotion": "悲伤"
+        }
+      ],
+      "choices": [],
+      "act": ""
+    },
+    {
+      "id": "endC",
+      "title": "阴影独行",
+      "type": "ending",
+      "sceneDesc": "秘密失控，媒体曝光但证据不足，林远被迫离开城市，陷入更深的黑暗。",
+      "dialogue": [
+        {
+          "speaker": "林远（内心）",
+          "text": "有些秘密，永远不该被唤醒……",
+          "emotion": "绝望"
+        }
+      ],
+      "choices": [],
+      "act": ""
+    }
+  ],
+  "endings": [
+    {
+      "id": "endingA",
+      "nodeId": "endA",
+      "title": "真相之光",
+      "type": "good",
+      "description": "正义公开，主角失去影院工作但获社会认可，内心平静。"
+    },
+    {
+      "id": "endingB",
+      "nodeId": "endB",
+      "title": "秘密之影",
+      "type": "neutral",
+      "description": "秘密埋藏，主角留下终生愧疚，影院继续运营。"
+    },
+    {
+      "id": "endingC",
+      "nodeId": "endC",
+      "title": "阴影独行",
+      "type": "bad",
+      "description": "主角被迫离开，或秘密失控导致更大灾难。"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "name": "macingkostomo",
+  "version": "1.0.0",
+  "description": "Local macOS workspace for InkOS chapter generation, review, and publishing workflows",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lanting200/MacInkostomo.git"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "express": "^4.18.0"
+  }
+}

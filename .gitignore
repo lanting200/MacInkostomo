@@ -1,0 +1,38 @@
+.DS_Store
+node_modules/
+.claude/
+
+# Local environment files and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.mobileprovision
+
+# Private runtime state and generated book content
+data/
+book/
+test-results/
+
+# Bundled InkOS dependencies, credentials, and generated output
+inkos/node_modules/
+inkos/.env
+inkos/output/
+
+# Xcode user state and local build products
+DerivedData/
+build/
+.build/
+dist/
+coverage/
+*.xcarchive
+*.xcuserstate
+xcuserdata/
+*.xccheckout
+*.xcscmblueprint
+
+# Local process output
+*.log
+*.pid
