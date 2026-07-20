@@ -285,6 +285,29 @@ final class APIClient: @unchecked Sendable {
     )
   }
 
+  // MARK: Structured long-form plan
+
+  func fetchLongFormPlan(bookID: String) async throws -> LongFormPlanResponse {
+    try await get(Self.path("books", bookID, "long-form-plan"))
+  }
+
+  func updateLongFormPlan(
+    bookID: String,
+    expectedRevision: Int?,
+    constraints: LongFormConstraints? = nil,
+    continuity: LongFormContinuity? = nil
+  ) async throws -> LongFormPlanResponse {
+    try await patch(
+      Self.path("books", bookID, "long-form-plan"),
+      body: LongFormPlanUpdateRequest(
+        expectedRevision: expectedRevision,
+        constraints: constraints,
+        continuity: continuity
+      ),
+      timeout: Self.longRequestTimeout
+    )
+  }
+
   // MARK: Fanqie
 
   func fetchFanqieLoginState() async throws -> FanqieLoginState {

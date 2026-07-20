@@ -1,6 +1,12 @@
 import { Command } from "commander";
-import { StateManager, formatLengthCount, readGenreProfile, resolveLengthCountingMode } from "@actalk/inkos-core";
-import { findProjectRoot, resolveBookId, log, logError } from "../utils.js";
+import {
+  createInkOSRuntime,
+  StateManager,
+  formatLengthCount,
+  readGenreProfile,
+  resolveLengthCountingMode,
+} from "@actalk/inkos-core";
+import { buildPipelineConfig, findProjectRoot, loadConfig, resolveBookId, log, logError } from "../utils.js";
 
 export const reviewCommand = new Command("review")
   .description("Review and approve chapters");
@@ -104,6 +110,19 @@ function parseBookAndChapter(
   throw new Error("Usage: inkos review approve [book-id] <chapter>");
 }
 
+async function withReviewRuntime<T>(
+  root: string,
+  run: (inkos: ReturnType<typeof createInkOSRuntime>["inkos"]) => Promise<T>,
+): Promise<T> {
+  const config = await loadConfig({ requireApiKey: false, projectRoot: root });
+  const runtime = createInkOSRuntime(buildPipelineConfig(config, root));
+  try {
+    return await run(runtime.inkos);
+  } finally {
+    await runtime.kernel.shutdown();
+  }
+}
+
 reviewCommand
   .command("approve")
   .description("Approve a chapter and commit its state: approve [book-id] <chapter>")
@@ -115,22 +134,10 @@ reviewCommand
       const { bookIdArg, chapterNum } = parseBookAndChapter(args);
       const bookId = await resolveBookId(bookIdArg, root);
 
-      const state = new StateManager(root);
-      const index = [...(await state.loadChapterIndex(bookId))];
-      const idx = index.findIndex((ch) => ch.number === chapterNum);
-      if (idx === -1) {
-        throw new Error(`Chapter ${chapterNum} not found in "${bookId}"`);
-      }
-
-      index[idx] = {
-        ...index[idx]!,
-        status: "approved",
-        updatedAt: new Date().toISOString(),
-      };
-      await state.saveChapterIndex(bookId, index);
+      const result = await withReviewRuntime(root, (inkos) => inkos.approveChapter(bookId, chapterNum));
 
       if (opts.json) {
-        log(JSON.stringify({ bookId, chapter: chapterNum, status: "approved" }));
+        log(JSON.stringify({ bookId, chapter: chapterNum, status: result.status }));
       } else {
         log(`Chapter ${chapterNum} approved (state committed).`);
       }
@@ -156,18 +163,17 @@ reviewCommand
       const state = new StateManager(root);
 
       const index = [...(await state.loadChapterIndex(bookId))];
-      let count = 0;
-      const now = new Date().toISOString();
-
-      const updated = index.map((ch) => {
-        if (ch.status === "ready-for-review" || ch.status === "audit-failed") {
-          count++;
-          return { ...ch, status: "approved" as const, updatedAt: now };
-        }
-        return ch;
-      });
-
-      await state.saveChapterIndex(bookId, updated);
+      const pending = index.filter((ch) => (
+        ch.status === "ready-for-review" || ch.status === "audit-failed"
+      ));
+      if (pending.length > 0) {
+        await withReviewRuntime(root, async (inkos) => {
+          for (const chapter of pending) {
+            await inkos.approveChapter(bookId, chapter.number);
+          }
+        });
+      }
+      const count = pending.length;
 
       if (opts.json) {
         log(JSON.stringify({ bookId, approvedCount: count }));
@@ -197,49 +203,26 @@ reviewCommand
       const { bookIdArg, chapterNum } = parseBookAndChapter(args);
       const bookId = await resolveBookId(bookIdArg, root);
 
-      const state = new StateManager(root);
-      const index = await state.loadChapterIndex(bookId);
-      const idx = index.findIndex((ch) => ch.number === chapterNum);
-      if (idx === -1) {
-        throw new Error(`Chapter ${chapterNum} not found in "${bookId}"`);
-      }
-
-      if (opts.keepSubsequent) {
-        // Legacy behavior: only mark as rejected, no state rollback
-        const updated = [...index];
-        updated[idx] = {
-          ...updated[idx]!,
-          status: "rejected",
-          reviewNote: opts.reason ?? "Rejected without reason",
-          updatedAt: new Date().toISOString(),
-        };
-        await state.saveChapterIndex(bookId, updated);
-
-        if (opts.json) {
-          log(JSON.stringify({ bookId, chapter: chapterNum, status: "rejected", discarded: [] }));
-        } else {
-          log(`Chapter ${chapterNum} rejected (state not rolled back).`);
-        }
-        return;
-      }
-
-      // Default: roll back state to before the rejected chapter and discard
-      // it along with all subsequent chapters that depend on its state.
-      const rollbackTarget = chapterNum - 1;
-      const discarded = await state.rollbackToChapter(bookId, rollbackTarget);
+      const result = await withReviewRuntime(root, (inkos) => inkos.rejectChapter(
+        bookId,
+        chapterNum,
+        { keepSubsequent: opts.keepSubsequent, reason: opts.reason },
+      ));
 
       if (opts.json) {
         log(JSON.stringify({
           bookId,
           chapter: chapterNum,
-          status: "rejected",
-          rolledBackTo: rollbackTarget,
-          discarded,
+          status: result.status,
+          ...(result.rolledBackTo === undefined ? {} : { rolledBackTo: result.rolledBackTo }),
+          discarded: result.discarded,
         }));
+      } else if (opts.keepSubsequent) {
+        log(`Chapter ${chapterNum} rejected (state not rolled back).`);
       } else {
-        log(`Chapter ${chapterNum} rejected. State rolled back to chapter ${rollbackTarget}.`);
-        if (discarded.length > 1) {
-          log(`  Also discarded ${discarded.length - 1} subsequent chapter(s): ${discarded.filter((n) => n !== chapterNum).join(", ")}`);
+        log(`Chapter ${chapterNum} rejected. State rolled back to chapter ${result.rolledBackTo}.`);
+        if (result.discarded.length > 1) {
+          log(`  Also discarded ${result.discarded.length - 1} subsequent chapter(s): ${result.discarded.filter((n) => n !== chapterNum).join(", ")}`);
         }
       }
     } catch (e) {

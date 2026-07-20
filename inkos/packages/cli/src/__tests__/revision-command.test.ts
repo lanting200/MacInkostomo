@@ -9,6 +9,13 @@ const logErrorMock = vi.fn();
 
 vi.mock("@actalk/inkos-core", () => ({
   DEFAULT_REVISE_MODE: "spot-fix",
+  createInkOSRuntime: () => ({
+    inkos: {
+      resyncChapterArtifacts: resyncChapterArtifactsMock,
+    },
+  }),
+  createProcessDiagnosticSink: vi.fn(),
+  FrameworkDiagnostics: class {},
   PipelineRunner: class {
     reviseDraft = reviseDraftMock;
     resyncChapterArtifacts = resyncChapterArtifactsMock;
@@ -77,6 +84,8 @@ describe("revision-related CLI commands", () => {
     expect(buildPipelineConfigMock).toHaveBeenCalledWith(expect.anything(), "/project", {
       externalContext: "以师债线为准同步状态。",
     });
-    expect(resyncChapterArtifactsMock).toHaveBeenCalledWith("demo-book", 3);
+    expect(resyncChapterArtifactsMock).toHaveBeenCalledWith("demo-book", 3, {
+      chapterNumber: 3,
+    });
   });
 });

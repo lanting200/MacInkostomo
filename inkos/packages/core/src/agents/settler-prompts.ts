@@ -45,6 +45,22 @@ export function buildSettlerSystemPrompt(
     ? `【LANGUAGE OVERRIDE】ALL output (state card, hooks, summaries, subplots, emotional arcs, character matrix) MUST be in English. The === TAG === markers remain unchanged.\n\n`
     : "";
 
+  const longFormRules = isEnglish
+    ? `## Long-form consistency delta (required when a protected plan is active)
+
+- Always emit the longFormConsistency object when protected long-form context is present. If the plan policy requires a delta, omitting it fails validation; emit empty arrays when nothing changed.
+- When protected long-form context contains timeline, character-knowledge, world-rule, entity-ownership, or setting boundaries, write every body-supported change to longFormConsistency.
+- Record only changes explicitly supported by the chapter body. Emit empty arrays when nothing changed; never pre-apply future plan events.
+- timelineEvents.eventId, worldRuleAssertions.ruleId, and knowledgeClaims.factId must use stable ids from the plan.
+- entityOps contains only owner/location/attribute changes in this chapter. settingDeltas.previousValue must match continuity state, and any setting change needs an explicit reason.`
+    : `## 长篇连续性增量（启用受保护长篇计划时必须输出）
+
+- 受保护长篇计划启用时必须输出 longFormConsistency；若计划策略要求增量，缺少该对象会导致校验失败。没有变化时输出空数组。
+- 如果受保护的长篇计划上下文包含时间线、角色知识边界、世界规则、实体归属或设定值，本章正文实际发生的变化必须写入 longFormConsistency。
+- 只记录正文明确支持的增量；没有变化时输出空数组，不要从计划预演未来剧情。
+- timelineEvents 的 eventId、worldRuleAssertions 的 ruleId、knowledgeClaims 的 factId 必须使用计划中的稳定 id。
+- entityOps 只写本章发生变化的 owner/location/attributes；settingDeltas 的 previousValue 必须是当前连续性状态中的值，随机改设定必须填写 reason。`;
+
   return `${langPrefix}你是状态追踪分析师。给定新章节正文和当前 truth 文件，你的任务是产出更新后的 truth 文件。
 
 ## 工作模式
@@ -72,10 +88,11 @@ export function buildSettlerSystemPrompt(
 - 平台：${book.platform}
 ${numericalBlock}
 ${hookRules}${objectRules}${fullCastBlock}
+${longFormRules}
 
 ## 输出格式（必须严格遵循）
 
-${buildSettlerOutputFormat(genreProfile)}
+${buildSettlerOutputFormat(genreProfile, isEnglish)}
 
 ## 关键规则
 
@@ -95,10 +112,13 @@ ${buildSettlerOutputFormat(genreProfile)}
 - **伏笔例外**：正文中出现的未解疑问、悬念、伏笔线索必须在 hooks 中记录。这不是"推断"，而是"提取正文中的叙事承诺"。如果正文暗示了一个谜题/冲突/秘密但没有解答，那就是一个 hook，必须记录`;
 }
 
-function buildSettlerOutputFormat(gp: GenreProfile): string {
+function buildSettlerOutputFormat(gp: GenreProfile, isEnglish: boolean): string {
   const chapterTypeExample = gp.chapterTypes.length > 0
     ? gp.chapterTypes[0]
     : "主线推进";
+  const longFormOutputRule = isEnglish
+    ? "11. When protected long-form context is present, always emit longFormConsistency; record body-supported timeline, knowledge, world-rule, entity, and setting changes, or use empty arrays when nothing changed"
+    : "11. 受保护长篇计划出现时必须输出 longFormConsistency；正文涉及的时间线、知识、世界规则、实体和设定变化要如实记录，没有变化时保留空数组";
 
   return `=== POST_SETTLEMENT ===
 （简要说明本章有哪些状态变动、伏笔推进、结算注意事项；允许 Markdown 表格或要点）
@@ -173,6 +193,13 @@ function buildSettlerOutputFormat(gp: GenreProfile): string {
       }
     ]
   },
+  "longFormConsistency": {
+    "timelineEvents": [],
+    "entityOps": [],
+    "knowledgeClaims": [],
+    "worldRuleAssertions": [],
+    "settingDeltas": []
+  },
   "notes": []
 }
 \`\`\`
@@ -187,7 +214,8 @@ function buildSettlerOutputFormat(gp: GenreProfile): string {
 7. 如果回收或延后 hook，必须放在 resolve / defer 数组里
 8. chapterSummary.chapter 必须等于当前章节号
 9. objectOps 只记录正文实际出现或状态发生变化的持久物品；同一 objectId 的材质/刻字不得无理由改变
-10. 新出现的伏笔物品必须同时记录稳定外观事实和关联 hookId，不能只在章节摘要里一笔带过`;
+10. 新出现的伏笔物品必须同时记录稳定外观事实和关联 hookId，不能只在章节摘要里一笔带过
+${longFormOutputRule}`;
 }
 
 export function buildSettlerUserPrompt(params: {

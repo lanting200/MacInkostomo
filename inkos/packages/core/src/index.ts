@@ -43,6 +43,69 @@ export {
   RuntimeStateDeltaSchema,
 } from "./models/runtime-state.js";
 export {
+  LongFormConstraintsSchema,
+  LongFormChapterBudgetSchema,
+  LongFormVolumeBudgetSchema,
+  LongFormPlanBodySchema,
+  LongFormPlanSchema,
+  LongFormPlanPolicySchema,
+  LongFormImmutableCanonSchema,
+  LongFormWorldRuleSchema,
+  LongFormEntitySchema,
+  LongFormKnowledgeBoundarySchema,
+  LongFormTimelineMilestoneSchema,
+  LongFormHookPlanSchema,
+  LongFormContinuityExtensionSchema,
+  NormalizedLongFormPlanSchema,
+  LongFormConsistencyDeltaSchema,
+  LongFormContinuityStateSchema,
+  CanonCheckpointSchema,
+  type LongFormConstraints,
+  type LongFormChapterBudget,
+  type LongFormVolumeBudget,
+  type LongFormPlanBody,
+  type PublisherLongFormPlan,
+  type LongFormPlanPolicy,
+  type LongFormContinuityExtension,
+  type NormalizedLongFormPlan,
+  type LongFormConsistencyDelta,
+  type LongFormContinuityState,
+  type CanonCheckpoint,
+} from "./models/long-form.js";
+export {
+  LONG_FORM_PLAN_FILE,
+  LONG_FORM_STATE_FILE,
+  DEFAULT_LONG_FORM_CONTEXT_MAX_CHARS,
+  adaptPublisherLongFormPlan,
+  loadLongFormPlan,
+  fingerprintLongFormPlan,
+  resolveLongFormVolume,
+  resolvePlanVolumeBoundaries,
+  hasCompleteChapterRange,
+  buildLongFormLengthSpec,
+  createPublisherLongFormPlan,
+  createInitialLongFormState,
+  seedPublisherLongFormPlanFromFoundation,
+  loadLongFormContinuityState,
+  loadLongFormContinuityStateAt,
+  reconcileLongFormProgress,
+  reconcileLongFormRuntimeSnapshot,
+  buildLongFormChapterContext,
+  validateAndApplyLongFormChapter,
+  persistLongFormContinuityState,
+  buildCanonCheckpoint,
+  persistCanonCheckpoint,
+  writeAtomicJson,
+  type LoadedLongFormPlan,
+  type LongFormValidationIssue,
+  type LongFormValidationResult,
+  type LongFormContextHook,
+  type LongFormContextFact,
+  type ChapterProgressRecord,
+  type PublisherLongFormPlanOptions,
+  type LongFormFoundationSeed,
+} from "./utils/long-form-plan.js";
+export {
   type PlayActionKind,
   type PlayActionIntentInput,
   type PlayActionIntent,
@@ -494,7 +557,7 @@ export { arbitrateRuntimeStateDeltaHooks, type HookArbiterDecision } from "./uti
 export { analyzeHookHealth } from "./utils/hook-health.js";
 
 // Pipeline
-export { PipelineRunner, type PipelineConfig, type ChapterPipelineResult, type DraftResult, type PlanChapterResult, type ComposeChapterResult, type ReviseResult, type TruthFiles, type BookStatusInfo, type ImportChaptersInput, type ImportChaptersResult, type TokenUsageSummary } from "./pipeline/runner.js";
+export { PipelineRunner, type PipelineConfig, type PipelineOperationContext, type ChapterPipelineResult, type DraftResult, type PlanChapterResult, type ComposeChapterResult, type ReviseResult, type RevisionBehaviorOptions, type ReviewMutationResult, type TruthFiles, type BookStatusInfo, type ImportChaptersInput, type ImportChaptersResult, type TokenUsageSummary } from "./pipeline/runner.js";
 export { Scheduler, type SchedulerConfig } from "./pipeline/scheduler.js";
 export { detectChapter, detectAndRewrite, loadDetectionHistory, type DetectChapterResult, type DetectAndRewriteResult } from "./pipeline/detection-runner.js";
 export { runScriptCreation, runStoryboardCreation, runInteractiveFilmCreation, createStoryboardAssetsManifest, type ScriptCreationRunOptions, type ScriptCreationRunResult, type StoryboardAssetsManifest, type StoryboardCreationRunOptions, type StoryboardCreationRunResult, type InteractiveFilmCreationRunOptions, type InteractiveFilmCreationRunResult, type StoryboardImageAsset, type StoryboardImageAssetVariant } from "./pipeline/script-storyboard-runner.js";
@@ -641,3 +704,58 @@ export {
 } from "./interactive-film/emotion.js";
 export { exportInk } from "./interactive-film/export-ink.js";
 export { buildPlayableHtml } from "./interactive-film/export-html.js";
+
+// Framework kernel: source-level module boundaries, workflow isolation, and
+// structured diagnostics shared by the CLI and PipelineRunner.
+export {
+  FrameworkDiagnosticLevelSchema,
+  FrameworkDiagnosticStatusSchema,
+  FrameworkFaultDataSchema,
+  FrameworkDiagnosticEventSchema,
+  FrameworkFault,
+  type FrameworkDiagnosticLevel,
+  type FrameworkDiagnosticStatus,
+  type FrameworkFaultData,
+  type FrameworkDiagnosticEvent,
+  type FrameworkDiagnosticEventInput,
+  type FrameworkFaultOptions,
+  type FrameworkExecutionScope,
+  type FrameworkModuleCallOptions,
+} from "./framework/contracts.js";
+export {
+  FRAMEWORK_EVENT_PREFIX,
+  FrameworkDiagnostics,
+  MemoryDiagnosticSink,
+  createProcessDiagnosticSink,
+  sanitizeDiagnosticData,
+  type FrameworkDiagnosticSink,
+  type FrameworkDiagnosticSinkFunction,
+} from "./framework/diagnostics.js";
+export {
+  FrameworkModuleRegistry,
+  type FrameworkModule,
+  type FrameworkModuleContext,
+  type FrameworkModuleRegistryOptions,
+} from "./framework/module-registry.js";
+export {
+  FrameworkWorkflowEngine,
+  type FrameworkWorkflowContext,
+  type FrameworkWorkflowRetryPolicy,
+  type FrameworkWorkflowStep,
+  type FrameworkWorkflowDefinition,
+  type FrameworkWorkflowResult,
+} from "./framework/workflow.js";
+export {
+  FrameworkKernel,
+  createFrameworkKernel,
+  type FrameworkKernelOptions,
+} from "./framework/kernel.js";
+export {
+  INKOS_MODULE_ID,
+  createInkOSModule,
+  createInkOSRuntime,
+  type FrameworkCallOptions,
+  type InkOSModuleService,
+  type InkOSModulePort,
+  type InkOSRuntime,
+} from "./framework/inkos-module.js";

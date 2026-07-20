@@ -686,6 +686,16 @@
     .form-group { display: grid; gap: 6px; margin-bottom: 10px; }
     .form-group label { font-size: 12px; color: var(--text-secondary); font-weight: 500; }
     .create-book-two-column { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .create-book-budget-summary {
+      display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px;
+      overflow: hidden; margin: 2px 0 12px; border: 1px solid var(--border);
+      border-radius: var(--radius); background: var(--border);
+    }
+    .create-book-budget-metric { min-width: 0; padding: 10px 12px; background: var(--bg-white); }
+    .create-book-budget-metric span { display: block; color: var(--text-muted); font-size: 11px; line-height: 16px; }
+    .create-book-budget-metric strong { display: block; overflow-wrap: anywhere; margin-top: 2px; color: var(--text); font-size: 14px; line-height: 20px; }
+    .create-book-budget-summary.invalid { border-color: #F1B5AF; background: #F1B5AF; }
+    .create-book-budget-summary.invalid .create-book-budget-metric strong { color: var(--red); }
 
     /* ====== Settings ====== */
     .settings-shell { width: min(1320px, 100%); margin: 0 auto; }
@@ -701,6 +711,26 @@
     .settings-book-controls { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
     .settings-book-controls .form-select { width: 220px; }
     .settings-book-controls .settings-sort-select { width: 132px; }
+    .long-form-plan-panel { margin-bottom: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-white); }
+    .long-form-plan-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 16px; border-bottom: 1px solid var(--border-light); }
+    .long-form-plan-head h3 { color: var(--text); font-size: 14px; line-height: 21px; }
+    .long-form-plan-head span { color: var(--text-muted); font-size: 11px; line-height: 17px; }
+    .long-form-plan-fields { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 10px 12px; padding: 14px 16px 4px; }
+    .long-form-plan-fields .form-group { min-width: 0; }
+    .long-form-plan-constraints { grid-column: 1 / -1; }
+    .long-form-plan-constraints .form-textarea { min-height: 78px; height: 78px; padding: 9px 12px; font-size: 13px; line-height: 1.55; }
+    .long-form-plan-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin: 0 16px 14px; overflow: hidden; border: 1px solid var(--border-light); border-radius: var(--radius-sm); background: var(--border-light); }
+    .long-form-plan-metric { min-width: 0; padding: 9px 11px; background: #FCFCFC; }
+    .long-form-plan-metric span { display: block; color: var(--text-muted); font-size: 10px; line-height: 15px; }
+    .long-form-plan-metric strong { display: block; overflow-wrap: anywhere; margin-top: 1px; color: var(--text); font-size: 13px; line-height: 19px; }
+    .long-form-volume-list { display: grid; gap: 6px; max-height: 210px; overflow-y: auto; margin: 0 16px 14px; }
+    .long-form-volume-row { display: grid; grid-template-columns: minmax(100px, 0.7fr) minmax(150px, 1fr) minmax(130px, 1fr); gap: 12px; align-items: center; padding: 8px 10px; border: 1px solid var(--border-light); border-radius: var(--radius-sm); color: var(--text-secondary); font-size: 11px; line-height: 17px; }
+    .long-form-volume-row strong { color: var(--text); font-size: 12px; }
+    .long-form-progress-track { height: 5px; overflow: hidden; border-radius: 3px; background: #ECEEF1; }
+    .long-form-progress-track span { display: block; height: 100%; border-radius: inherit; background: var(--green); }
+    .long-form-plan-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 16px; border-top: 1px solid var(--border-light); }
+    .long-form-plan-status { min-width: 0; color: var(--text-muted); font-size: 11px; line-height: 17px; }
+    .long-form-plan-empty { padding: 18px 16px; color: var(--text-muted); font-size: 12px; line-height: 18px; }
     .settings-book-workspace { display: grid; grid-template-columns: minmax(235px, 290px) minmax(0, 1fr); min-height: min(690px, calc(100vh - 170px)); overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-white); }
     .settings-file-sidebar { display: flex; min-width: 0; flex-direction: column; border-right: 1px solid var(--border); background: #FCFCFC; }
     .settings-file-search { margin: 12px; }
@@ -754,9 +784,64 @@
     .llm-save-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--border-light); }
     .llm-save-row p { color: var(--text-muted); font-size: 11px; line-height: 17px; }
     .settings-utility-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: 24px; }
+    .debug-workbench { grid-column: 1 / -1; min-width: 0; }
+    .debug-workbench-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
+    .debug-workbench-head h2 { color: var(--text); font-size: 17px; font-weight: 600; line-height: 26px; }
+    .debug-connection-status { min-height: 17px; margin-top: 2px; color: var(--text-muted); font-size: 11px; line-height: 17px; }
+    .debug-connection-status.connected { color: var(--green); }
+    .debug-connection-status.connecting { color: var(--blue); }
+    .debug-connection-status.failed { color: var(--red); }
+    .debug-workbench-actions, .debug-filter-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .debug-filter-bar { display: grid; grid-template-columns: minmax(96px, .55fr) minmax(140px, .9fr) minmax(140px, 1fr) minmax(140px, 1fr) minmax(82px, .55fr) minmax(82px, .55fr) minmax(150px, 1.1fr) auto auto; gap: 9px; align-items: end; padding: 12px; border: 1px solid var(--border-light); background: #FCFCFC; }
+    .debug-filter-field { min-width: 0; display: grid; gap: 5px; }
+    .debug-filter-field label { color: var(--text-muted); font-size: 10px; line-height: 15px; }
+    .debug-filter-field .form-input, .debug-filter-field .form-select { width: 100%; min-width: 0; height: 34px; padding: 6px 9px; font-size: 12px; }
+    .debug-filter-search { min-width: 150px; }
+    .debug-live-toggle { display: inline-flex; align-items: center; align-self: end; gap: 7px; height: 34px; color: var(--text-secondary); font-size: 12px; white-space: nowrap; cursor: pointer; }
+    .debug-live-toggle input { position: absolute; opacity: 0; pointer-events: none; }
+    .debug-toggle-track { display: inline-flex; align-items: center; width: 32px; height: 18px; padding: 2px; border-radius: 10px; background: #D5D8DE; transition: background var(--transition); }
+    .debug-toggle-track span { width: 14px; height: 14px; border-radius: 50%; background: #FFF; box-shadow: 0 1px 2px rgba(0,0,0,.16); transition: transform var(--transition); }
+    .debug-live-toggle input:checked + .debug-toggle-track { background: var(--green); }
+    .debug-live-toggle input:checked + .debug-toggle-track span { transform: translateX(14px); }
+    .debug-summary-strip { display: flex; justify-content: space-between; gap: 12px; min-height: 34px; align-items: center; color: var(--text-muted); font-size: 11px; line-height: 17px; }
+    .debug-workbench-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(230px, 300px); gap: 18px; min-height: 440px; }
+    .debug-events-region, .debug-side-block { min-width: 0; border: 1px solid var(--border-light); background: var(--bg-white); }
+    .debug-section-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 42px; padding: 9px 12px; border-bottom: 1px solid var(--border-light); }
+    .debug-section-head h3 { color: var(--text); font-size: 13px; font-weight: 600; line-height: 20px; }
+    .debug-section-head > span { min-width: 22px; color: var(--text-muted); font-family: "SF Mono", "Menlo", monospace; font-size: 10px; text-align: right; }
+    .debug-events-list { max-height: 590px; overflow-y: auto; }
+    .debug-event-row { padding: 10px 12px; border-bottom: 1px solid var(--border-light); }
+    .debug-event-row:last-child { border-bottom: 0; }
+    .debug-event-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; color: var(--text-muted); font-family: "SF Mono", "Menlo", monospace; font-size: 10px; line-height: 16px; }
+    .debug-event-sequence { color: var(--primary); }
+    .debug-event-badge { display: inline-flex; align-items: center; min-height: 17px; padding: 1px 5px; border-radius: 4px; background: #F2F3F5; color: var(--text-secondary); font-family: var(--font); font-size: 10px; line-height: 15px; }
+    .debug-event-badge.level-debug { color: #6F42C1; background: #F4EDFF; }
+    .debug-event-badge.level-info { color: var(--blue); background: var(--blue-light); }
+    .debug-event-badge.level-warn { color: #A15C00; background: var(--orange-light); }
+    .debug-event-badge.level-error { color: var(--red); background: var(--red-light); }
+    .debug-event-message { margin-top: 5px; color: var(--text); font-size: 12px; line-height: 19px; overflow-wrap: anywhere; }
+    .debug-event-context { display: flex; flex-wrap: wrap; gap: 5px 12px; margin-top: 5px; color: var(--text-secondary); font-size: 10px; line-height: 16px; }
+    .debug-event-context code, .debug-event-id { color: var(--primary); font-family: "SF Mono", "Menlo", monospace; }
+    .debug-event-details { margin-top: 6px; }
+    .debug-event-details summary { color: var(--text-muted); font-size: 10px; cursor: pointer; }
+    .debug-event-details pre { max-height: 220px; overflow: auto; margin-top: 5px; padding: 8px; border: 1px solid var(--border-light); background: #FCFCFC; color: var(--text-secondary); font-family: "SF Mono", "Menlo", monospace; font-size: 10px; line-height: 16px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .debug-side-region { display: grid; align-content: start; gap: 18px; min-width: 0; }
+    .debug-jobs-list, .debug-files-list { max-height: 260px; overflow-y: auto; }
+    .debug-job-row, .debug-file-row { padding: 9px 11px; border-bottom: 1px solid var(--border-light); }
+    .debug-job-row:last-child, .debug-file-row:last-child { border-bottom: 0; }
+    .debug-job-title, .debug-file-name { color: var(--text); font-size: 11px; font-weight: 600; line-height: 17px; overflow-wrap: anywhere; }
+    .debug-job-meta, .debug-file-meta { margin-top: 2px; color: var(--text-muted); font-family: "SF Mono", "Menlo", monospace; font-size: 10px; line-height: 15px; overflow-wrap: anywhere; }
+    .debug-empty { padding: 22px 12px; color: var(--text-muted); font-size: 11px; line-height: 18px; text-align: center; }
+    .debug-status-line { display: block; min-height: 20px; padding-top: 8px; color: var(--text-muted); font-size: 11px; line-height: 17px; }
     @media (max-width: 900px) {
       .settings-book-workspace { grid-template-columns: 230px minmax(0, 1fr); }
       .llm-endpoint-grid, .llm-model-grid, .settings-utility-grid { grid-template-columns: 1fr; }
+      .debug-filter-bar { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .debug-filter-wide, .debug-filter-search { min-width: 0; }
+      .debug-filter-actions { grid-column: span 2; }
+      .debug-workbench-grid { grid-template-columns: 1fr; }
+      .debug-side-region { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .long-form-plan-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 640px) {
       .settings-tabs { gap: 14px; overflow-x: auto; }
@@ -772,6 +857,16 @@
       .settings-editor-actions .btn { flex: 1; }
       .llm-model-select-row { grid-template-columns: 1fr 1fr; }
       .llm-model-select-row .form-select { grid-column: 1 / -1; }
+      .debug-workbench-head, .debug-summary-strip { align-items: flex-start; flex-direction: column; }
+      .debug-workbench-actions { width: 100%; }
+      .debug-workbench-actions .btn { flex: 1; }
+      .debug-filter-bar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .debug-filter-actions { grid-column: 1 / -1; }
+      .debug-live-toggle { grid-column: 1 / -1; }
+      .debug-side-region { grid-template-columns: 1fr; }
+      .long-form-plan-head, .long-form-plan-foot { align-items: flex-start; flex-direction: column; }
+      .long-form-plan-fields, .long-form-plan-metrics { grid-template-columns: 1fr 1fr; }
+      .long-form-volume-row { grid-template-columns: 1fr; gap: 4px; }
     }
     .account-card {
       background: var(--bg-white); border: 1px solid var(--border);
@@ -868,6 +963,7 @@
       .fq-chapter-column { min-height: 320px; overflow-x: auto !important; }
       .fq-table { min-width: 620px; }
       .create-book-two-column { grid-template-columns: 1fr; gap: 0; }
+      .create-book-budget-summary { grid-template-columns: 1fr 1fr; }
       .modal-content { padding: 20px 18px; max-height: 92vh; }
     }
 
@@ -1016,6 +1112,9 @@
             </select>
           </div>
         </div>
+        <section class="long-form-plan-panel" id="longFormPlanPanel" aria-labelledby="longFormPlanTitle">
+          <div class="long-form-plan-empty">选择书籍后加载长篇计划。</div>
+        </section>
         <div class="settings-book-workspace">
           <aside class="settings-file-sidebar">
             <div class="settings-file-search"><label class="sr-only" for="settingsFileSearch">筛选设定文件</label><input class="form-input" id="settingsFileSearch" type="search" placeholder="筛选文件" oninput="renderBookSettingsFileList()"></div>
@@ -1076,14 +1175,97 @@
             <h2>番茄账号</h2>
             <div id="fanqieAccountCard" class="account-card"><div style="text-align:center;padding:12px;"><div class="spin"><div class="spin-dot spin-dot-sm"></div><span class="spin-tip" style="font-size:12px;">加载中...</span></div></div></div>
           </div>
-          <div class="fq-section">
-            <h2>Debug</h2>
-            <div style="display:flex;gap:8px;margin-bottom:8px;">
-              <button class="btn btn-outline btn-sm" onclick="loadDebugPanel()">刷新 Debug</button>
-              <button class="btn btn-outline btn-sm" onclick="copyDebugSummary()">复制摘要</button>
+          <section class="fq-section debug-workbench" aria-labelledby="debugTitle">
+            <div class="debug-workbench-head">
+              <div>
+                <h2 id="debugTitle">Debug 事件</h2>
+                <div class="debug-connection-status" id="debugStreamStatus" role="status">未连接</div>
+              </div>
+              <div class="debug-workbench-actions">
+                <button class="btn btn-outline btn-sm" type="button" onclick="loadDebugPanel()" title="刷新调试事件">刷新</button>
+                <button class="btn btn-outline btn-sm" type="button" onclick="downloadDebugJsonl()" title="下载当前筛选结果">下载 JSONL</button>
+                <button class="btn btn-outline btn-sm" type="button" onclick="copyDebugSummary()" title="复制当前调试摘要">复制摘要</button>
+              </div>
             </div>
-            <pre id="debugPanel" style="max-height:420px;overflow:auto;background:#0d1117;color:#c9d1d9;border:1px solid var(--border);border-radius:8px;padding:10px;font-size:11px;white-space:pre-wrap;">点击刷新查看最近事件、生成任务和日志文件。</pre>
-          </div>
+            <form class="debug-filter-bar" id="debugFilters" onsubmit="event.preventDefault(); loadDebugPanel();">
+              <div class="debug-filter-field">
+                <label for="debugLevel">级别</label>
+                <select class="form-select" id="debugLevel">
+                  <option value="">全部</option>
+                  <option value="debug">debug</option>
+                  <option value="info">info</option>
+                  <option value="warn">warn</option>
+                  <option value="error">error</option>
+                </select>
+              </div>
+              <div class="debug-filter-field debug-filter-wide">
+                <label for="debugComponent">组件</label>
+                <input class="form-input" id="debugComponent" list="debugComponentOptions" placeholder="全部组件" autocomplete="off">
+                <datalist id="debugComponentOptions"></datalist>
+              </div>
+              <div class="debug-filter-field debug-filter-wide">
+                <label for="debugTraceId">Trace</label>
+                <input class="form-input" id="debugTraceId" placeholder="trace id" autocomplete="off">
+              </div>
+              <div class="debug-filter-field debug-filter-wide">
+                <label for="debugBookId">书籍</label>
+                <input class="form-input" id="debugBookId" placeholder="book id" autocomplete="off">
+              </div>
+              <div class="debug-filter-field">
+                <label for="debugChapterNumber">章节</label>
+                <input class="form-input" id="debugChapterNumber" type="number" min="1" step="1" placeholder="全部">
+              </div>
+              <div class="debug-filter-field">
+                <label for="debugLimit">数量</label>
+                <select class="form-select" id="debugLimit">
+                  <option value="50">50</option>
+                  <option value="100" selected>100</option>
+                  <option value="200">200</option>
+                  <option value="500">500</option>
+                  <option value="1000">1000</option>
+                </select>
+              </div>
+              <div class="debug-filter-field debug-filter-search">
+                <label for="debugText">文本</label>
+                <input class="form-input" id="debugText" placeholder="消息或数据" autocomplete="off">
+              </div>
+              <div class="debug-filter-actions">
+                <button class="btn btn-primary btn-sm" type="submit">应用筛选</button>
+                <button class="btn btn-outline btn-sm" type="button" onclick="resetDebugFilters()">重置</button>
+              </div>
+              <label class="debug-live-toggle" for="debugLiveToggle">
+                <input id="debugLiveToggle" type="checkbox" onchange="toggleDebugStream(this.checked)">
+                <span class="debug-toggle-track" aria-hidden="true"><span></span></span>
+                <span>实时</span>
+              </label>
+            </form>
+            <div class="debug-summary-strip">
+              <span id="debugResultMeta">暂无事件</span>
+              <span id="debugHealthMeta">诊断目录未检查</span>
+            </div>
+            <div class="debug-workbench-grid">
+              <section class="debug-events-region" aria-labelledby="debugEventsTitle">
+                <div class="debug-section-head">
+                  <h3 id="debugEventsTitle">事件</h3>
+                  <span id="debugEventCount">0</span>
+                </div>
+                <div class="debug-events-list" id="debugPanel" role="log" aria-live="polite" aria-label="结构化调试事件">
+                  <div class="debug-empty">点击“应用筛选”读取事件。</div>
+                </div>
+              </section>
+              <aside class="debug-side-region">
+                <section class="debug-side-block" aria-labelledby="debugJobsTitle">
+                  <div class="debug-section-head"><h3 id="debugJobsTitle">任务</h3><span id="debugJobCount">0</span></div>
+                  <div class="debug-jobs-list" id="debugJobsList"><div class="debug-empty">暂无任务</div></div>
+                </section>
+                <section class="debug-side-block" aria-labelledby="debugFilesTitle">
+                  <div class="debug-section-head"><h3 id="debugFilesTitle">日志文件</h3><span id="debugFileCount">0</span></div>
+                  <div class="debug-files-list" id="debugFilesList"><div class="debug-empty">暂无文件</div></div>
+                </section>
+              </aside>
+            </div>
+            <output class="debug-status-line" id="debugPanelStatus" role="status"></output>
+          </section>
         </div>
       </section>
     </div>
@@ -1119,6 +1301,6 @@
     </div>
   </div>
 
-  <script src="/app.js?v=20260720-review-fixes-v2"></script>
+  <script src="/app.js?v=20260720-debug-workbench-v1"></script>
 </body>
 </html>

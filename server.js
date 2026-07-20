@@ -7,15 +7,43 @@ import { reviseChapter, retrieveKnowledge, generateChapter, rewriteChapter, read
 import { listBooks, listChapters, getFanqieChapter, shutdownFanqie } from './lib/fanqie.js';
 import { chmodSync, existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, renameSync, unlinkSync } from 'fs';
 import { EventEmitter } from 'events';
+import { randomUUID } from 'crypto';
 import { assertBookId, bookPath, PATHS } from './lib/paths.js';
-import { runInkos, runInkosSync, ensureLocalInkosProject, shutdownInkos } from './lib/inkos-runner.js';
-import { STATUS, wordCount } from './lib/status.js';
+import { runInkos, ensureLocalInkosProject, shutdownInkos } from './lib/inkos-runner.js';
+import {
+  invalidatePublisherInkOSRuntime,
+  runPublisherInkOS,
+  shutdownPublisherInkOSRuntime,
+} from './lib/inkos-runtime.js';
+import { chapterLength, STATUS, wordCount } from './lib/status.js';
 import { generateCreateBookPayload } from './lib/book-create-assistant.js';
 import { reviewGeneratedChapter } from './lib/llm-reviewer.js';
-import { debugEvent, readDebugEvents, debugFileInfo } from './lib/debug-log.js';
+import {
+  debugEvent,
+  debugEvents,
+  debugFileInfo,
+  debugHealth,
+  debugSchema,
+  queryDebugEvents,
+} from './lib/debug-log.js';
 import { loadWorkflowJobs, saveWorkflowJobs } from './lib/workflow-jobs.js';
 import { copyDirectoryStrict, replaceDirectoryFromBackup } from './lib/directory-restore.js';
 import { normalizeLlmBaseUrl } from './lib/llm-endpoint.js';
+import { writePrivateFile } from './lib/private-file.js';
+import {
+  assertLongFormHistoryPreserved,
+  buildLongFormPlan,
+  commitLongFormPlanUpdate,
+  loadOrMigrateLongFormPlan,
+  normalizeLongFormConstraints,
+  preserveLongFormSeed,
+  readLongFormPlan,
+  renderLongFormChapterContext,
+  resolveAdaptiveChapterBudget,
+  summarizeChapterBudgets,
+  updateLongFormPlan,
+  writeLongFormPlan,
+} from './lib/long-form-plan.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -55,6 +83,27 @@ function persistWorkflowJobs() {
   }
 }
 
+function creationRecovery(bookId) {
+  if (!bookId) return null;
+  let safeBookId;
+  try {
+    safeBookId = assertBookId(bookId);
+  } catch {
+    return null;
+  }
+  if (!existsSync(bookPath(safeBookId))) return null;
+  const importable = existsSync(bookPath(safeBookId, 'chapters'));
+  return {
+    recoverable: true,
+    recovery: {
+      action: importable ? 'import' : 'inspect',
+      bookId: safeBookId,
+      relativePath: `book/books/${safeBookId}`,
+      importable,
+    },
+  };
+}
+
 function markInterruptedStartupJobs() {
   const now = new Date().toISOString();
   for (const job of generationJobs.values()) {
@@ -69,9 +118,13 @@ function markInterruptedStartupJobs() {
   }
   for (const job of creationJobs.values()) {
     if (job.finishedAt) continue;
+    const recovery = creationRecovery(job.bookId || job.expectedBookId);
     Object.assign(job, {
       status: 'failed',
-      error: '服务已重启，上一轮创建任务已中断；请检查 book/books 后再决定是否重试。',
+      error: recovery?.recovery.importable
+        ? '服务已重启，上一轮创建任务已中断；检测到已保留的 InkOS 产物，可通过“导入现有小说”恢复 Publisher 登记。'
+        : '服务已重启，上一轮创建任务已中断；请检查 book/books 中的恢复产物后再决定如何处理。',
+      ...(recovery || { recoverable: false }),
       updatedAt: now,
       finishedAt: now,
     });
@@ -178,7 +231,13 @@ function setGenerationJob(bookId, chapterNum, patch = {}) {
   }
   generationJobs.set(key, next);
   persistWorkflowJobs();
-  debugEvent('generation', patch.phase || 'update', { bookId, chapterNum, ...patch });
+  debugEvent('generation', patch.phase || 'update', { bookId, chapterNum, ...patch }, 'info', {
+    traceId: next.traceId,
+    operation: 'chapter.workflow',
+    phase: next.finishedAt ? (next.error ? 'failure' : 'success') : 'progress',
+    bookId,
+    chapterNumber: chapterNum,
+  });
   publishGenerationEvent(bookId, chapterNum, { type: 'job', job: next });
   return next;
 }
@@ -375,9 +434,9 @@ function mergeInkosChapterForClient(bookId, book, diskEntry) {
     reviewNotes: meta.reviewNotes || reviewNote || (diskEntry.auditIssues || []).join('\n'),
     revisionHistory: meta.revisionHistory || [],
     publishedAt: meta.publishedAt || null,
-    volume: meta.volume || getVolumeForChapter(diskEntry.number, bookId)?.num || null,
+    volume: meta.volume || getVolumeForChapter(diskEntry.number, bookId, book)?.num || null,
     volumeTitle: meta.volumeTitle || (() => {
-      const v = getVolumeForChapter(diskEntry.number, bookId);
+      const v = getVolumeForChapter(diskEntry.number, bookId, book);
       return v ? `${v.title}·${v.subtitle}` : null;
     })(),
     createdAt: diskEntry.createdAt || meta.createdAt,
@@ -472,6 +531,13 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(__dirname + '/public'));
 
+app.use((req, res, next) => {
+  const incoming = String(req.get('X-Trace-Id') || '').trim();
+  req.traceId = /^[A-Za-z0-9._:-]{8,200}$/.test(incoming) ? incoming : randomUUID();
+  res.set('X-Trace-Id', req.traceId);
+  next();
+});
+
 app.param('bookId', (req, res, next, value) => {
   try {
     req.params.bookId = assertBookId(value);
@@ -488,7 +554,12 @@ app.use((req, res, next) => {
       debugEvent('http', `${req.method} ${req.path}`, {
         statusCode: res.statusCode,
         durationMs: Date.now() - startedAt,
-      }, res.statusCode >= 400 ? 'warn' : 'info');
+      }, res.statusCode >= 400 ? 'warn' : 'info', {
+        traceId: req.traceId,
+        operation: 'http.request',
+        phase: res.statusCode >= 400 ? 'failure' : 'success',
+        durationMs: Date.now() - startedAt,
+      });
     }
   });
   next();
@@ -541,6 +612,31 @@ function getChapterMarkdownPath(bookId, num) {
 }
 
 async function syncInkosChapterArtifacts(bookId, num, brief, options = {}) {
+  if (process.env.PUBLISHER_INKOS_RUNTIME !== 'subprocess') {
+    try {
+      const result = await runPublisherInkOS('write.sync', bookId, {
+        chapterNumber: num,
+        externalContext: brief,
+        traceId: options.traceId,
+        timeoutMs: Number(options.timeout || process.env.PUBLISHER_INKOS_SYNC_TIMEOUT_MS || '60000'),
+        callbacks: {
+          onTextDelta: options.onTextDelta,
+          onStreamProgress: options.onStreamProgress,
+        },
+      });
+      return {
+        synced: result?.status !== 'state-degraded',
+        runtime: 'framework',
+        result,
+      };
+    } catch (err) {
+      if (!/内置 InkOS core 未构建|Cannot find module|ERR_MODULE_NOT_FOUND|core 未就绪/i.test(String(err?.message || err))) {
+        console.warn(`[inkos-sync] 内置框架同步失败: ${err.message}`);
+        return { synced: false, runtime: 'framework', reason: err.message };
+      }
+      console.warn(`[inkos-sync] 内置 core 未就绪，回退 CLI：${err.message}`);
+    }
+  }
   try {
     await runInkos(['write', 'sync', bookId, String(num), '--brief', brief || 'Publisher compatibility sync after chapter body update', '--json'], {
       cwd: PATHS.BOOKS_DIR,
@@ -555,13 +651,30 @@ async function syncInkosChapterArtifacts(bookId, num, brief, options = {}) {
 }
 
 async function rejectInkosChapterKeepSubsequent(bookId, num, reason) {
+  if (process.env.PUBLISHER_INKOS_RUNTIME !== 'subprocess') {
+    try {
+      const result = await runPublisherInkOS('review.reject', bookId, {
+        chapterNumber: num,
+        keepSubsequent: true,
+        reason: reason || 'Publisher validation failed',
+        timeoutMs: 30000,
+      });
+      return { rejected: true, runtime: 'framework', result };
+    } catch (err) {
+      if (!isEmbeddedCoreUnavailable(err)) {
+        console.warn(`[inkos-review] 第${num}章内置模块标记 rejected 失败: ${err.message}`);
+        return { rejected: false, runtime: 'framework', reason: err.message };
+      }
+      console.warn(`[inkos-review] 内置 core 未就绪，回退 CLI：${err.message}`);
+    }
+  }
   try {
     await runInkos(['review', 'reject', bookId, String(num), '--keep-subsequent', '--reason', reason || 'Publisher validation failed', '--json'], {
       cwd: PATHS.BOOKS_DIR,
       timeout: 30000,
       maxBuffer: 1024 * 1024,
     });
-    return { rejected: true };
+    return { rejected: true, runtime: 'cli' };
   } catch (err) {
     console.warn(`[inkos-review] 第${num}章标记 rejected 失败: ${err.message}`);
     return { rejected: false, reason: err.message };
@@ -747,7 +860,12 @@ async function retryRevisionUntilValid(bookId, num, title, originalNote, oldCont
   return { finalResult, validationIssues, attempts };
 }
 
-function approveInkosChapterIfReviewable(bookId, num) {
+function isEmbeddedCoreUnavailable(error) {
+  return /内置 InkOS core 未构建|Cannot find module|ERR_MODULE_NOT_FOUND|core 未就绪/i
+    .test(String(error?.message || error));
+}
+
+async function approveInkosChapterIfReviewable(bookId, num) {
   const diskChapter = readChapterIndex(bookId, { strict: true }).find(c => c.number === num);
   if (!diskChapter || diskChapter.status === 'approved') {
     return { synced: false, reason: diskChapter ? 'already approved' : 'missing on disk' };
@@ -758,20 +876,32 @@ function approveInkosChapterIfReviewable(bookId, num) {
   if (!isInkosApprovable(diskChapter)) {
     return { synced: false, reason: `not reviewable: ${diskChapter.status || 'unknown'}` };
   }
-  runInkosSync(['review', 'approve', bookId, String(num), '--json'], {
+  if (process.env.PUBLISHER_INKOS_RUNTIME !== 'subprocess') {
+    try {
+      const result = await runPublisherInkOS('review.approve', bookId, {
+        chapterNumber: num,
+        timeoutMs: 30000,
+      });
+      return { synced: true, reason: 'approved', runtime: 'framework', result };
+    } catch (err) {
+      if (!isEmbeddedCoreUnavailable(err)) throw err;
+      console.warn(`[inkos-review] 内置 core 未就绪，回退 CLI：${err.message}`);
+    }
+  }
+  await runInkos(['review', 'approve', bookId, String(num), '--json'], {
     cwd: PATHS.BOOKS_DIR,
     timeout: 30000,
     maxBuffer: 1024 * 1024,
   });
-  return { synced: true, reason: 'approved' };
+  return { synced: true, reason: 'approved', runtime: 'cli' };
 }
 
-function syncApprovedChaptersToInkos(bookId, book) {
+async function syncApprovedChaptersToInkos(bookId, book) {
   const results = [];
   for (const ch of book.chapters) {
     if (ch.status !== STATUS.APPROVED) continue;
     try {
-      const result = approveInkosChapterIfReviewable(bookId, ch.number);
+      const result = await approveInkosChapterIfReviewable(bookId, ch.number);
       if (result.synced) console.log(`[inkos-review] 已同步 InkOS 通过: ${bookId} 第${ch.number}章`);
       results.push({ number: ch.number, ...result });
     } catch (err) {
@@ -858,6 +988,54 @@ app.post('/api/books/import', (req, res) => {
   }
 });
 
+app.get('/api/books/:bookId/long-form-plan', (req, res) => {
+  try {
+    const bookId = assertBookId(req.params.bookId);
+    const state = loadState();
+    if (!getBook(state, bookId)) return res.status(404).json({ error: 'Book not found' });
+    res.json(loadOrMigrateLongFormPlan(bookId, { legacyBook: getBook(state, bookId) }));
+  } catch (err) {
+    res.status(err?.statusCode || 500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/books/:bookId/long-form-plan', (req, res) => {
+  try {
+    const bookId = assertBookId(req.params.bookId);
+    const state = loadState();
+    if (!getBook(state, bookId)) return res.status(404).json({ error: 'Book not found' });
+    if (rejectActiveBookMutation(res, bookId, '修改长篇规划')) return;
+
+    const body = req.body || {};
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return res.status(400).json({ error: 'PATCH body 必须是对象' });
+    }
+    if (body.expectedRevision !== undefined
+      && (!Number.isSafeInteger(body.expectedRevision) || body.expectedRevision < 1)) {
+      return res.status(400).json({ error: 'expectedRevision 必须是大于 0 的整数' });
+    }
+
+    const current = loadOrMigrateLongFormPlan(bookId, { legacyBook: getBook(state, bookId) });
+    if (body.expectedRevision !== undefined && body.expectedRevision !== current.revision) {
+      return res.status(409).json({
+        error: `长篇规划已更新，当前 revision 为 ${current.revision}`,
+        currentRevision: current.revision,
+      });
+    }
+    const next = updateLongFormPlan(current, body);
+    const diskIndex = readChapterIndex(bookId, { strict: true });
+    const writtenChapters = collectWrittenChapterMetrics(bookId, getBook(state, bookId), diskIndex);
+    assertLongFormHistoryPreserved(current, next, writtenChapters);
+    const committed = commitLongFormPlanUpdate(bookId, next, state, { saveState });
+    // Keep the in-memory object used by this request aligned with the committed
+    // snapshot; subsequent routes load state from disk again.
+    Object.assign(state, committed.state);
+    res.json(next);
+  } catch (err) {
+    res.status(err?.statusCode || 500).json({ error: err.message });
+  }
+});
+
 function safeSlug(input) {
   return String(input || '')
     .trim()
@@ -866,11 +1044,78 @@ function safeSlug(input) {
     .slice(0, 80) || `book-${Date.now().toString(36)}`;
 }
 
-function buildBookCreationBrief(payload = {}) {
+function resolveBookLanguage(bookId, book) {
+  const fromState = book?.inkos?.language || book?.language || book?.creation?.payload?.language;
+  if (fromState === 'en' || fromState === 'zh') return fromState;
+  try {
+    const metadata = JSON.parse(readFileSync(bookPath(bookId, 'book.json'), 'utf-8'));
+    return metadata.language === 'en' ? 'en' : 'zh';
+  } catch {
+    return 'zh';
+  }
+}
+
+function collectWrittenChapterMetrics(bookId, book, diskIndex = null) {
+  const language = resolveBookLanguage(bookId, book);
+  const metrics = new Map();
+  for (const chapter of book?.chapters || []) {
+    const number = Number(chapter?.number);
+    if (!Number.isSafeInteger(number) || number < 1) continue;
+    const words = Number(chapter.wordCount);
+    metrics.set(number, {
+      number,
+      wordCount: Number.isSafeInteger(words) && words >= 0 ? words : chapterLength(chapter.content || '', language),
+      source: 'state',
+      trusted: (Number.isSafeInteger(words) && words > 0) || Boolean(chapter.content),
+    });
+  }
+  for (const entry of Array.isArray(diskIndex) ? diskIndex : readChapterIndex(bookId, { strict: true })) {
+    const number = Number(entry?.number);
+    if (!Number.isSafeInteger(number) || number < 1) continue;
+    const words = Number(entry.wordCount);
+    let actualWords = Number.isSafeInteger(words) && words >= 0 ? words : null;
+    if (actualWords === null) {
+      const content = reReadChapter(bookId, number);
+      if (content !== null) actualWords = chapterLength(content, language);
+    }
+    const previous = metrics.get(number);
+    metrics.set(number, {
+      number,
+      wordCount: actualWords === null ? (previous?.wordCount || 0) : actualWords,
+      source: 'disk',
+      trusted: actualWords !== null && actualWords > 0,
+    });
+  }
+  return Array.from(metrics.values()).sort((left, right) => left.number - right.number);
+}
+
+function buildBookCreationBrief(payload = {}, longFormPlan) {
   const volumes = Array.isArray(payload.volumes) ? payload.volumes : [];
   const volumeText = volumes.length > 0
     ? volumes.map((v, i) => `- 卷${v.num || i + 1}：${v.title || ''}${v.subtitle ? '·' + v.subtitle : ''}，章节 ${v.start || ''}-${v.end || ''}，目标：${v.summary || v.context || ''}`).join('\n')
     : String(payload.volumePlan || '').trim();
+  const constraints = longFormPlan?.constraints;
+  const plan = longFormPlan?.plan;
+  const specialConstraints = constraints?.specialConstraints || (
+    Array.isArray(payload.constraints) ? payload.constraints : [payload.constraints || payload.notes || '']
+  );
+  const structuredBudget = plan ? [
+    '## 结构化长篇预算（权威）',
+    `- 精确目标总字数：${constraints.targetTotalWords}`,
+    `- 目标章数：${plan.targetChapters}`,
+    `- 分卷数：${constraints.volumeCount}`,
+    `- 目标单章字数：${constraints.targetChapterWords}`,
+    `- 单章字数容差：±${constraints.chapterWordTolerance}%`,
+    `- 单章允许范围：${plan.chapterWordRange.min}-${plan.chapterWordRange.max}`,
+    '',
+    '### 分卷预算',
+    ...plan.volumes.map(volume => `- 第${volume.number}卷：第${volume.startChapter}-${volume.endChapter}章，共${volume.chapterCount}章，精确预算${volume.targetWords}字`),
+    '',
+    '### 逐章预算摘要',
+    ...summarizeChapterBudgets(longFormPlan),
+    '',
+    '完整逐章预算数组已写入 long-form-plan.json；上述结构化预算不可被自由文本大纲覆盖。',
+  ] : [];
   return [
     `# ${payload.title || '未命名小说'} 创作简报`,
     '',
@@ -878,9 +1123,11 @@ function buildBookCreationBrief(payload = {}) {
     `- 书名：${payload.title || ''}`,
     `- 类型：${payload.genre || 'xuanhuan'}`,
     `- 平台：${payload.platform || 'tomato'}`,
-    `- 总章数：${payload.targetChapters || ''}`,
-    `- 单章字数：${payload.chapterWords || ''}`,
-    `- 总字数：${payload.totalWords || ''}`,
+    `- 总章数：${plan?.targetChapters || payload.targetChapters || ''}`,
+    `- 单章字数：${constraints?.targetChapterWords || payload.chapterWords || ''}`,
+    `- 总字数：${constraints?.targetTotalWords || payload.totalWords || ''}`,
+    '',
+    ...structuredBudget,
     '',
     `## 核心创意`,
     payload.premise || '',
@@ -902,7 +1149,7 @@ function buildBookCreationBrief(payload = {}) {
     payload.style || '',
     '',
     `## 禁忌与特别要求`,
-    payload.constraints || payload.notes || '',
+    ...specialConstraints.map(value => String(value || '').trim()).filter(Boolean),
   ].join('\n').trim() + '\n';
 }
 
@@ -918,10 +1165,62 @@ function parseMaybeJson(text) {
   return { raw };
 }
 
-async function runCreateBookJob(jobId, payload, briefPath) {
+function registerCreatedBookInPublisherState({ bookId, title, payload, briefPath, longFormPlan }) {
+  const state = loadState();
+  const now = new Date().toISOString();
+  if (!state.books[bookId]) {
+    state.books[bookId] = {
+      title,
+      chapters: [],
+      createdAt: now,
+      updatedAt: now,
+      inkos: {
+        bookId,
+        genre: payload.genre || 'xuanhuan',
+        platform: payload.platform || 'tomato',
+        language: payload.language === 'en' ? 'en' : 'zh',
+        targetChapters: longFormPlan.plan.targetChapters,
+        chapterWordCount: longFormPlan.constraints.targetChapterWords,
+      },
+      creation: {
+        success: true,
+        briefPath,
+        payload,
+        longFormPlanRevision: longFormPlan.revision,
+      },
+    };
+  } else {
+    const existingBook = state.books[bookId];
+    existingBook.title = existingBook.title || title;
+    existingBook.inkos = {
+      ...(existingBook.inkos || {}),
+      bookId,
+      genre: payload.genre || existingBook.inkos?.genre || 'xuanhuan',
+      platform: payload.platform || existingBook.inkos?.platform || 'tomato',
+      language: payload.language === 'en' ? 'en' : 'zh',
+      targetChapters: longFormPlan.plan.targetChapters,
+      chapterWordCount: longFormPlan.constraints.targetChapterWords,
+    };
+    existingBook.creation = {
+      success: true,
+      briefPath,
+      payload,
+      longFormPlanRevision: longFormPlan.revision,
+    };
+    existingBook.updatedAt = now;
+  }
+  saveState(state);
+}
+
+async function runCreateBookJob(jobId, payload, briefPath, planTemplate) {
   const job = creationJobs.get(jobId);
   if (!job) return;
   const title = String(payload.title || '').trim();
+  let commandStdout = '';
+  let commandStderr = '';
+  let createdBookId = '';
+  let committedLongFormPlan = null;
+  const expectedBookId = assertBookId(safeSlug(title));
   try {
     job.status = 'running';
     job.updatedAt = new Date().toISOString();
@@ -931,59 +1230,158 @@ async function runCreateBookJob(jobId, payload, briefPath) {
       '--title', title,
       '--genre', payload.genre || 'xuanhuan',
       '--platform', payload.platform || 'tomato',
-      '--target-chapters', String(payload.targetChapters || 200),
-      '--chapter-words', String(payload.chapterWords || 3000),
+      '--target-chapters', String(planTemplate.plan.targetChapters),
+      '--chapter-words', String(planTemplate.constraints.targetChapterWords),
       '--brief', briefPath,
       '--lang', payload.language || 'zh',
       '--json',
     ];
     job.args = args;
-    const storedCfg = getInkosConfig();
-    const { stdout, stderr } = await runInkos(args, {
-      cwd: PATHS.BOOKS_DIR,
-      timeout: Number(process.env.PUBLISHER_CREATE_BOOK_TIMEOUT_MS || '900000'),
-      maxBuffer: 20 * 1024 * 1024,
-      env: storedCfg.reviewApiKey ? { PUBLISHER_REVIEW_API_KEY: storedCfg.reviewApiKey } : {},
-    });
-    const parsed = parseMaybeJson(stdout);
-    if (parsed.error) throw new Error(parsed.error);
-    const bookId = parsed.bookId || safeSlug(title);
-    const state = loadState();
-    if (!state.books[bookId]) {
-      state.books[bookId] = {
-        title,
-        chapters: [],
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        inkos: {
-          bookId,
-          genre: payload.genre || 'xuanhuan',
+    let parsed;
+    let frameworkPlan = null;
+    if (process.env.PUBLISHER_INKOS_RUNTIME !== 'subprocess') {
+      try {
+        const bookId = expectedBookId;
+        const requestedLongFormPlan = buildLongFormPlan(bookId, planTemplate.constraints, {
+          source: 'created',
+          createdAt: planTemplate.createdAt,
+          now: planTemplate.updatedAt,
+        });
+        const now = new Date().toISOString();
+        const book = {
+          id: bookId,
+          title,
           platform: payload.platform || 'tomato',
-          targetChapters: Number(payload.targetChapters || 200),
-          chapterWordCount: Number(payload.chapterWords || 3000),
-        },
-        creation: { success: true, briefPath, payload },
-      };
+          genre: payload.genre || 'xuanhuan',
+          status: 'outlining',
+          targetChapters: planTemplate.plan.targetChapters,
+          chapterWordCount: planTemplate.constraints.targetChapterWords,
+          language: payload.language === 'en' ? 'en' : 'zh',
+          createdAt: now,
+          updatedAt: now,
+        };
+        const brief = readFileSync(briefPath, 'utf-8');
+        await runPublisherInkOS('book.init', bookId, {
+          book,
+          initOptions: { externalContext: brief, longFormPlan: requestedLongFormPlan },
+          traceId: job.traceId,
+          timeoutMs: Number(process.env.PUBLISHER_CREATE_BOOK_TIMEOUT_MS || '900000'),
+        });
+        frameworkPlan = readLongFormPlan(bookId);
+        parsed = { bookId, title: book.title, runtime: 'framework' };
+      } catch (error) {
+        if (!/内置 InkOS core 未构建|Cannot find module|ERR_MODULE_NOT_FOUND|core 未就绪/i.test(String(error?.message || error))) {
+          throw error;
+        }
+        console.warn(`[book-create] 内置 core 未就绪，回退 CLI：${error.message}`);
+      }
     }
-    saveState(state);
+    if (!parsed) {
+      const storedCfg = getInkosConfig();
+      const { stdout, stderr } = await runInkos(args, {
+        cwd: PATHS.BOOKS_DIR,
+        timeout: Number(process.env.PUBLISHER_CREATE_BOOK_TIMEOUT_MS || '900000'),
+        maxBuffer: 20 * 1024 * 1024,
+        traceId: job.traceId,
+        env: {
+          ...(storedCfg.reviewApiKey ? { PUBLISHER_REVIEW_API_KEY: storedCfg.reviewApiKey } : {}),
+          ...(job.traceId ? { MACINKOSTOMO_TRACE_ID: job.traceId } : {}),
+          INKOS_FRAMEWORK_EVENTS: '1',
+        },
+      });
+      commandStdout = stdout;
+      commandStderr = stderr;
+      parsed = parseMaybeJson(stdout);
+    }
+    if (parsed.error) throw new Error(parsed.error);
+    const bookId = assertBookId(parsed.bookId || safeSlug(title));
+    createdBookId = bookId;
+    job.bookId = bookId;
+    job.updatedAt = new Date().toISOString();
+    persistWorkflowJobs();
+
+    let longFormPlan = frameworkPlan;
+    try {
+      if (!longFormPlan) {
+        const requestedPlan = buildLongFormPlan(bookId, planTemplate.constraints, {
+          source: 'created',
+          createdAt: planTemplate.createdAt,
+        });
+        const seededPlan = readLongFormPlan(bookId);
+        longFormPlan = writeLongFormPlan(
+          bookId,
+          seededPlan ? preserveLongFormSeed(requestedPlan, seededPlan) : requestedPlan,
+        );
+      }
+    } catch (err) {
+      throw new Error(`InkOS 已创建书籍 ${bookId}，但长篇规划保存失败：${err.message}`, { cause: err });
+    }
+    committedLongFormPlan = longFormPlan;
+    registerCreatedBookInPublisherState({ bookId, title, payload, briefPath, longFormPlan });
     Object.assign(job, {
       status: 'success',
       bookId,
       title,
-      stdout: String(stdout || '').slice(-4000),
-      stderr: String(stderr || '').slice(-4000),
+      stdout: String(commandStdout || '').slice(-4000),
+      stderr: String(commandStderr || '').slice(-4000),
+      longFormPlanRevision: longFormPlan.revision,
       finishedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     });
     persistWorkflowJobs();
     console.log(`[book-create] 已创建 ${title} (${bookId})`);
   } catch (err) {
+    if (createdBookId && committedLongFormPlan) {
+      try {
+        registerCreatedBookInPublisherState({
+          bookId: createdBookId,
+          title,
+          payload,
+          briefPath,
+          longFormPlan: committedLongFormPlan,
+        });
+        Object.assign(job, {
+          status: 'success',
+          bookId: createdBookId,
+          title,
+          warning: `Publisher 状态首次登记失败，重试后已恢复：${err.message}`,
+          recoveredStateCommit: true,
+          longFormPlanRevision: committedLongFormPlan.revision,
+          stdout: String(commandStdout || '').slice(-4000),
+          stderr: String(commandStderr || '').slice(-4000),
+          finishedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+        persistWorkflowJobs();
+        debugEvent('book-create', 'Publisher state commit recovered', {
+          initialError: err.message,
+          longFormPlanRevision: committedLongFormPlan.revision,
+        }, 'warn', {
+          traceId: job.traceId,
+          operation: 'book.create',
+          phase: 'success',
+          bookId: createdBookId,
+        });
+        return;
+      } catch (recoveryError) {
+        err = new Error(`${err.message}；Publisher 状态重试仍失败：${recoveryError.message}`, { cause: recoveryError });
+      }
+    }
     const parsed = parseMaybeJson(err.stdout);
+    const recoveryBookId = createdBookId || expectedBookId;
+    const recovery = creationRecovery(recoveryBookId);
+    const recoveryMessage = recovery?.recovery.importable
+      ? '；InkOS 产物已保留，可通过“导入现有小说”恢复 Publisher 登记。'
+      : recovery
+        ? '；InkOS 中间产物已保留，请检查恢复目录后再处理。'
+        : '';
     Object.assign(job, {
       status: 'failed',
-      error: parsed.error || err.message,
-      stdout: String(err.stdout || '').slice(-4000),
-      stderr: String(err.stderr || '').slice(-4000),
+      error: `${parsed.error || err.message}${recoveryMessage}`,
+      bookId: createdBookId || job.bookId || (recovery ? recoveryBookId : undefined),
+      ...(recovery || { recoverable: false }),
+      stdout: String(err.stdout || commandStdout || '').slice(-4000),
+      stderr: String(err.stderr || commandStderr || '').slice(-4000),
       finishedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     });
@@ -997,25 +1395,81 @@ app.post('/api/books/create', asyncRoute(async (req, res) => {
   const payload = req.body || {};
   const title = String(payload.title || '').trim();
   if (!title) return res.status(400).json({ error: 'title required' });
+  const constraints = normalizeLongFormConstraints(payload, {}, { requireSpecialConstraints: true });
+  const expectedBookId = assertBookId(safeSlug(title));
+  const duplicateJob = Array.from(creationJobs.values()).find(job => (
+    !job.finishedAt && (job.expectedBookId === expectedBookId || job.bookId === expectedBookId)
+  ));
+  if (duplicateJob) {
+    return res.status(409).json({ error: '同名小说的创建任务正在运行，请等待当前任务结束。', job: duplicateJob });
+  }
+  const diskRecovery = creationRecovery(expectedBookId);
+  if (diskRecovery) {
+    return res.status(409).json({
+      error: diskRecovery.recovery.importable
+        ? '同名 InkOS 小说目录已存在。为保护现有数据，请改用其他书名，或通过“导入现有小说”恢复 Publisher 登记。'
+        : '同名 InkOS 恢复目录已存在。为保护中间产物，请先检查该目录或改用其他书名。',
+      bookId: expectedBookId,
+      ...diskRecovery,
+    });
+  }
+  const state = loadState();
+  if (getBook(state, expectedBookId)) {
+    return res.status(409).json({
+      error: 'Publisher 中已存在同 ID 小说。为保护现有章节状态，请先处理该小说或改用其他书名。',
+      bookId: expectedBookId,
+    });
+  }
+  const planCreatedAt = new Date().toISOString();
+  const planTemplate = buildLongFormPlan(expectedBookId, constraints, {
+    source: 'created',
+    createdAt: planCreatedAt,
+    now: planCreatedAt,
+  });
+  const normalizedPayload = {
+    ...payload,
+    targetChapters: planTemplate.plan.targetChapters,
+    chapterWords: planTemplate.constraints.targetChapterWords,
+    totalWords: planTemplate.constraints.targetTotalWords,
+    longFormConstraints: planTemplate.constraints,
+  };
 
   ensureLocalInkosProject();
   const briefDir = join(__dirname, 'data', 'create-briefs');
   mkdirSync(briefDir, { recursive: true });
   const briefPath = join(briefDir, `${Date.now()}-${safeSlug(title)}.md`);
-  writeFileSync(briefPath, buildBookCreationBrief(payload), 'utf-8');
+  writePrivateFile(briefPath, buildBookCreationBrief(normalizedPayload, planTemplate));
 
   const jobId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   creationJobs.set(jobId, {
     jobId,
     status: 'queued',
     title,
+    expectedBookId,
     briefPath,
+    longFormConstraints: planTemplate.constraints,
+    traceId: req.traceId,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   });
   persistWorkflowJobs();
-  res.json({ message: 'InkOS 正在创建小说设定与大纲...', status: 'processing', jobId, title });
-  runCreateBookJob(jobId, payload, briefPath);
+  res.json({
+    message: 'InkOS 正在创建小说设定与大纲...',
+    status: 'processing',
+    jobId,
+    title,
+    traceId: req.traceId,
+    longFormPlan: {
+      version: planTemplate.version,
+      revision: planTemplate.revision,
+      constraints: planTemplate.constraints,
+      plan: {
+        targetChapters: planTemplate.plan.targetChapters,
+        chapterWordRange: planTemplate.plan.chapterWordRange,
+      },
+    },
+  });
+  runCreateBookJob(jobId, normalizedPayload, briefPath, planTemplate);
 }));
 
 app.post('/api/books/create/assist', asyncRoute(async (req, res) => {
@@ -1119,8 +1573,8 @@ app.get('/api/books/:bookId/chapters', (req, res) => {
   // 附上分卷信息
   const maxNum = chapters.length > 0 ? Math.max(...chapters.map(c => c.number)) : 0;
   const nextChapterNum = maxNum + 1;
-  const volumes = getVolumesForBook(req.params.bookId);
-  const currentVolume = getVolumeForChapter(maxNum > 0 ? maxNum : 1, req.params.bookId);
+  const volumes = getVolumesForBook(req.params.bookId, book);
+  const currentVolume = getVolumeForChapter(maxNum > 0 ? maxNum : 1, req.params.bookId, book);
   res.json({
     bookId: req.params.bookId,
     bookTitle: book.title,
@@ -1132,6 +1586,9 @@ app.get('/api/books/:bookId/chapters', (req, res) => {
         num: v.num, title: v.title, subtitle: v.subtitle,
         start: v.start, end: v.end,
         context: v.context || '',
+        targetWords: v.targetWords || null,
+        chapterCount: v.chapterCount || (v.end - v.start + 1),
+        structured: Boolean(v.structured),
         chaptersInVolume: inVol,
         isCurrent: currentVolume && currentVolume.num === v.num,
         progress: maxNum > 0
@@ -1168,7 +1625,7 @@ app.get('/api/books/:bookId/chapters/:num', (req, res) => {
 
 // Update chapter status. Normal rejection/revision uses POST /revise; this PATCH
 // route remains for approval and compatibility with manual content updates.
-app.patch('/api/books/:bookId/chapters/:num', (req, res) => {
+app.patch('/api/books/:bookId/chapters/:num', asyncRoute(async (req, res) => {
   const num = parseChapterNum(req.params.num);
   if (!num) return res.status(400).json({ error: 'Invalid chapter number' });
   const state = loadState();
@@ -1214,7 +1671,7 @@ app.patch('/api/books/:bookId/chapters/:num', (req, res) => {
   let approveSync = null;
   if (status === STATUS.APPROVED) {
     try {
-      approveSync = approveInkosChapterIfReviewable(bookId, num);
+      approveSync = await approveInkosChapterIfReviewable(bookId, num);
       if (approveSync.synced) console.log(`[inkos-review] 前端通过后同步 InkOS: ${bookId} 第${num}章`);
     } catch (err) {
       console.warn(`[inkos-review] 前端通过第${num}章后同步 InkOS 失败: ${err.message}`);
@@ -1243,7 +1700,7 @@ app.patch('/api/books/:bookId/chapters/:num', (req, res) => {
   saveState(state);
   const diskEntry = getInkosChapterEntry(bookId, num);
   res.json(diskEntry ? mergeInkosChapterForClient(bookId, book, diskEntry) : chapter);
-});
+}));
 
 // Preview knowledge retrieval for a chapter
 app.post('/api/books/:bookId/chapters/:num/knowledge', asyncRoute(async (req, res) => {
@@ -1968,7 +2425,7 @@ function parseVolumeNum(raw, fallback) {
   return CN_NUM[s] || fallback;
 }
 
-function getVolumesForBook(bookId) {
+function getLegacyVolumesForBook(bookId) {
   const file = join(PATHS.BOOKS_SUBDIR, bookId, 'story', 'outline', 'volume_map.md');
   if (!existsSync(file)) return [];
   const text = readFileSync(file, 'utf-8');
@@ -2004,8 +2461,32 @@ function getVolumesForBook(bookId) {
   return volumes.sort((a, b) => a.start - b.start);
 }
 
-function getVolumeForChapter(chapterNum, bookId = null) {
-  const volumes = bookId ? getVolumesForBook(bookId) : [];
+function getVolumesForBook(bookId, legacyBook = null) {
+  const legacyVolumes = getLegacyVolumesForBook(bookId);
+  // Ordinary chapter reads are intentionally side-effect free. A missing plan
+  // stays on the Markdown legacy fallback; GET /long-form-plan or generation
+  // performs the explicit migration and atomic write.
+  const plan = readLongFormPlan(bookId);
+  if (!plan) return legacyVolumes;
+  const structuredByNumber = new Map(legacyVolumes.map(volume => [volume.num, volume]));
+  return plan.plan.volumes.map(volume => {
+    const legacy = structuredByNumber.get(volume.number) || {};
+    return {
+      num: volume.number,
+      title: legacy.title || `第${volume.number}卷`,
+      subtitle: legacy.subtitle || '',
+      start: volume.startChapter,
+      end: volume.endChapter,
+      context: legacy.context || `结构化预算：${volume.targetWords}字，共${volume.chapterCount}章。`,
+      targetWords: volume.targetWords,
+      chapterCount: volume.chapterCount,
+      structured: true,
+    };
+  });
+}
+
+function getVolumeForChapter(chapterNum, bookId = null, legacyBook = null) {
+  const volumes = bookId ? getVolumesForBook(bookId, legacyBook) : [];
   return volumes.find(v => chapterNum >= v.start && chapterNum <= v.end) || null;
 }
 
@@ -2125,7 +2606,7 @@ function reconcileWithDisk(state, bookId) {
       bookTitle: book.title,
     });
     // 标注分卷（与 /generate 一致）
-    const v = getVolumeForChapter(entry.number, bookId);
+    const v = getVolumeForChapter(entry.number, bookId, book);
     const ch = getChapter(getBook(state, bookId), entry.number);
     if (ch && v) {
       ch.volume = v.num;
@@ -2207,6 +2688,9 @@ app.post('/api/books/:bookId/generate', asyncRoute(async (req, res) => {
       });
     }
 
+    const bookLanguage = resolveBookLanguage(bookId, book);
+    const longFormPlan = loadOrMigrateLongFormPlan(bookId, { legacyBook: book });
+
     let diskIndex;
     try {
       diskIndex = readChapterIndex(bookId, { strict: true });
@@ -2217,7 +2701,7 @@ app.post('/api/books/:bookId/generate', asyncRoute(async (req, res) => {
       return res.status(503).json({ error: 'InkOS 章节索引缺失，但 Publisher 仍有章节记录；为避免覆盖现有章节，已停止生成。' });
     }
 
-    syncApprovedChaptersToInkos(bookId, book);
+    await syncApprovedChaptersToInkos(bookId, book);
     diskIndex = readChapterIndex(bookId, { strict: true });
     const blockingChapter = diskIndex.find(ch => !isInkosCommitted(ch));
     if (blockingChapter) {
@@ -2231,7 +2715,27 @@ app.post('/api/books/:bookId/generate', asyncRoute(async (req, res) => {
       ? Math.max(...diskIndex.map(c => c.number).filter(Boolean))
       : (book.chapters.length > 0 ? Math.max(...book.chapters.map(c => c.number)) : 0);
     const nextNum = maxNum + 1;
-    const vol = getVolumeForChapter(nextNum, bookId);
+    if (nextNum > longFormPlan.plan.targetChapters) {
+      return res.status(409).json({
+        error: `全书规划共 ${longFormPlan.plan.targetChapters} 章，已到达结构化长篇规划上限。请先更新长篇规划。`,
+        targetChapters: longFormPlan.plan.targetChapters,
+        revision: longFormPlan.revision,
+      });
+    }
+    const chapterBudget = longFormPlan.plan.chapters[nextNum - 1];
+    const writtenMetrics = collectWrittenChapterMetrics(bookId, book, diskIndex);
+    let adaptiveBudget;
+    try {
+      adaptiveBudget = resolveAdaptiveChapterBudget(longFormPlan, nextNum, writtenMetrics);
+    } catch (err) {
+      return res.status(err?.statusCode || 409).json({ error: err.message });
+    }
+    const structuredGuidance = renderLongFormChapterContext(longFormPlan, nextNum, {
+      targetWords: adaptiveBudget.targetWords,
+      minWords: adaptiveBudget.minWords,
+      maxWords: adaptiveBudget.maxWords,
+    });
+    const vol = getVolumeForChapter(nextNum, bookId, book);
     const queuedAt = new Date().toISOString();
     setGenerationJob(bookId, nextNum, {
       phase: 'inkos_writing',
@@ -2241,6 +2745,12 @@ app.post('/api/books/:bookId/generate', asyncRoute(async (req, res) => {
       message: '已提交生成请求',
       liveText: '',
       liveTextTruncated: false,
+      longFormPlanRevision: longFormPlan.revision,
+      targetWords: adaptiveBudget.targetWords,
+      plannedTargetWords: chapterBudget.targetWords,
+      adaptiveBudget,
+      wordRange: { min: adaptiveBudget.minWords, max: adaptiveBudget.maxWords },
+      traceId: req.traceId,
       progress: [{
         stage: 'queued',
         eventKey: 'queued',
@@ -2250,8 +2760,8 @@ app.post('/api/books/:bookId/generate', asyncRoute(async (req, res) => {
       }],
     });
 
-    // 构建分卷感知的 guidance。InkOS 的 volume_map.md 是权威；
-    // Publisher 每章都注入当前卷边界，避免长篇生成时逐渐忘记卷切换。
+    // 构建分卷感知的 guidance。结构化计划提供权威边界，旧版
+    // volume_map.md 只补充卷名和语义说明。
     let volumeGuidance = '';
     if (vol) {
       const volumeName = `${vol.title}${vol.subtitle ? '·' + vol.subtitle : ''}`;
@@ -2270,7 +2780,7 @@ app.post('/api/books/:bookId/generate', asyncRoute(async (req, res) => {
         ].join('\n');
       } else if (nextNum >= vol.end - 30) {
         // 卷尾临近：提示收束
-        const nextVol = getVolumesForBook(bookId).find(v => v.num === vol.num + 1);
+        const nextVol = getVolumesForBook(bookId, book).find(v => v.num === vol.num + 1);
         volumeGuidance = [
           ...baseLines,
           `本章处于卷尾收束阶段，距卷末还有 ${vol.end - nextNum + 1} 章。`,
@@ -2285,15 +2795,18 @@ app.post('/api/books/:bookId/generate', asyncRoute(async (req, res) => {
       }
     }
 
-    // 合并用户 guidance 和分卷 guidance（用户指导优先但不覆盖分卷结构）
-    const finalGuidance = [volumeGuidance, guidance].filter(Boolean).join('\n\n') || undefined;
+    // 结构化预算是权威约束；自由文本分卷与用户指导只能补充情节目标。
+    const finalGuidance = [structuredGuidance, volumeGuidance, guidance].filter(Boolean).join('\n\n') || undefined;
 
-    res.json({ message: 'InkOS 正在生成新章节...', status: 'processing' });
+    res.json({ message: 'InkOS 正在生成新章节...', status: 'processing', traceId: req.traceId });
 
     let trackedChapterNum = nextNum;
     let generatedVolume = vol;
+    let effectiveGenerationBudget = adaptiveBudget;
     try {
       const result = await generateChapter(bookId, finalGuidance, {
+        targetWords: adaptiveBudget.targetWords,
+        traceId: req.traceId,
         onProgress: progress => appendGenerationProgress(bookId, nextNum, progress, { phase: 'inkos_writing' }),
         onTextDelta: text => appendGenerationText(bookId, nextNum, text),
       });
@@ -2302,19 +2815,37 @@ app.post('/api/books/:bookId/generate', asyncRoute(async (req, res) => {
         if (!Number.isSafeInteger(actualChapterNum) || actualChapterNum < 1) {
           throw new Error(`InkOS 返回了无效章节号: ${String(result.newChapterNum)}`);
         }
+        if (actualChapterNum > longFormPlan.plan.targetChapters) {
+          throw new Error(`InkOS 生成了超出结构化规划上限的第${actualChapterNum}章`);
+        }
         result.newChapterNum = actualChapterNum;
         if (actualChapterNum !== nextNum) {
+          const postGenerationIndex = readChapterIndex(bookId, { strict: true });
+          const postGenerationMetrics = collectWrittenChapterMetrics(bookId, book, postGenerationIndex);
+          effectiveGenerationBudget = resolveAdaptiveChapterBudget(
+            longFormPlan,
+            actualChapterNum,
+            postGenerationMetrics,
+          );
           finishGenerationJob(bookId, nextNum, {
             phase: 'complete_retargeted',
             message: `InkOS 实际生成第${actualChapterNum}章，任务已转移`,
             actualChapterNum,
           });
           trackedChapterNum = actualChapterNum;
-          generatedVolume = getVolumeForChapter(actualChapterNum, bookId);
+          generatedVolume = getVolumeForChapter(actualChapterNum, bookId, book);
           setGenerationJob(bookId, actualChapterNum, {
             phase: 'inkos_writing',
             title: result.title || '',
             message: `已接收 InkOS 实际生成的第${actualChapterNum}章`,
+            traceId: req.traceId,
+            targetWords: effectiveGenerationBudget.targetWords,
+            plannedTargetWords: effectiveGenerationBudget.plannedTargetWords,
+            adaptiveBudget: effectiveGenerationBudget,
+            wordRange: {
+              min: effectiveGenerationBudget.minWords,
+              max: effectiveGenerationBudget.maxWords,
+            },
           });
         }
       }
@@ -2343,7 +2874,15 @@ app.post('/api/books/:bookId/generate', asyncRoute(async (req, res) => {
             ch.reviewNotes = inkosReview.revisionGuidance;
           }
           commitBookFromSnapshot(freshState, bookId, { chapterNumbers: [result.newChapterNum] });
-          finishGenerationJob(bookId, trackedChapterNum, { phase: 'complete_inkos_failed', llmReview: inkosReview });
+          const actualWords = chapterLength(result.newContent, bookLanguage);
+          finishGenerationJob(bookId, trackedChapterNum, {
+            phase: 'complete_inkos_failed',
+            llmReview: inkosReview,
+            actualWords,
+            wordDrift: actualWords - effectiveGenerationBudget.targetWords,
+            targetWords: effectiveGenerationBudget.targetWords,
+            wordRange: { min: effectiveGenerationBudget.minWords, max: effectiveGenerationBudget.maxWords },
+          });
           console.warn(`[generate] 第 ${result.newChapterNum} 章 InkOS 自审未通过，已拦截系统 LLM 初审`);
           return;
         }
@@ -2384,6 +2923,55 @@ app.post('/api/books/:bookId/generate', asyncRoute(async (req, res) => {
           console.error(`[llm-review] 第${result.newChapterNum}章初审异常:`, reviewErr);
         }
 
+        let artifactSync = null;
+        if (finalContent !== result.newContent) {
+          artifactSync = await syncInkosChapterArtifacts(
+            bookId,
+            result.newChapterNum,
+            'Publisher 初审修订后的正文同步',
+          );
+          if (!artifactSync.synced) {
+            const syncIssue = `修订正文未能同步到 InkOS truth/index：${artifactSync.reason || '未知原因'}`;
+            llmReview = {
+              ...(llmReview || {}),
+              status: 'failed',
+              model: llmReview?.model || '',
+              summary: `${llmReview?.summary ? `${llmReview.summary}；` : ''}${syncIssue}`,
+              issues: [...(llmReview?.issues || []), syncIssue],
+              revisionGuidance: [llmReview?.revisionGuidance, syncIssue].filter(Boolean).join('\n'),
+              reviewedAt: llmReview?.reviewedAt || new Date().toISOString(),
+              attempts: llmReview?.attempts || [],
+            };
+          }
+        }
+
+        const actualWords = chapterLength(finalContent, bookLanguage);
+        const actualBudget = effectiveGenerationBudget;
+        let wordGate = {
+          passed: !artifactSync || artifactSync.synced,
+          actualWords,
+          minWords: actualBudget.minWords,
+          maxWords: actualBudget.maxWords,
+          artifactSync,
+        };
+        if (actualWords < actualBudget.minWords || actualWords > actualBudget.maxWords) {
+          const driftIssue = `机器字数门禁未通过：实际 ${actualWords} 字，允许 ${actualBudget.minWords}-${actualBudget.maxWords} 字`;
+          llmReview = {
+            ...(llmReview || {}),
+            status: 'failed',
+            model: llmReview?.model || '',
+            summary: `${llmReview?.summary ? `${llmReview.summary}；` : ''}${driftIssue}`,
+            issues: [...(llmReview?.issues || []), driftIssue],
+            revisionGuidance: [llmReview?.revisionGuidance, driftIssue].filter(Boolean).join('\n'),
+            reviewedAt: llmReview?.reviewedAt || new Date().toISOString(),
+            attempts: llmReview?.attempts || [],
+          };
+          const sync = await syncInkosChapterArtifacts(bookId, result.newChapterNum, driftIssue);
+          const reject = await rejectInkosChapterKeepSubsequent(bookId, result.newChapterNum, driftIssue);
+          wordGate = { ...wordGate, passed: false, issue: driftIssue, sync, reject };
+          console.warn(`[generate] 第${result.newChapterNum}章字数门禁失败：${actualWords}，允许 ${actualBudget.minWords}-${actualBudget.maxWords}`);
+        }
+
         upsertChapterInMemory(freshState, bookId, {
           number: result.newChapterNum,
           title: result.title || '',
@@ -2405,7 +2993,15 @@ app.post('/api/books/:bookId/generate', asyncRoute(async (req, res) => {
           ch.status = llmReview?.status === 'passed' ? STATUS.PENDING_REVIEW : STATUS.REVISION_FAILED;
         }
         commitBookFromSnapshot(freshState, bookId, { chapterNumbers: [result.newChapterNum] });
-        finishGenerationJob(bookId, trackedChapterNum, { phase: llmReview?.status === 'passed' ? 'complete_passed' : 'complete_needs_review', llmReview });
+        finishGenerationJob(bookId, trackedChapterNum, {
+          phase: llmReview?.status === 'passed' ? 'complete_passed' : 'complete_needs_review',
+          llmReview,
+          wordGate,
+          actualWords,
+          wordDrift: actualWords - effectiveGenerationBudget.targetWords,
+          targetWords: effectiveGenerationBudget.targetWords,
+          wordRange: { min: actualBudget.minWords, max: actualBudget.maxWords },
+        });
         console.log(`[generate] 第 ${result.newChapterNum} 章 生成成功 (${generatedVolume ? '卷' + generatedVolume.num + '·' + generatedVolume.title : '规划外'})`);
       } else {
         finishGenerationJob(bookId, trackedChapterNum, { phase: 'failed', error: result.error });
@@ -2416,7 +3012,7 @@ app.post('/api/books/:bookId/generate', asyncRoute(async (req, res) => {
       console.error('[generate] 异常:', err);
     }
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err?.statusCode || 500).json({ error: err.message });
   }
 }));
 
@@ -2464,7 +3060,66 @@ app.get('/api/books/:bookId/generation/:chapterNum', (req, res) => {
 });
 
 app.get('/api/debug/events', (req, res) => {
-  res.json({ events: readDebugEvents(req.query.limit || 300), files: debugFileInfo() });
+  const result = queryDebugEvents({
+    limit: req.query.limit || 300,
+    after: req.query.after,
+    before: req.query.before,
+    level: req.query.level,
+    component: req.query.component || req.query.scope,
+    operation: req.query.operation,
+    traceId: req.query.traceId,
+    bookId: req.query.bookId,
+    chapterNumber: req.query.chapterNumber,
+    text: req.query.text,
+  });
+  if (req.query.format === 'jsonl' || req.accepts(['json', 'application/x-ndjson']) === 'application/x-ndjson') {
+    res.type('application/x-ndjson');
+    return res.send(result.events.map(event => JSON.stringify(event)).join('\n') + (result.events.length ? '\n' : ''));
+  }
+  res.json({ ...result, files: debugFileInfo() });
+});
+
+app.get('/api/debug/schema', (req, res) => {
+  res.json(debugSchema());
+});
+
+app.get('/api/debug/health', (req, res) => {
+  const health = debugHealth();
+  res.status(health.status === 'healthy' ? 200 : 503).json(health);
+});
+
+app.get('/api/debug/stream', (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders?.();
+  const send = event => {
+    if (req.query.traceId && event.traceId !== String(req.query.traceId)) return;
+    if (req.query.component && event.component !== String(req.query.component)) return;
+    if (req.query.bookId && event.bookId !== String(req.query.bookId)) return;
+    if (req.query.chapterNumber && event.chapterNumber !== Number(req.query.chapterNumber)) return;
+    res.write(`id: ${event.sequence}\nevent: diagnostic\ndata: ${JSON.stringify(event)}\n\n`);
+  };
+  const backlog = queryDebugEvents({
+    limit: req.query.limit || 200,
+    after: req.query.after || req.get('Last-Event-ID'),
+    traceId: req.query.traceId,
+    component: req.query.component,
+    bookId: req.query.bookId,
+    chapterNumber: req.query.chapterNumber,
+  });
+  backlog.events.forEach(send);
+  debugEvents.on('event', send);
+  const heartbeat = setInterval(() => {
+    if (!res.writableEnded) res.write(': keepalive\n\n');
+  }, 15_000);
+  req.once('close', () => {
+    clearInterval(heartbeat);
+    debugEvents.off('event', send);
+  });
 });
 
 app.get('/api/debug/jobs', (req, res) => {
@@ -2756,6 +3411,7 @@ app.post('/api/inkos/config', asyncRoute(async (req, res) => {
       reviewApiKey: incoming.reviewApiKey ? incoming.reviewApiKey : (stored.reviewApiKey || ''),
     };
     const result = await applyInkosConfig(cfg);
+    await invalidatePublisherInkOSRuntime();
     res.json({ ok: true, ...result });
   } catch (err) {
     res.status(err?.statusCode || 500).json({ error: err.message });
@@ -3083,7 +3739,11 @@ function shutdown(signal) {
   }
   persistWorkflowJobs();
   const terminatedChildren = Number(shutdownFanqie()) + shutdownInkos();
-  server.close(() => {
+  const runtimeShutdown = shutdownPublisherInkOSRuntime({ waitForActive: true }).catch(err => {
+    console.warn('[server] 内置 InkOS 运行时关闭异常:', err.message);
+  });
+  server.close(async () => {
+    await runtimeShutdown;
     if (terminatedChildren > 0) {
       setTimeout(() => process.exit(0), 1800);
     } else {

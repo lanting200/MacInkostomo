@@ -1,5 +1,6 @@
-import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import yaml from "js-yaml";
 import type {
   ChapterTrace,
@@ -27,15 +28,25 @@ export async function writeGovernedRuntimeArtifacts(params: {
   const ruleStackPath = join(params.runtimeDir, `${chapterSlug}.rule-stack.yaml`);
   const tracePath = join(params.runtimeDir, `${chapterSlug}.trace.json`);
 
-  await Promise.all([
-    writeFile(contextPath, JSON.stringify(params.contextPackage, null, 2), "utf-8"),
-    writeFile(ruleStackPath, yaml.dump(params.ruleStack, { lineWidth: 120 }), "utf-8"),
-    writeFile(tracePath, JSON.stringify(params.trace, null, 2), "utf-8"),
-  ]);
+  await writeAtomicText(contextPath, `${JSON.stringify(params.contextPackage, null, 2)}\n`);
+  await writeAtomicText(ruleStackPath, yaml.dump(params.ruleStack, { lineWidth: 120 }));
+  await writeAtomicText(tracePath, `${JSON.stringify(params.trace, null, 2)}\n`);
 
   return {
     contextPath,
     ruleStackPath,
     tracePath,
   };
+}
+
+export async function writeAtomicText(path: string, content: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const tempPath = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(tempPath, content, "utf-8");
+    await rename(tempPath, path);
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }

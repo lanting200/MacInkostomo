@@ -1,4 +1,4 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import type { PlanChapterOutput } from "../agents/planner.js";
 import {
@@ -6,6 +6,7 @@ import {
   type ChapterIntent,
 } from "../models/input-governance.js";
 import { parseMemo, PlannerParseError } from "../utils/chapter-memo-parser.js";
+import { writeAtomicText } from "../utils/runtime-writer.js";
 
 /**
  * Persisted governed plans are stored as a human-readable markdown file.
@@ -42,7 +43,7 @@ export async function savePersistedPlan(
 ): Promise<void> {
   const { intent, memo, plannerInputs } = plan;
   const content = renderPersistedPlanMarkdown(intent, memo, plannerInputs);
-  await writeFile(planPath(bookDir, memo.chapter), content, "utf-8");
+  await writeAtomicText(planPath(bookDir, memo.chapter), content);
 }
 
 export async function loadPersistedPlan(

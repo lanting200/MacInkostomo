@@ -687,6 +687,584 @@ struct BookSettingsRestoreResponse: Codable, Sendable {
   let restoredCount: Int
 }
 
+// MARK: - Structured long-form plan
+
+struct LongFormConstraints: Codable, Equatable, Sendable {
+  var targetTotalWords: Int
+  var volumeCount: Int
+  var targetChapterWords: Int
+  var chapterWordTolerance: Int
+  var specialConstraints: [String]
+
+  init(
+    targetTotalWords: Int = 600_000,
+    volumeCount: Int = 6,
+    targetChapterWords: Int = 3000,
+    chapterWordTolerance: Int = 15,
+    specialConstraints: [String] = []
+  ) {
+    self.targetTotalWords = targetTotalWords
+    self.volumeCount = volumeCount
+    self.targetChapterWords = targetChapterWords
+    self.chapterWordTolerance = chapterWordTolerance
+    self.specialConstraints = specialConstraints
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case targetTotalWords, totalWordCount, totalWords
+    case volumeCount, targetVolumes
+    case targetChapterWords, chapterWords
+    case chapterWordTolerance, chapterWordTolerancePercent
+    case specialConstraints, constraints
+  }
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    targetTotalWords = Self.firstPositiveInt(
+      values, keys: [.targetTotalWords, .totalWordCount, .totalWords], fallback: 0)
+    volumeCount = Self.firstPositiveInt(
+      values, keys: [.volumeCount, .targetVolumes], fallback: 0)
+    targetChapterWords = Self.firstPositiveInt(
+      values, keys: [.targetChapterWords, .chapterWords], fallback: 0)
+    chapterWordTolerance = Self.firstNonnegativeInt(
+      values,
+      keys: [.chapterWordTolerance, .chapterWordTolerancePercent],
+      fallback: 15
+    )
+    if let list = try? values.decode([String].self, forKey: .specialConstraints) {
+      specialConstraints = list
+    } else {
+      let text = values.lossyString(forKey: .specialConstraints)
+      let legacyText = text.isEmpty ? values.lossyString(forKey: .constraints) : text
+      specialConstraints = Self.lines(from: legacyText)
+    }
+  }
+
+  func encode(to encoder: Encoder) throws {
+    var values = encoder.container(keyedBy: CodingKeys.self)
+    try values.encode(targetTotalWords, forKey: .targetTotalWords)
+    try values.encode(volumeCount, forKey: .volumeCount)
+    try values.encode(targetChapterWords, forKey: .targetChapterWords)
+    try values.encode(chapterWordTolerance, forKey: .chapterWordTolerance)
+    try values.encode(specialConstraints, forKey: .specialConstraints)
+  }
+
+  private static func firstPositiveInt(
+    _ values: KeyedDecodingContainer<CodingKeys>,
+    keys: [CodingKeys],
+    fallback: Int
+  ) -> Int {
+    for key in keys where values.contains(key) {
+      let value = values.lossyInt(forKey: key)
+      if value > 0 { return value }
+    }
+    return fallback
+  }
+
+  private static func firstNonnegativeInt(
+    _ values: KeyedDecodingContainer<CodingKeys>,
+    keys: [CodingKeys],
+    fallback: Int
+  ) -> Int {
+    for key in keys where values.contains(key) {
+      let value = values.lossyInt(forKey: key, default: -1)
+      if value >= 0 { return value }
+    }
+    return fallback
+  }
+
+  static func lines(from text: String) -> [String] {
+    text.components(separatedBy: .newlines)
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+  }
+}
+
+struct LongFormChapterWordRange: Codable, Equatable, Sendable {
+  let min: Int
+  let max: Int
+}
+
+struct LongFormContinuityPolicy: Codable, Equatable, Sendable {
+  var requireContinuousVolumes: Bool
+  var allowUnplannedEntities: Bool
+  var requireConsistencyDelta: Bool
+  var checkpointAtVolumeEnd: Bool
+
+  init(
+    requireContinuousVolumes: Bool = true,
+    allowUnplannedEntities: Bool = true,
+    requireConsistencyDelta: Bool = false,
+    checkpointAtVolumeEnd: Bool = true
+  ) {
+    self.requireContinuousVolumes = requireContinuousVolumes
+    self.allowUnplannedEntities = allowUnplannedEntities
+    self.requireConsistencyDelta = requireConsistencyDelta
+    self.checkpointAtVolumeEnd = checkpointAtVolumeEnd
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case requireContinuousVolumes, allowUnplannedEntities
+    case requireConsistencyDelta, checkpointAtVolumeEnd
+  }
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    requireContinuousVolumes = try values.decodeIfPresent(
+      Bool.self, forKey: .requireContinuousVolumes) ?? true
+    allowUnplannedEntities = try values.decodeIfPresent(
+      Bool.self, forKey: .allowUnplannedEntities) ?? true
+    requireConsistencyDelta = try values.decodeIfPresent(
+      Bool.self, forKey: .requireConsistencyDelta) ?? false
+    checkpointAtVolumeEnd = try values.decodeIfPresent(
+      Bool.self, forKey: .checkpointAtVolumeEnd) ?? true
+  }
+}
+
+struct LongFormImmutableCanon: Codable, Equatable, Sendable {
+  let id: String
+  let category: String
+  let statement: String
+  let value: String?
+  let aliases: [String]
+
+  private enum CodingKeys: String, CodingKey {
+    case id, category, statement, value, aliases
+  }
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    id = try values.decode(String.self, forKey: .id)
+    category = try values.decodeIfPresent(String.self, forKey: .category) ?? "other"
+    statement = try values.decode(String.self, forKey: .statement)
+    value = try values.decodeIfPresent(String.self, forKey: .value)
+    aliases = try values.decodeIfPresent([String].self, forKey: .aliases) ?? []
+  }
+}
+
+struct LongFormWorldRule: Codable, Equatable, Sendable {
+  let id: String
+  let statement: String
+  let immutable: Bool
+
+  private enum CodingKeys: String, CodingKey {
+    case id, statement, immutable
+  }
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    id = try values.decode(String.self, forKey: .id)
+    statement = try values.decode(String.self, forKey: .statement)
+    immutable = try values.decodeIfPresent(Bool.self, forKey: .immutable) ?? true
+  }
+}
+
+struct LongFormEntity: Codable, Equatable, Sendable {
+  let id: String
+  let name: String
+  let type: String
+  let owner: String?
+  let location: String?
+  let attributes: [String: String]
+  let immutableOwner: Bool
+  let immutableLocation: Bool
+  let immutableAttributes: [String]
+
+  private enum CodingKeys: String, CodingKey {
+    case id, name, type, owner, location, attributes
+    case immutableOwner, immutableLocation, immutableAttributes
+  }
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    id = try values.decode(String.self, forKey: .id)
+    name = try values.decode(String.self, forKey: .name)
+    type = try values.decode(String.self, forKey: .type)
+    owner = try values.decodeIfPresent(String.self, forKey: .owner)
+    location = try values.decodeIfPresent(String.self, forKey: .location)
+    attributes = try values.decodeIfPresent([String: String].self, forKey: .attributes) ?? [:]
+    immutableOwner = try values.decodeIfPresent(Bool.self, forKey: .immutableOwner) ?? false
+    immutableLocation = try values.decodeIfPresent(Bool.self, forKey: .immutableLocation) ?? false
+    immutableAttributes = try values.decodeIfPresent(
+      [String].self, forKey: .immutableAttributes) ?? []
+  }
+}
+
+struct LongFormKnowledgeBoundary: Codable, Equatable, Sendable {
+  let factId: String
+  let statement: String
+  let allowedKnowers: [String]
+  let forbiddenKnowers: [String]
+  let availableFromChapter: Int
+  let revealByChapter: Int?
+  let markers: [String]
+
+  private enum CodingKeys: String, CodingKey {
+    case factId, statement, allowedKnowers, forbiddenKnowers
+    case availableFromChapter, revealByChapter, markers
+  }
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    factId = try values.decode(String.self, forKey: .factId)
+    statement = try values.decode(String.self, forKey: .statement)
+    allowedKnowers = try values.decodeIfPresent([String].self, forKey: .allowedKnowers) ?? []
+    forbiddenKnowers = try values.decodeIfPresent([String].self, forKey: .forbiddenKnowers) ?? []
+    availableFromChapter = try values.decodeIfPresent(
+      Int.self, forKey: .availableFromChapter) ?? 1
+    revealByChapter = try values.decodeIfPresent(Int.self, forKey: .revealByChapter)
+    markers = try values.decodeIfPresent([String].self, forKey: .markers) ?? []
+  }
+}
+
+struct LongFormTimelineMilestone: Codable, Equatable, Sendable {
+  let id: String
+  let order: Int
+  let label: String
+  let earliestChapter: Int
+  let latestChapter: Int
+  let immutable: Bool
+
+  private enum CodingKeys: String, CodingKey {
+    case id, order, label, earliestChapter, latestChapter, immutable
+  }
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    id = try values.decode(String.self, forKey: .id)
+    order = try values.decode(Int.self, forKey: .order)
+    label = try values.decode(String.self, forKey: .label)
+    earliestChapter = try values.decode(Int.self, forKey: .earliestChapter)
+    latestChapter = try values.decode(Int.self, forKey: .latestChapter)
+    immutable = try values.decodeIfPresent(Bool.self, forKey: .immutable) ?? true
+  }
+}
+
+struct LongFormHookPlan: Codable, Equatable, Sendable {
+  let hookId: String
+  let description: String
+  let openFromChapter: Int
+  let resolveByChapter: Int?
+  let requiredVolumeNumber: Int?
+}
+
+struct LongFormContinuity: Codable, Equatable, Sendable {
+  var immutableCanon: [LongFormImmutableCanon]
+  var worldRules: [LongFormWorldRule]
+  var entities: [LongFormEntity]
+  var knowledgeBoundaries: [LongFormKnowledgeBoundary]
+  var timeline: [LongFormTimelineMilestone]
+  var hooks: [LongFormHookPlan]
+  var policy: LongFormContinuityPolicy
+
+  init(
+    immutableCanon: [LongFormImmutableCanon] = [],
+    worldRules: [LongFormWorldRule] = [],
+    entities: [LongFormEntity] = [],
+    knowledgeBoundaries: [LongFormKnowledgeBoundary] = [],
+    timeline: [LongFormTimelineMilestone] = [],
+    hooks: [LongFormHookPlan] = [],
+    policy: LongFormContinuityPolicy = LongFormContinuityPolicy()
+  ) {
+    self.immutableCanon = immutableCanon
+    self.worldRules = worldRules
+    self.entities = entities
+    self.knowledgeBoundaries = knowledgeBoundaries
+    self.timeline = timeline
+    self.hooks = hooks
+    self.policy = policy
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case immutableCanon, worldRules, entities, knowledgeBoundaries, timeline, hooks, policy
+  }
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    immutableCanon = try values.decodeIfPresent(
+      [LongFormImmutableCanon].self, forKey: .immutableCanon) ?? []
+    worldRules = try values.decodeIfPresent([LongFormWorldRule].self, forKey: .worldRules) ?? []
+    entities = try values.decodeIfPresent([LongFormEntity].self, forKey: .entities) ?? []
+    knowledgeBoundaries = try values.decodeIfPresent(
+      [LongFormKnowledgeBoundary].self, forKey: .knowledgeBoundaries) ?? []
+    timeline = try values.decodeIfPresent(
+      [LongFormTimelineMilestone].self, forKey: .timeline) ?? []
+    hooks = try values.decodeIfPresent([LongFormHookPlan].self, forKey: .hooks) ?? []
+    policy = try values.decodeIfPresent(
+      LongFormContinuityPolicy.self, forKey: .policy) ?? LongFormContinuityPolicy()
+  }
+}
+
+struct LongFormContinuityValidationError: LocalizedError, Equatable, Sendable {
+  let message: String
+
+  var errorDescription: String? { message }
+}
+
+extension LongFormContinuity {
+  func validated(targetChapters: Int, volumeCount: Int) throws -> LongFormContinuity {
+    guard targetChapters >= 1, volumeCount >= 1 else {
+      throw LongFormContinuityValidationError(message: "长篇计划缺少有效的章节或分卷范围")
+    }
+    try Self.requireCount(immutableCanon.count, max: 5_000, label: "不可变事实")
+    try Self.requireCount(worldRules.count, max: 5_000, label: "世界规则")
+    try Self.requireCount(entities.count, max: 10_000, label: "实体")
+    try Self.requireCount(knowledgeBoundaries.count, max: 10_000, label: "知识边界")
+    try Self.requireCount(timeline.count, max: 10_000, label: "时间线")
+    try Self.requireCount(hooks.count, max: 10_000, label: "伏笔")
+
+    try Self.requireUnique(immutableCanon.map(\.id), label: "不可变事实 id")
+    try Self.requireUnique(worldRules.map(\.id), label: "世界规则 id")
+    try Self.requireUnique(entities.map(\.id), label: "实体 id")
+    try Self.requireUnique(knowledgeBoundaries.map(\.factId), label: "知识边界 factId")
+    try Self.requireUnique(timeline.map(\.id), label: "时间线 id")
+    try Self.requireUnique(timeline.map { String($0.order) }, label: "时间线 order")
+    try Self.requireUnique(hooks.map(\.hookId), label: "伏笔 hookId")
+
+    let canonCategories = Set([
+      "character", "world", "timeline", "entity", "object", "knowledge", "other",
+    ])
+    for (index, item) in immutableCanon.enumerated() {
+      let label = "不可变事实第 \(index + 1) 项"
+      try Self.requireText(item.id, max: 160, label: "\(label).id")
+      try Self.requireText(item.statement, max: 2_000, label: "\(label).statement")
+      guard canonCategories.contains(item.category) else {
+        throw LongFormContinuityValidationError(message: "\(label).category 无效")
+      }
+      if let value = item.value {
+        try Self.requireText(value, max: 1_000, allowEmpty: true, label: "\(label).value")
+      }
+      try Self.requireCount(item.aliases.count, max: 32, label: "\(label).aliases")
+      for alias in item.aliases {
+        try Self.requireText(alias, max: 160, label: "\(label).aliases")
+      }
+    }
+
+    for (index, item) in worldRules.enumerated() {
+      let label = "世界规则第 \(index + 1) 项"
+      try Self.requireText(item.id, max: 160, label: "\(label).id")
+      try Self.requireText(item.statement, max: 2_000, label: "\(label).statement")
+    }
+
+    let entityTypes = Set(["character", "object", "location", "faction", "concept"])
+    for (index, item) in entities.enumerated() {
+      let label = "实体第 \(index + 1) 项"
+      try Self.requireText(item.id, max: 160, label: "\(label).id")
+      try Self.requireText(item.name, max: 500, label: "\(label).name")
+      guard entityTypes.contains(item.type) else {
+        throw LongFormContinuityValidationError(message: "\(label).type 无效")
+      }
+      if let owner = item.owner {
+        try Self.requireText(owner, max: 500, allowEmpty: true, label: "\(label).owner")
+      }
+      if let location = item.location {
+        try Self.requireText(location, max: 500, allowEmpty: true, label: "\(label).location")
+      }
+      for (key, value) in item.attributes {
+        try Self.requireText(key, max: 160, label: "\(label).attributes 键")
+        try Self.requireText(value, max: 1_000, allowEmpty: true, label: "\(label).attributes.\(key)")
+      }
+      try Self.requireCount(
+        item.immutableAttributes.count, max: 64, label: "\(label).immutableAttributes")
+      for attribute in item.immutableAttributes {
+        try Self.requireText(attribute, max: 160, label: "\(label).immutableAttributes")
+      }
+    }
+
+    for (index, item) in knowledgeBoundaries.enumerated() {
+      let label = "知识边界第 \(index + 1) 项"
+      try Self.requireText(item.factId, max: 160, label: "\(label).factId")
+      try Self.requireText(item.statement, max: 2_000, label: "\(label).statement")
+      try Self.requireChapter(item.availableFromChapter, max: targetChapters,
+        label: "\(label).availableFromChapter")
+      if let reveal = item.revealByChapter {
+        try Self.requireChapter(reveal, max: targetChapters, label: "\(label).revealByChapter")
+        guard reveal >= item.availableFromChapter else {
+          throw LongFormContinuityValidationError(
+            message: "\(label).revealByChapter 不能早于 availableFromChapter")
+        }
+      }
+      try Self.validateIdentifierList(
+        item.allowedKnowers, maxCount: 128, label: "\(label).allowedKnowers")
+      try Self.validateIdentifierList(
+        item.forbiddenKnowers, maxCount: 128, label: "\(label).forbiddenKnowers")
+      try Self.validateIdentifierList(item.markers, maxCount: 32, label: "\(label).markers")
+      let allowed = Set(item.allowedKnowers.map {
+        $0.trimmingCharacters(in: .whitespacesAndNewlines)
+      })
+      let forbidden = Set(item.forbiddenKnowers.map {
+        $0.trimmingCharacters(in: .whitespacesAndNewlines)
+      })
+      let overlap = allowed.intersection(forbidden)
+      if let conflictingKnower = overlap.first {
+        throw LongFormContinuityValidationError(
+          message: "\(label)中 \(conflictingKnower) 不能同时出现在允许与禁止知情列表")
+      }
+    }
+
+    for (index, item) in timeline.enumerated() {
+      let label = "时间线第 \(index + 1) 项"
+      try Self.requireText(item.id, max: 160, label: "\(label).id")
+      try Self.requireText(item.label, max: 2_000, label: "\(label).label")
+      guard item.order >= 0 else {
+        throw LongFormContinuityValidationError(message: "\(label).order 不能小于 0")
+      }
+      try Self.requireChapter(
+        item.earliestChapter, max: targetChapters, label: "\(label).earliestChapter")
+      try Self.requireChapter(
+        item.latestChapter, max: targetChapters, label: "\(label).latestChapter")
+      guard item.earliestChapter <= item.latestChapter else {
+        throw LongFormContinuityValidationError(message: "\(label)的章节窗口无效")
+      }
+    }
+
+    for (index, item) in hooks.enumerated() {
+      let label = "伏笔第 \(index + 1) 项"
+      try Self.requireText(item.hookId, max: 160, label: "\(label).hookId")
+      try Self.requireText(item.description, max: 2_000, label: "\(label).description")
+      try Self.requireChapter(
+        item.openFromChapter, max: targetChapters, label: "\(label).openFromChapter")
+      if let resolve = item.resolveByChapter {
+        try Self.requireChapter(resolve, max: targetChapters, label: "\(label).resolveByChapter")
+        guard resolve >= item.openFromChapter else {
+          throw LongFormContinuityValidationError(
+            message: "\(label).resolveByChapter 不能早于 openFromChapter")
+        }
+      }
+      if let volume = item.requiredVolumeNumber, !(1...volumeCount).contains(volume) {
+        throw LongFormContinuityValidationError(
+          message: "\(label).requiredVolumeNumber 需在 1 至 \(volumeCount) 之间")
+      }
+    }
+    return self
+  }
+
+  private static func requireCount(_ count: Int, max: Int, label: String) throws {
+    if count > max {
+      throw LongFormContinuityValidationError(message: "\(label)不能超过 \(max) 条")
+    }
+  }
+
+  private static func requireUnique(_ values: [String], label: String) throws {
+    var seen = Set<String>()
+    for value in values {
+      let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+      if seen.contains(normalized) {
+        throw LongFormContinuityValidationError(message: "\(label) 重复：\(normalized)")
+      }
+      seen.insert(normalized)
+    }
+  }
+
+  private static func requireText(
+    _ value: String,
+    max: Int,
+    allowEmpty: Bool = false,
+    label: String
+  ) throws {
+    let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !allowEmpty && normalized.isEmpty {
+      throw LongFormContinuityValidationError(message: "\(label) 不能为空")
+    }
+    if normalized.count > max {
+      throw LongFormContinuityValidationError(message: "\(label)不能超过 \(max) 个字符")
+    }
+  }
+
+  private static func requireChapter(_ value: Int, max: Int, label: String) throws {
+    if !(1...max).contains(value) {
+      throw LongFormContinuityValidationError(message: "\(label)需在 1 至 \(max) 之间")
+    }
+  }
+
+  private static func validateIdentifierList(
+    _ values: [String],
+    maxCount: Int,
+    label: String
+  ) throws {
+    try requireCount(values.count, max: maxCount, label: label)
+    for value in values {
+      try requireText(value, max: 160, label: label)
+    }
+  }
+}
+
+struct LongFormVolumePlan: Codable, Identifiable, Equatable, Sendable {
+  let number: Int
+  let startChapter: Int
+  let endChapter: Int
+  let chapterCount: Int
+  let targetWords: Int
+
+  var id: Int { number }
+}
+
+struct LongFormChapterPlan: Codable, Identifiable, Equatable, Sendable {
+  let number: Int
+  let volumeNumber: Int
+  let targetWords: Int
+  let minWords: Int
+  let maxWords: Int
+
+  var id: Int { number }
+}
+
+struct LongFormDerivedPlan: Codable, Equatable, Sendable {
+  let targetChapters: Int
+  let chapterWordRange: LongFormChapterWordRange
+  let volumes: [LongFormVolumePlan]
+  let chapters: [LongFormChapterPlan]
+}
+
+struct LongFormPlanResponse: Codable, Equatable, Sendable {
+  let version: Int
+  let revision: Int
+  let bookId: String
+  let constraints: LongFormConstraints
+  let plan: LongFormDerivedPlan
+  let continuity: LongFormContinuity
+  let source: String
+  let createdAt: String?
+  let updatedAt: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case version, revision, bookId, constraints, plan, continuity, source, createdAt, updatedAt
+  }
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    version = values.lossyInt(forKey: .version, default: 1)
+    revision = values.lossyInt(forKey: .revision)
+    bookId = values.lossyString(forKey: .bookId)
+    constraints = try values.decode(LongFormConstraints.self, forKey: .constraints)
+    plan = try values.decode(LongFormDerivedPlan.self, forKey: .plan)
+    continuity = try values.decodeIfPresent(
+      LongFormContinuity.self, forKey: .continuity) ?? LongFormContinuity()
+    source = values.lossyString(forKey: .source, default: "unknown")
+    createdAt = values.lossyOptionalString(forKey: .createdAt)
+    updatedAt = values.lossyOptionalString(forKey: .updatedAt)
+  }
+
+  func encode(to encoder: Encoder) throws {
+    var values = encoder.container(keyedBy: CodingKeys.self)
+    try values.encode(version, forKey: .version)
+    try values.encode(revision, forKey: .revision)
+    try values.encode(bookId, forKey: .bookId)
+    try values.encode(constraints, forKey: .constraints)
+    try values.encode(plan, forKey: .plan)
+    try values.encode(continuity, forKey: .continuity)
+    try values.encode(source, forKey: .source)
+    try values.encodeIfPresent(createdAt, forKey: .createdAt)
+    try values.encodeIfPresent(updatedAt, forKey: .updatedAt)
+  }
+}
+
+struct LongFormPlanUpdateRequest: Encodable, Sendable {
+  let expectedRevision: Int?
+  let constraints: LongFormConstraints?
+  let continuity: LongFormContinuity?
+}
+
 // MARK: - Fanqie read-only data
 
 struct FanqieLoginState: Codable, Equatable, Sendable {
@@ -866,7 +1444,7 @@ struct DeleteBookResponse: Codable, Sendable {
   let trashedTo: String
 }
 
-struct CreateBookRequest: Codable, Sendable {
+struct CreateBookRequest: Codable, Equatable, Sendable {
   var title: String
   var language: String
   var genre: String
@@ -874,6 +1452,9 @@ struct CreateBookRequest: Codable, Sendable {
   var targetChapters: Int
   var chapterWords: Int
   var totalWords: String
+  var targetTotalWords: Int
+  var volumeCount: Int
+  var chapterWordTolerance: Int
   var premise: String
   var characters: String
   var worldbuilding: String
@@ -890,7 +1471,10 @@ struct CreateBookRequest: Codable, Sendable {
     platform: String = "tomato",
     targetChapters: Int = 200,
     chapterWords: Int = 3000,
-    totalWords: String = "",
+    totalWords: String = "600000",
+    targetTotalWords: Int = 600_000,
+    volumeCount: Int = 6,
+    chapterWordTolerance: Int = 15,
     premise: String = "",
     characters: String = "",
     worldbuilding: String = "",
@@ -907,6 +1491,9 @@ struct CreateBookRequest: Codable, Sendable {
     self.targetChapters = targetChapters
     self.chapterWords = chapterWords
     self.totalWords = totalWords
+    self.targetTotalWords = targetTotalWords
+    self.volumeCount = volumeCount
+    self.chapterWordTolerance = chapterWordTolerance
     self.premise = premise
     self.characters = characters
     self.worldbuilding = worldbuilding
@@ -915,6 +1502,239 @@ struct CreateBookRequest: Codable, Sendable {
     self.pacing = pacing
     self.style = style
     self.constraints = constraints
+  }
+
+  var derivedTargetChapters: Int {
+    guard targetTotalWords > 0, chapterWords > 0 else { return 0 }
+    return max(1, Int((Double(targetTotalWords) / Double(chapterWords)).rounded()))
+  }
+
+  var chapterWordRange: ClosedRange<Int> {
+    let boundedTolerance = min(max(chapterWordTolerance, 0), 100)
+    let lower = (chapterWords * (100 - boundedTolerance) + 50) / 100
+    let upper = (chapterWords * (100 + boundedTolerance) + 50) / 100
+    return lower...upper
+  }
+
+  mutating func synchronizeLongFormFields() {
+    targetChapters = derivedTargetChapters
+    totalWords = String(targetTotalWords)
+    constraints = constraints.trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case title, language, genre, platform, targetChapters, chapterWords, totalWords
+    case targetTotalWords, totalWordCount, targetWords
+    case targetChapterWords
+    case volumeCount, targetVolumes
+    case chapterWordTolerance, chapterWordTolerancePercent
+    case premise, characters, worldbuilding, outline, volumePlan, pacing, style
+    case constraints, specialConstraints
+  }
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    title = values.lossyString(forKey: .title)
+    language = values.lossyString(forKey: .language, default: "zh")
+    genre = values.lossyString(forKey: .genre, default: "xuanhuan")
+    platform = values.lossyString(forKey: .platform, default: "tomato")
+    targetChapters = values.lossyInt(forKey: .targetChapters, default: 200)
+    chapterWords =
+      values.contains(.targetChapterWords)
+      ? values.lossyInt(forKey: .targetChapterWords, default: 3000)
+      : values.lossyInt(forKey: .chapterWords, default: 3000)
+    totalWords = values.lossyString(forKey: .totalWords)
+
+    let explicitTotal =
+      Self.lossyPositiveInt(values, keys: [.targetTotalWords, .totalWordCount, .targetWords])
+    targetTotalWords =
+      explicitTotal
+      ?? Self.parseLegacyWordCount(totalWords)
+      ?? max(1, targetChapters) * max(500, chapterWords)
+    targetTotalWords = min(targetTotalWords, 3_000_000)
+
+    volumeCount =
+      Self.lossyPositiveInt(values, keys: [.volumeCount, .targetVolumes]) ?? 6
+    chapterWordTolerance =
+      Self.lossyNonnegativeInt(
+        values, keys: [.chapterWordTolerance, .chapterWordTolerancePercent]) ?? 15
+
+    premise = values.lossyString(forKey: .premise)
+    characters = values.lossyString(forKey: .characters)
+    worldbuilding = values.lossyString(forKey: .worldbuilding)
+    outline = values.lossyString(forKey: .outline)
+    volumePlan = values.lossyString(forKey: .volumePlan)
+    pacing = values.lossyString(forKey: .pacing)
+    style = values.lossyString(forKey: .style)
+    constraints = values.lossyString(forKey: .constraints)
+    if constraints.isEmpty,
+      let list = try? values.decode([String].self, forKey: .specialConstraints)
+    {
+      constraints = list.joined(separator: "\n")
+    } else if constraints.isEmpty {
+      constraints = values.lossyString(forKey: .specialConstraints)
+    }
+    synchronizeLongFormFields()
+  }
+
+  func encode(to encoder: Encoder) throws {
+    var values = encoder.container(keyedBy: CodingKeys.self)
+    let chapters = derivedTargetChapters
+    try values.encode(title, forKey: .title)
+    try values.encode(language, forKey: .language)
+    try values.encode(genre, forKey: .genre)
+    try values.encode(platform, forKey: .platform)
+    try values.encode(chapters, forKey: .targetChapters)
+    try values.encode(chapterWords, forKey: .chapterWords)
+    try values.encode(chapterWords, forKey: .targetChapterWords)
+    try values.encode(String(targetTotalWords), forKey: .totalWords)
+    try values.encode(targetTotalWords, forKey: .targetTotalWords)
+    try values.encode(volumeCount, forKey: .volumeCount)
+    try values.encode(chapterWordTolerance, forKey: .chapterWordTolerance)
+    try values.encode(chapterWordTolerance, forKey: .chapterWordTolerancePercent)
+    try values.encode(premise, forKey: .premise)
+    try values.encode(characters, forKey: .characters)
+    try values.encode(worldbuilding, forKey: .worldbuilding)
+    try values.encode(outline, forKey: .outline)
+    try values.encode(volumePlan, forKey: .volumePlan)
+    try values.encode(pacing, forKey: .pacing)
+    try values.encode(style, forKey: .style)
+    try values.encode(constraints, forKey: .constraints)
+    try values.encode(LongFormConstraints.lines(from: constraints), forKey: .specialConstraints)
+  }
+
+  private static func lossyPositiveInt(
+    _ values: KeyedDecodingContainer<CodingKeys>,
+    keys: [CodingKeys]
+  ) -> Int? {
+    for key in keys where values.contains(key) {
+      let value = values.lossyInt(forKey: key)
+      if value > 0 { return value }
+    }
+    return nil
+  }
+
+  private static func lossyNonnegativeInt(
+    _ values: KeyedDecodingContainer<CodingKeys>,
+    keys: [CodingKeys]
+  ) -> Int? {
+    for key in keys where values.contains(key) {
+      let value = values.lossyInt(forKey: key, default: -1)
+      if value >= 0 { return value }
+    }
+    return nil
+  }
+
+  private static func parseLegacyWordCount(_ text: String) -> Int? {
+    let compact =
+      text
+      .replacingOccurrences(of: ",", with: "")
+      .replacingOccurrences(of: "，", with: "")
+      .replacingOccurrences(of: " ", with: "")
+      .lowercased()
+    guard !compact.isEmpty else { return nil }
+    let numberText = compact.prefix { $0.isNumber || $0 == "." }
+    guard let number = Double(String(numberText)), number > 0 else { return nil }
+    let multiplier: Double
+    if compact.contains("亿") {
+      multiplier = 100_000_000
+    } else if compact.contains("万") || compact.contains("w") {
+      multiplier = 10_000
+    } else {
+      multiplier = 1
+    }
+    let result = number * multiplier
+    guard result <= Double(Int.max) else { return nil }
+    return Int(result.rounded())
+  }
+}
+
+struct CreateBookDraftSnapshot: Codable, Equatable, Sendable {
+  var request: CreateBookRequest
+  var requirements: String
+  var pendingCreationJobID: String?
+
+  static let empty = CreateBookDraftSnapshot(
+    request: CreateBookRequest(),
+    requirements: "",
+    pendingCreationJobID: nil
+  )
+}
+
+enum CreateBookDraftPersistence {
+  private static let defaultsKey = "MacInkostomo.createBookDraft.v1"
+
+  static func load(defaults: UserDefaults = .standard) -> CreateBookDraftSnapshot {
+    guard let data = defaults.data(forKey: defaultsKey) else { return .empty }
+    do {
+      return try JSONDecoder().decode(CreateBookDraftSnapshot.self, from: data)
+    } catch {
+      defaults.removeObject(forKey: defaultsKey)
+      return .empty
+    }
+  }
+
+  static func saveDraft(
+    request: CreateBookRequest,
+    requirements: String,
+    defaults: UserDefaults = .standard
+  ) {
+    var snapshot = load(defaults: defaults)
+    snapshot.request = request
+    snapshot.requirements = requirements
+    save(snapshot, defaults: defaults)
+  }
+
+  static func markPending(
+    jobID: String,
+    request: CreateBookRequest,
+    requirements: String,
+    defaults: UserDefaults = .standard
+  ) {
+    save(
+      CreateBookDraftSnapshot(
+        request: request,
+        requirements: requirements,
+        pendingCreationJobID: jobID
+      ),
+      defaults: defaults
+    )
+  }
+
+  @discardableResult
+  static func reconcile(
+    creationJobs: [CreationJob],
+    defaults: UserDefaults = .standard
+  ) -> CreateBookDraftSnapshot {
+    var snapshot = load(defaults: defaults)
+    guard let jobID = snapshot.pendingCreationJobID else { return snapshot }
+    guard let job = creationJobs.first(where: { $0.jobId == jobID }) else {
+      snapshot.pendingCreationJobID = nil
+      save(snapshot, defaults: defaults)
+      return snapshot
+    }
+
+    if job.status.lowercased() == "success" {
+      clear(defaults: defaults)
+      return .empty
+    }
+    if !job.isActive {
+      snapshot.pendingCreationJobID = nil
+      save(snapshot, defaults: defaults)
+    }
+    return snapshot
+  }
+
+  static func clear(defaults: UserDefaults = .standard) {
+    defaults.removeObject(forKey: defaultsKey)
+  }
+
+  private static func save(
+    _ snapshot: CreateBookDraftSnapshot,
+    defaults: UserDefaults
+  ) {
+    guard let data = try? JSONEncoder().encode(snapshot) else { return }
+    defaults.set(data, forKey: defaultsKey)
   }
 }
 

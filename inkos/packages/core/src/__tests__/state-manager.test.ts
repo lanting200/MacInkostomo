@@ -450,6 +450,32 @@ describe("StateManager", () => {
       expect(snapshotManifest).toContain("\"schemaVersion\": 2");
     });
 
+    it("rebuilds an existing snapshot without retaining stale truth or structured files", async () => {
+      const storyDir = join(manager.bookDir(bookId), "story");
+      const stateDir = manager.stateDir(bookId);
+      const snapshotDir = join(storyDir, "snapshots", "1");
+      await mkdir(stateDir, { recursive: true });
+      await Promise.all([
+        writeFile(join(stateDir, "manifest.json"), "old manifest", "utf-8"),
+        writeFile(join(stateDir, "stale.json"), "stale runtime state", "utf-8"),
+      ]);
+      await manager.snapshotState(bookId, 1);
+
+      await Promise.all([
+        rm(join(storyDir, "particle_ledger.md")),
+        rm(join(stateDir, "stale.json")),
+        writeFile(join(stateDir, "manifest.json"), "new manifest", "utf-8"),
+      ]);
+      await manager.snapshotState(bookId, 1);
+
+      await expect(readFile(join(snapshotDir, "state", "manifest.json"), "utf-8"))
+        .resolves.toBe("new manifest");
+      await expect(stat(join(snapshotDir, "particle_ledger.md")))
+        .rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(join(snapshotDir, "state", "stale.json")))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    });
+
     it("restores state from a previous snapshot", async () => {
       await manager.snapshotState(bookId, 1);
 
@@ -537,6 +563,28 @@ describe("StateManager", () => {
 
       const manifest = await readFile(join(stateDir, "manifest.json"), "utf-8");
       expect(manifest).toContain("\"lastAppliedChapter\": 1");
+    });
+
+    it("surfaces structured snapshot copy failures instead of treating them as a missing snapshot", async () => {
+      const stateDir = manager.stateDir(bookId);
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(join(stateDir, "manifest.json"), "valid before corruption", "utf-8");
+      await manager.snapshotState(bookId, 1);
+
+      const snapshotManifest = join(
+        manager.bookDir(bookId),
+        "story",
+        "snapshots",
+        "1",
+        "state",
+        "manifest.json",
+      );
+      await rm(snapshotManifest);
+      await mkdir(snapshotManifest);
+
+      await expect(manager.restoreState(bookId, 1)).rejects.toMatchObject({
+        code: expect.stringMatching(/^(?:EISDIR|ENOTSUP)$/),
+      });
     });
 
     it("returns false when restoring from non-existent snapshot", async () => {
@@ -661,6 +709,18 @@ describe("StateManager", () => {
       ).rejects.toThrow(/is locked/);
 
       await release();
+    });
+
+    it("does not let another StateManager instance steal a live same-process lock", async () => {
+      await mkdir(manager.bookDir("lock-book-shared"), { recursive: true });
+      const otherManager = new StateManager(tempDir);
+      const release = await manager.acquireBookLock("lock-book-shared");
+
+      try {
+        await expect(otherManager.acquireBookLock("lock-book-shared")).rejects.toThrow(/is locked/);
+      } finally {
+        await release();
+      }
     });
 
     it("allows re-acquiring lock after release", async () => {
@@ -1309,6 +1369,39 @@ describe("StateManager", () => {
       await expect(stat(join(storyDir, "memory.db"))).rejects.toThrow();
       await expect(stat(join(storyDir, "memory.db-shm"))).rejects.toThrow();
       await expect(stat(join(storyDir, "memory.db-wal"))).rejects.toThrow();
+    });
+
+    it.each([
+      ["underscore", "0002_Title_Two.md"],
+      ["hyphen", "0002-Title-Two.md"],
+    ])("removes %s chapter files and future canon checkpoints", async (_style, chapterFile) => {
+      await setupRollbackBook();
+      const bookDir = manager.bookDir(bookId);
+      const chaptersDir = join(bookDir, "chapters");
+      const canonDir = join(bookDir, "story", "canon_checkpoints");
+      await mkdir(canonDir, { recursive: true });
+      if (chapterFile.includes("-")) {
+        await rm(join(chaptersDir, "0002_Title_Two.md"));
+        await writeFile(join(chaptersDir, chapterFile), "# Chapter 2\n\nContent 2.", "utf-8");
+      }
+      await Promise.all([
+        writeFile(
+          join(canonDir, "volume-0001.json"),
+          JSON.stringify({ completedAtChapter: 1 }),
+          "utf-8",
+        ),
+        writeFile(
+          join(canonDir, "volume-0002.json"),
+          JSON.stringify({ completedAtChapter: 3 }),
+          "utf-8",
+        ),
+      ]);
+
+      await manager.rollbackToChapter(bookId, 1);
+
+      await expect(stat(join(chaptersDir, chapterFile))).rejects.toThrow();
+      await expect(stat(join(canonDir, "volume-0001.json"))).resolves.toBeDefined();
+      await expect(stat(join(canonDir, "volume-0002.json"))).rejects.toThrow();
     });
   });
 });

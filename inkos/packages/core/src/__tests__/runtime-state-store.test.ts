@@ -19,6 +19,42 @@ describe("runtime-state-store memory helpers", () => {
     }
   });
 
+  it("applies a replay delta to the previous chapter snapshot instead of current aggregate state", async () => {
+    root = await mkdtemp(join(tmpdir(), "inkos-runtime-replay-"));
+    const baseSnapshot = {
+      manifest: {
+        schemaVersion: 2 as const,
+        language: "en" as const,
+        lastAppliedChapter: 0,
+        projectionVersion: 1,
+        migrationWarnings: [],
+      },
+      currentState: { chapter: 0, facts: [] },
+      hooks: { hooks: [] },
+      chapterSummaries: { rows: [] },
+      objects: { objects: [] },
+    };
+
+    const artifacts = await buildRuntimeStateArtifacts({
+      bookDir: join(root, "book"),
+      baseSnapshot,
+      language: "en",
+      allowReapply: true,
+      delta: {
+        chapter: 1,
+        hookOps: { upsert: [], mention: [], resolve: [], defer: [] },
+        newHookCandidates: [],
+        subplotOps: [],
+        emotionalArcOps: [],
+        characterMatrixOps: [],
+        notes: [],
+      },
+    });
+
+    expect(artifacts.snapshot.manifest.lastAppliedChapter).toBe(1);
+    expect(artifacts.snapshot.currentState.facts).toEqual([]);
+  });
+
   it("prefers structured runtime state over stale markdown projections for narrative memory", async () => {
     root = await mkdtemp(join(tmpdir(), "inkos-runtime-state-store-"));
     const bookDir = join(root, "book");

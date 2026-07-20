@@ -314,7 +314,7 @@ describe("CLI integration", () => {
   });
 
   describe("inkos book create", () => {
-    it("removes stale incomplete book directories before retrying create", async () => {
+    it("preserves stale incomplete book directories instead of deleting user data", async () => {
       try {
         await stat(join(projectDir, "inkos.json"));
       } catch {
@@ -322,25 +322,30 @@ describe("CLI integration", () => {
       }
       const bookId = "stale-book";
       const staleDir = join(projectDir, "books", bookId);
-      await mkdir(join(staleDir, "story"), { recursive: true });
-      await writeFile(join(staleDir, "book.json"), JSON.stringify({
-        id: bookId,
-        title: "Stale Book",
-      }, null, 2));
-      await writeFile(join(staleDir, "story", "current_state.md"), "# stale\n", "utf-8");
+      try {
+        await mkdir(join(staleDir, "story"), { recursive: true });
+        await writeFile(join(staleDir, "book.json"), JSON.stringify({
+          id: bookId,
+          title: "Stale Book",
+        }, null, 2));
+        await writeFile(join(staleDir, "story", "current_state.md"), "# stale\n", "utf-8");
 
-      const { exitCode, stderr } = runStderr([
-        "book",
-        "create",
-        "--title",
-        "stale book",
-      ], {
-        env: failingLlmEnv,
-      });
+        const { exitCode, stderr } = runStderr([
+          "book",
+          "create",
+          "--title",
+          "stale book",
+        ], {
+          env: failingLlmEnv,
+        });
 
-      expect(exitCode).not.toBe(0);
-      expect(stderr).toContain("Failed to create book");
-      await expect(stat(staleDir)).rejects.toThrow();
+        expect(exitCode).not.toBe(0);
+        expect(stderr).toContain("Failed to create book");
+        expect(stderr).toContain("Incomplete book directory already exists");
+        await expect(readFile(join(staleDir, "story", "current_state.md"), "utf-8")).resolves.toBe("# stale\n");
+      } finally {
+        await rm(staleDir, { recursive: true, force: true });
+      }
     }, CLI_PROCESS_TIMEOUT_MS);
   });
 
@@ -774,12 +779,12 @@ describe("CLI integration", () => {
         env: failingLlmEnv,
       });
       expect(exitCode).not.toBe(0);
-      expect(`${stdout}\n${stderr}`).toContain("Regenerating chapter 2");
-      expect(`${stdout}\n${stderr}`).not.toContain("resolved to 3");
+      expect(`${stdout}\n${stderr}`).toContain("Rewriting latest chapter 2");
+      expect(`${stdout}\n${stderr}`).toContain("latest chapter (3)");
 
       const next = await state.getNextChapterNumber(bookId);
-      expect(next).toBe(2);
-      await expect(readFile(join(storyDir, "current_state.md"), "utf-8")).resolves.toBe("State at ch1");
+      expect(next).toBe(4);
+      await expect(readFile(join(storyDir, "current_state.md"), "utf-8")).resolves.toBe("State at ch3");
     });
   });
 

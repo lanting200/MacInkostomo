@@ -11,6 +11,7 @@ export interface AgentContext {
   readonly logger?: Logger;
   readonly onStreamProgress?: OnStreamProgress;
   readonly onTextDelta?: (text: string) => void;
+  readonly signal?: AbortSignal;
 }
 
 export abstract class BaseAgent {
@@ -36,6 +37,7 @@ export abstract class BaseAgent {
       ...options,
       onStreamProgress: this.ctx.onStreamProgress,
       onTextDelta: options?.onTextDelta,
+      signal: this.ctx.signal,
     });
   }
 
@@ -59,6 +61,7 @@ export abstract class BaseAgent {
         webSearch: true,
         onStreamProgress: this.ctx.onStreamProgress,
         onTextDelta: options?.onTextDelta,
+        signal: this.ctx.signal,
       });
     }
 

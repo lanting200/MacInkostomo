@@ -38,9 +38,19 @@ import {
 } from "../utils/governed-working-set.js";
 import { extractPOVFromOutline, filterMatrixByPOV, filterHooksByPOV } from "../utils/pov-filter.js";
 import { parseCreativeOutput } from "./writer-parser.js";
-import { buildRuntimeStateArtifacts, saveRuntimeStateSnapshot, type RuntimeStateArtifacts } from "../state/runtime-state-store.js";
+import {
+  buildRuntimeStateArtifacts,
+  saveRuntimeStateSnapshot,
+  type RuntimeStateArtifacts,
+  type RuntimeTruthFileSnapshot,
+} from "../state/runtime-state-store.js";
 import type { RuntimeStateSnapshot } from "../state/state-reducer.js";
-import { renderObjectLedgerProjection } from "../state/state-projections.js";
+import {
+  renderChapterSummariesProjection,
+  renderCurrentStateProjection,
+  renderHooksProjection,
+  renderObjectLedgerProjection,
+} from "../state/state-projections.js";
 import { parsePendingHooksMarkdown } from "../utils/memory-retrieval.js";
 import { analyzeHookHealth } from "../utils/hook-health.js";
 import { buildEnglishVarianceBrief } from "../utils/long-span-fatigue.js";
@@ -100,6 +110,10 @@ export interface SettleChapterStateInput {
   readonly contextPackage?: ContextPackage;
   readonly ruleStack?: RuleStack;
   readonly validationFeedback?: string;
+  /** Structured state immediately before this chapter, used for clean replay. */
+  readonly runtimeStateBaseSnapshot?: RuntimeStateSnapshot;
+  /** Markdown truth immediately before this chapter, used for clean replay. */
+  readonly truthFileBaseSnapshot?: RuntimeTruthFileSnapshot;
 }
 
 export interface TokenUsage {
@@ -494,6 +508,19 @@ export class WriterAgent extends BaseAgent {
     const parsedBookRules = await readBookRules(input.bookDir);
     const bookRules = parsedBookRules?.rules ?? null;
     const resolvedLanguage = input.book.language ?? genreProfile.language;
+    const truthFileBase = input.truthFileBaseSnapshot;
+    const settlementCurrentState = input.runtimeStateBaseSnapshot
+      ? renderCurrentStateProjection(input.runtimeStateBaseSnapshot.currentState, resolvedLanguage)
+      : truthFileBase?.currentState ?? currentState;
+    const settlementHooks = input.runtimeStateBaseSnapshot
+      ? renderHooksProjection(input.runtimeStateBaseSnapshot.hooks, resolvedLanguage)
+      : truthFileBase?.hooks ?? hooks;
+    const settlementSummaries = input.runtimeStateBaseSnapshot
+      ? renderChapterSummariesProjection(input.runtimeStateBaseSnapshot.chapterSummaries, resolvedLanguage)
+      : truthFileBase?.chapterSummaries ?? chapterSummaries;
+    const settlementObjectLedger = input.runtimeStateBaseSnapshot
+      ? renderObjectLedgerProjection(input.runtimeStateBaseSnapshot.objects ?? { objects: [] }, resolvedLanguage)
+      : truthFileBase?.objectLedger ?? objectLedger;
     const governedMemoryBlocks = input.contextPackage
       ? buildGovernedMemoryEvidenceBlocks(input.contextPackage, resolvedLanguage)
       : undefined;
@@ -505,14 +532,14 @@ export class WriterAgent extends BaseAgent {
       chapterNumber: input.chapterNumber,
       title: input.title,
       content: input.content,
-      currentState,
-      ledger: genreProfile.numericalSystem ? ledger : "",
-      objectLedger,
-      hooks,
-      chapterSummaries,
-      subplotBoard,
-      emotionalArcs,
-      characterMatrix,
+      currentState: settlementCurrentState,
+      ledger: genreProfile.numericalSystem ? truthFileBase?.ledger ?? ledger : "",
+      objectLedger: settlementObjectLedger,
+      hooks: settlementHooks,
+      chapterSummaries: settlementSummaries,
+      subplotBoard: truthFileBase?.subplotBoard ?? subplotBoard,
+      emotionalArcs: truthFileBase?.emotionalArcs ?? emotionalArcs,
+      characterMatrix: truthFileBase?.characterMatrix ?? characterMatrix,
       volumeOutline,
       selectedEvidenceBlock: governedMemoryBlocks
         ? this.joinGovernedEvidenceBlocks(governedMemoryBlocks)
@@ -521,10 +548,10 @@ export class WriterAgent extends BaseAgent {
       contextPackage: input.contextPackage,
       ruleStack: input.ruleStack,
       validationFeedback: input.validationFeedback,
-      originalHooks: hooks,
-      originalSubplots: subplotBoard,
-      originalEmotionalArcs: emotionalArcs,
-      originalCharacterMatrix: characterMatrix,
+      originalHooks: settlementHooks,
+      originalSubplots: truthFileBase?.subplotBoard ?? subplotBoard,
+      originalEmotionalArcs: truthFileBase?.emotionalArcs ?? emotionalArcs,
+      originalCharacterMatrix: truthFileBase?.characterMatrix ?? characterMatrix,
     });
     const settlement = settleResult.settlement;
     const runtimeStateArtifacts = await this.buildRuntimeStateArtifactsIfPresent(
@@ -533,6 +560,7 @@ export class WriterAgent extends BaseAgent {
       resolvedLanguage,
       input.chapterNumber,
       input.allowReapply,
+      input.runtimeStateBaseSnapshot,
     );
 
     return {
@@ -720,11 +748,8 @@ export class WriterAgent extends BaseAgent {
     const paddedNum = String(output.chapterNumber).padStart(4, "0");
     const filename = `${paddedNum}_${this.sanitizeFilename(output.title)}.md`;
     const existingChapterFiles = await readdir(chaptersDir).catch(() => []);
-    await Promise.all(
-      existingChapterFiles
-        .filter((file) => file.startsWith(`${paddedNum}_`) && file.endsWith(".md") && file !== filename)
-        .map((file) => rm(join(chaptersDir, file), { force: true })),
-    );
+    const supersededChapterFiles = existingChapterFiles
+      .filter((file) => file.startsWith(`${paddedNum}_`) && file.endsWith(".md") && file !== filename);
 
     const heading = language === "en"
       ? `# Chapter ${output.chapterNumber}: ${output.title}`
@@ -740,35 +765,38 @@ export class WriterAgent extends BaseAgent {
       language,
     );
 
-    const writes: Array<Promise<void>> = [
-      writeFile(join(chaptersDir, filename), chapterContent, "utf-8"),
-      writeFile(join(storyDir, "current_state.md"), runtimeStateArtifacts?.currentStateMarkdown ?? output.updatedState, "utf-8"),
-      writeFile(join(storyDir, "pending_hooks.md"), runtimeStateArtifacts?.hooksMarkdown ?? output.updatedHooks, "utf-8"),
+    const writes: Array<() => Promise<void>> = [
+      () => writeFile(join(chaptersDir, filename), chapterContent, "utf-8"),
+      () => writeFile(join(storyDir, "current_state.md"), runtimeStateArtifacts?.currentStateMarkdown ?? output.updatedState, "utf-8"),
+      () => writeFile(join(storyDir, "pending_hooks.md"), runtimeStateArtifacts?.hooksMarkdown ?? output.updatedHooks, "utf-8"),
     ];
 
     if (runtimeStateArtifacts?.chapterSummariesMarkdown) {
       writes.push(
-        writeFile(join(storyDir, "chapter_summaries.md"), runtimeStateArtifacts.chapterSummariesMarkdown, "utf-8"),
+        () => writeFile(join(storyDir, "chapter_summaries.md"), runtimeStateArtifacts.chapterSummariesMarkdown, "utf-8"),
       );
     }
 
     if (runtimeStateArtifacts?.objectLedgerMarkdown) {
       writes.push(
-        writeFile(join(storyDir, "object_ledger.md"), runtimeStateArtifacts.objectLedgerMarkdown, "utf-8"),
+        () => writeFile(join(storyDir, "object_ledger.md"), runtimeStateArtifacts.objectLedgerMarkdown, "utf-8"),
       );
     }
 
     if (runtimeStateArtifacts?.snapshot ?? output.runtimeStateSnapshot) {
-      writes.push(saveRuntimeStateSnapshot(bookDir, runtimeStateArtifacts?.snapshot ?? output.runtimeStateSnapshot!));
+      writes.push(() => saveRuntimeStateSnapshot(bookDir, runtimeStateArtifacts?.snapshot ?? output.runtimeStateSnapshot!));
     }
 
     if (numericalSystem) {
       writes.push(
-        writeFile(join(storyDir, "particle_ledger.md"), output.updatedLedger, "utf-8"),
+        () => writeFile(join(storyDir, "particle_ledger.md"), output.updatedLedger, "utf-8"),
       );
     }
 
-    await Promise.all(writes);
+    for (const write of writes) await write();
+    for (const file of supersededChapterFiles) {
+      await rm(join(chaptersDir, file), { force: true });
+    }
   }
 
   private buildUserPrompt(params: {
@@ -1189,35 +1217,32 @@ ${overrides}\n`;
     language: "zh" | "en" = "zh",
   ): Promise<void> {
     const storyDir = join(bookDir, "story");
-    const writes: Array<Promise<void>> = [];
 
     // Append chapter summary to chapter_summaries.md
     if (!output.runtimeStateDelta && output.updatedChapterSummaries) {
-      writes.push(writeFile(
+      await writeFile(
         join(storyDir, "chapter_summaries.md"),
         output.updatedChapterSummaries,
         "utf-8",
-      ));
+      );
     } else if (!output.runtimeStateDelta && output.chapterSummary) {
-      writes.push(this.appendChapterSummary(storyDir, output.chapterSummary, language));
+      await this.appendChapterSummary(storyDir, output.chapterSummary, language);
     }
 
     // Overwrite subplot board
     if (output.updatedSubplots) {
-      writes.push(writeFile(join(storyDir, "subplot_board.md"), output.updatedSubplots, "utf-8"));
+      await writeFile(join(storyDir, "subplot_board.md"), output.updatedSubplots, "utf-8");
     }
 
     // Overwrite emotional arcs
     if (output.updatedEmotionalArcs) {
-      writes.push(writeFile(join(storyDir, "emotional_arcs.md"), output.updatedEmotionalArcs, "utf-8"));
+      await writeFile(join(storyDir, "emotional_arcs.md"), output.updatedEmotionalArcs, "utf-8");
     }
 
     // Overwrite character matrix
     if (output.updatedCharacterMatrix) {
-      writes.push(writeFile(join(storyDir, "character_matrix.md"), output.updatedCharacterMatrix, "utf-8"));
+      await writeFile(join(storyDir, "character_matrix.md"), output.updatedCharacterMatrix, "utf-8");
     }
-
-    await Promise.all(writes);
   }
 
   private renderDeltaSummaryRow(delta: RuntimeStateDelta): string {
@@ -1293,6 +1318,7 @@ ${overrides}\n`;
     language: "zh" | "en",
     authoritativeChapterNumber?: number,
     allowReapply?: boolean,
+    baseSnapshot?: RuntimeStateSnapshot,
   ): Promise<RuntimeStateArtifacts | null> {
     if (!delta) return null;
     const safeDelta = authoritativeChapterNumber === undefined
@@ -1303,6 +1329,7 @@ ${overrides}\n`;
       delta: safeDelta,
       language,
       allowReapply,
+      baseSnapshot,
     });
   }
 

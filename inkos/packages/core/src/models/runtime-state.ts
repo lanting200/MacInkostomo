@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { LongFormConsistencyDeltaSchema } from "./long-form.js";
 
 export const RuntimeStateLanguageSchema = z.enum(["zh", "en"]);
 export type RuntimeStateLanguage = z.infer<typeof RuntimeStateLanguageSchema>;
@@ -170,6 +171,7 @@ export const RuntimeStateDeltaSchema = z.object({
   emotionalArcOps: z.array(LooseOpSchema).default([]),
   characterMatrixOps: z.array(LooseOpSchema).default([]),
   objectOps: ObjectOpsSchema.optional(),
+  longFormConsistency: LongFormConsistencyDeltaSchema.optional(),
   notes: z.array(z.string()).default([]),
 });
 

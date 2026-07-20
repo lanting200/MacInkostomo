@@ -37,6 +37,10 @@ export interface ComposeChapterInput {
   readonly compressibleContextCompiler?: CompressibleContextCompiler;
   readonly outlineSectionSelector?: OutlineSectionSelector;
   readonly onContextCompression?: ContextCompressionCallback;
+  /** Fixed-size authoritative context derived from root long-form-plan.json. */
+  readonly longFormContext?: string;
+  /** Last cancellation gate before runtime artifacts are written. */
+  readonly beforePersist?: () => void;
 }
 
 export interface ContextBudget {
@@ -96,6 +100,7 @@ export async function composeGovernedChapter(input: ComposeChapterInput): Promis
     input.book.language ?? "zh",
     input.outlineSectionSelector,
     skillContextPlan,
+    input.longFormContext,
   );
   const initialContextPackage = ContextPackageSchema.parse({
     chapter: input.chapterNumber,
@@ -123,6 +128,7 @@ export async function composeGovernedChapter(input: ComposeChapterInput): Promis
     promptPacks: skillContextPlan.promptPackIds,
     contextNeeds: skillContextPlan.contextNeedIds,
   });
+  input.beforePersist?.();
   const {
     contextPath,
     ruleStackPath,
@@ -447,6 +453,7 @@ async function collectSelectedContext(
   language: "zh" | "en",
   outlineSectionSelector?: OutlineSectionSelector,
   skillContextPlan?: SkillContextPlan,
+  longFormContext?: string,
 ): Promise<ContextPackage["selectedContext"]> {
     const retrievalHints = deriveRetrievalHints(plan);
     const memoBodyExcerpt = plan.memo.body.trim();
@@ -604,6 +611,11 @@ async function collectSelectedContext(
 
     return [
       ...chapterMemoEntry,
+      ...(longFormContext?.trim() ? [{
+        source: "long-form-plan.json#chapter-context",
+        reason: "Apply the authoritative long-form budget, canon, knowledge, timeline, and hook boundaries.",
+        excerpt: longFormContext.trim(),
+      }] : []),
       ...entries.filter((entry): entry is NonNullable<typeof entry> => entry !== null),
       ...outlineEntries,
       ...canonEntries.filter((entry): entry is NonNullable<typeof entry> => entry !== null),

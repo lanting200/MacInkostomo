@@ -37,6 +37,11 @@ let settingsBookGroups = [];
 let settingsSelectedFilePath = '';
 let settingsSelectedFileContent = '';
 let settingsFileLoadSequence = 0;
+let settingsLongFormPlan = null;
+let settingsLongFormChapters = [];
+let settingsLongFormInputSnapshot = '';
+let settingsLongFormLoadError = '';
+let settingsWorkspaceRequestSequence = 0;
 const settingsModelCatalogs = {
   chapter: { models: [], tests: new Map(), loading: false, batchTesting: false, batchProgress: null, message: '', selected: '', endpointVersion: 0, catalogRequestId: 0, testRequestId: 0 },
   review: { models: [], tests: new Map(), loading: false, batchTesting: false, batchProgress: null, message: '', selected: '', endpointVersion: 0, catalogRequestId: 0, testRequestId: 0 },
@@ -44,6 +49,15 @@ const settingsModelCatalogs = {
 let settingsCredentialState = {
   reviewUsesChapterKey: true,
 };
+let debugEventsCache = [];
+let debugJobsSnapshot = { generationJobs: [], creationJobs: [], debug: null };
+let debugFilesSnapshot = [];
+let debugCursorSnapshot = null;
+let debugLoaded = false;
+let debugRequestSequence = 0;
+let debugEventSource = null;
+let debugStreamReconnectTimer = null;
+let debugJobsRefreshTimer = null;
 
 // ====== API ======
 const API = '/api';
@@ -1552,12 +1566,83 @@ function closeImportModal({ restoreFocus = true } = {}) {
 }
 
 // ====== Create / Delete Book ======
+const MAX_LONG_FORM_WORDS = 3_000_000;
+const DEFAULT_LONG_FORM_WORDS = 600_000;
+
 const CREATE_BOOK_FORM_FIELDS = [
   'cbSimpleRequirement', 'cbTitle', 'cbLanguage', 'cbGenre', 'cbPlatform',
-  'cbTargetChapters', 'cbChapterWords', 'cbTotalWords', 'cbPacing',
+  'cbTargetChapters', 'cbChapterWords', 'cbTotalWords', 'cbVolumeCount',
+  'cbChapterWordTolerance', 'cbPacing',
   'cbPremise', 'cbCharacters', 'cbWorldbuilding', 'cbOutline', 'cbVolumePlan',
   'cbStyle', 'cbConstraints',
 ];
+
+function parseLongFormWordCount(value) {
+  if (Number.isSafeInteger(value)) return value;
+  const raw = String(value ?? '').trim().replace(/[,，\s]/g, '');
+  if (!raw) return null;
+  const match = raw.match(/^(\d+(?:\.\d+)?)(万|萬|亿|億)?(?:字)?$/);
+  if (!match) return null;
+  const multiplier = match[2] === '万' || match[2] === '萬'
+    ? 10_000
+    : match[2] === '亿' || match[2] === '億'
+      ? 100_000_000
+      : 1;
+  const words = Math.round(Number(match[1]) * multiplier);
+  return Number.isSafeInteger(words) ? words : null;
+}
+
+function normalizeSpecialConstraints(value) {
+  const entries = Array.isArray(value) ? value : String(value || '').split(/[\n；;]+/);
+  return [...new Set(entries.map(item => String(item || '').trim()).filter(Boolean))];
+}
+
+function inferVolumeCount(payload = {}) {
+  const explicit = Number(payload.volumeCount);
+  if (Number.isInteger(explicit) && explicit > 0) return explicit;
+  const plan = String(payload.volumePlan || '');
+  const markers = plan.match(/(?:^|\n)\s*(?:第?\s*[一二三四五六七八九十百\d]+\s*卷|卷\s*[一二三四五六七八九十百\d]+)/g);
+  return Math.max(1, markers?.length || 6);
+}
+
+function longFormBudgetFromCreateForm() {
+  const targetTotalWords = parseLongFormWordCount(document.getElementById('cbTotalWords')?.value);
+  const volumeCount = Number(document.getElementById('cbVolumeCount')?.value);
+  const targetChapterWords = Number(document.getElementById('cbChapterWords')?.value);
+  const chapterWordTolerance = Number(document.getElementById('cbChapterWordTolerance')?.value);
+  const targetChapters = Number.isFinite(targetTotalWords) && Number.isFinite(targetChapterWords) && targetChapterWords > 0
+    ? Math.max(1, Math.round(targetTotalWords / targetChapterWords))
+    : null;
+  return { targetTotalWords, volumeCount, targetChapterWords, chapterWordTolerance, targetChapters };
+}
+
+function renderCreateBookBudgetSummary() {
+  const summary = document.getElementById('cbBudgetSummary');
+  if (!summary) return;
+  const budget = longFormBudgetFromCreateForm();
+  const valid = Number.isInteger(budget.targetTotalWords)
+    && budget.targetTotalWords > 0
+    && budget.targetTotalWords <= MAX_LONG_FORM_WORDS
+    && Number.isInteger(budget.volumeCount)
+    && budget.volumeCount > 0
+    && Number.isInteger(budget.targetChapterWords)
+    && budget.targetChapterWords >= 500
+    && Number.isInteger(budget.chapterWordTolerance)
+    && budget.chapterWordTolerance >= 0
+    && budget.chapterWordTolerance <= 50;
+  const derivedInput = document.getElementById('cbTargetChapters');
+  if (derivedInput) derivedInput.value = budget.targetChapters || '';
+  const minWords = valid ? Math.max(1, Math.round(budget.targetChapterWords * (1 - budget.chapterWordTolerance / 100))) : null;
+  const maxWords = valid ? Math.round(budget.targetChapterWords * (1 + budget.chapterWordTolerance / 100)) : null;
+  const averageVolumeWords = valid ? Math.round(budget.targetTotalWords / budget.volumeCount) : null;
+  summary.classList.toggle('invalid', !valid);
+  summary.innerHTML = [
+    ['推导章数', budget.targetChapters ? `${budget.targetChapters.toLocaleString('zh-CN')} 章` : '待填写'],
+    ['单章范围', minWords ? `${minWords.toLocaleString('zh-CN')}-${maxWords.toLocaleString('zh-CN')} 字` : '待填写'],
+    ['平均每卷', averageVolumeWords ? `${averageVolumeWords.toLocaleString('zh-CN')} 字` : '待填写'],
+    ['总字数上限', valid ? `${budget.targetTotalWords.toLocaleString('zh-CN')} / ${MAX_LONG_FORM_WORDS.toLocaleString('zh-CN')}` : '检查输入'],
+  ].map(([label, value]) => `<div class="create-book-budget-metric"><span>${label}</span><strong>${value}</strong></div>`).join('');
+}
 
 function readCreateBookDraft() {
   return readLocalJson(CREATE_BOOK_DRAFT_KEY, {}) || {};
@@ -1601,19 +1686,29 @@ function bindCreateBookDraftAutosave() {
   CREATE_BOOK_FORM_FIELDS.forEach(id => {
     const el = document.getElementById(id);
     if (!el) return;
-    el.addEventListener('input', saveCreateBookFormDraft);
-    el.addEventListener('change', saveCreateBookFormDraft);
+    const handleChange = () => {
+      saveCreateBookFormDraft();
+      renderCreateBookBudgetSummary();
+    };
+    el.addEventListener('input', handleChange);
+    el.addEventListener('change', handleChange);
   });
 }
 
 function applyCreateBookPayloadToForm(p = {}) {
+  const targetTotalWords = parseLongFormWordCount(
+    p.targetTotalWords ?? p.totalWordCount ?? p.targetWords ?? p.totalWords,
+  ) || DEFAULT_LONG_FORM_WORDS;
+  const targetChapterWords = Number(p.targetChapterWords || p.chapterWords || 3000);
+  const specialConstraints = normalizeSpecialConstraints(p.specialConstraints || p.constraints);
   setFormValue('cbTitle', p.title);
   setFormValue('cbLanguage', p.language || 'zh');
   setFormValue('cbGenre', p.genre || 'xuanhuan');
   setFormValue('cbPlatform', p.platform || 'tomato');
-  setFormValue('cbTargetChapters', p.targetChapters || 200);
-  setFormValue('cbChapterWords', p.chapterWords || 3000);
-  setFormValue('cbTotalWords', p.totalWords);
+  setFormValue('cbChapterWords', targetChapterWords);
+  setFormValue('cbTotalWords', targetTotalWords);
+  setFormValue('cbVolumeCount', inferVolumeCount(p));
+  setFormValue('cbChapterWordTolerance', p.chapterWordTolerance ?? p.chapterWordTolerancePercent ?? 15);
   setFormValue('cbPremise', p.premise);
   setFormValue('cbCharacters', p.characters);
   setFormValue('cbWorldbuilding', p.worldbuilding);
@@ -1621,7 +1716,8 @@ function applyCreateBookPayloadToForm(p = {}) {
   setFormValue('cbVolumePlan', p.volumePlan);
   setFormValue('cbPacing', p.pacing);
   setFormValue('cbStyle', p.style);
-  setFormValue('cbConstraints', p.constraints);
+  setFormValue('cbConstraints', specialConstraints.join('\n'));
+  renderCreateBookBudgetSummary();
 }
 
 function resumeActiveBookCreationJob() {
@@ -1651,11 +1747,14 @@ function openCreateBookModal() {
       <div class="form-group"><label for="cbLanguage">语言</label><select class="form-select" id="cbLanguage"><option value="zh">中文</option><option value="en">English</option></select></div>
       <div class="form-group"><label for="cbGenre">类型</label><input class="form-input" id="cbGenre" value="xuanhuan" placeholder="xuanhuan / urban / fanfic..."></div>
       <div class="form-group"><label for="cbPlatform">平台</label><input class="form-input" id="cbPlatform" value="tomato" placeholder="tomato / qidian / other"></div>
-      <div class="form-group"><label for="cbTargetChapters">目标章数</label><input class="form-input" id="cbTargetChapters" type="number" min="1" step="1" value="200"></div>
-      <div class="form-group"><label for="cbChapterWords">单章字数</label><input class="form-input" id="cbChapterWords" type="number" min="500" step="1" value="3000"></div>
-      <div class="form-group"><label for="cbTotalWords">总字数要求</label><input class="form-input" id="cbTotalWords" placeholder="例如：60万字 / 450万字"></div>
+      <div class="form-group"><label for="cbTotalWords">目标总字数 *</label><input class="form-input" id="cbTotalWords" type="number" min="1000" max="3000000" step="1000" value="600000"></div>
+      <div class="form-group"><label for="cbVolumeCount">分卷数 *</label><input class="form-input" id="cbVolumeCount" type="number" min="1" max="100" step="1" value="6"></div>
+      <div class="form-group"><label for="cbChapterWords">目标单章字数 *</label><input class="form-input" id="cbChapterWords" type="number" min="500" max="20000" step="100" value="3000"></div>
+      <div class="form-group"><label for="cbChapterWordTolerance">单章字数容差（%）*</label><input class="form-input" id="cbChapterWordTolerance" type="number" min="0" max="50" step="1" value="15"></div>
+      <div class="form-group"><label for="cbTargetChapters">推导目标章数</label><input class="form-input" id="cbTargetChapters" type="number" min="1" step="1" value="200" readonly></div>
       <div class="form-group"><label for="cbPacing">节奏要求</label><input class="form-input" id="cbPacing" placeholder="例如：前三章强钩子，20章一小高潮"></div>
     </div>
+    <div class="create-book-budget-summary" id="cbBudgetSummary" aria-live="polite"></div>
     <div class="form-group"><label for="cbPremise">核心创意 / 卖点 *</label><textarea class="form-textarea form-textarea-sm" id="cbPremise" placeholder="一句话设定、主冲突、爽点、差异化卖点"></textarea></div>
     <div class="form-group"><label for="cbCharacters">主角与主要人物 *</label><textarea class="form-textarea form-textarea-sm" id="cbCharacters" placeholder="主角身份、目标、弱点、金手指；重要配角/反派关系"></textarea></div>
     <div class="form-group"><label for="cbWorldbuilding">世界观与规则 *</label><textarea class="form-textarea form-textarea-sm" id="cbWorldbuilding" placeholder="力量体系、禁忌、组织、地域、核心规则"></textarea></div>
@@ -1663,7 +1762,7 @@ function openCreateBookModal() {
     <div class="form-group"><label for="cbVolumePlan">分卷规划 *</label><textarea class="form-textarea form-textarea-sm" id="cbVolumePlan" placeholder="卷1：1-50章，目标...&#10;卷2：51-120章，目标..."></textarea></div>
     <div class="create-book-two-column">
       <div class="form-group"><label for="cbStyle">文风要求</label><textarea class="form-textarea form-textarea-sm" id="cbStyle" placeholder="叙事视角、语言质感、对话比例、氛围"></textarea></div>
-      <div class="form-group"><label for="cbConstraints">禁忌 / 特别要求</label><textarea class="form-textarea form-textarea-sm" id="cbConstraints" placeholder="不能写什么、必须保持的设定、审核边界"></textarea></div>
+      <div class="form-group"><label for="cbConstraints">特殊约束 *（每行一条）</label><textarea class="form-textarea form-textarea-sm" id="cbConstraints" placeholder="主角不能无代价越级&#10;已确认的世界规则不可被随机设定覆盖&#10;人物只能使用当前知识边界内的信息"></textarea></div>
     </div>
     <p style="font-size:12px;color:#8b949e;">创建后会在 <code>./book/books/</code> 生成 InkOS 小说目录，并自动加入本系统书籍列表。</p>`,
     true);
@@ -1674,6 +1773,7 @@ function openCreateBookModal() {
   document.getElementById('cbAssistBtn').onclick = assistFillCreateBookForm;
   restoreCreateBookFormDraft();
   bindCreateBookDraftAutosave();
+  renderCreateBookBudgetSummary();
 }
 
 function setFormValue(id, value) {
@@ -1733,14 +1833,21 @@ async function assistFillCreateBookForm() {
 }
 
 function payloadToCreateBookFields(p = {}) {
+  const targetTotalWords = parseLongFormWordCount(
+    p.targetTotalWords ?? p.totalWordCount ?? p.targetWords ?? p.totalWords,
+  ) || DEFAULT_LONG_FORM_WORDS;
+  const targetChapterWords = Number(p.targetChapterWords || p.chapterWords || 3000);
+  const targetChapters = Math.max(1, Math.round(targetTotalWords / targetChapterWords));
   return {
     cbTitle: p.title || '',
     cbLanguage: p.language || 'zh',
     cbGenre: p.genre || 'xuanhuan',
     cbPlatform: p.platform || 'tomato',
-    cbTargetChapters: p.targetChapters || 200,
-    cbChapterWords: p.chapterWords || 3000,
-    cbTotalWords: p.totalWords || '',
+    cbTargetChapters: targetChapters,
+    cbChapterWords: targetChapterWords,
+    cbTotalWords: targetTotalWords,
+    cbVolumeCount: inferVolumeCount(p),
+    cbChapterWordTolerance: p.chapterWordTolerance ?? p.chapterWordTolerancePercent ?? 15,
     cbPremise: p.premise || '',
     cbCharacters: p.characters || '',
     cbWorldbuilding: p.worldbuilding || '',
@@ -1748,7 +1855,7 @@ function payloadToCreateBookFields(p = {}) {
     cbVolumePlan: p.volumePlan || '',
     cbPacing: p.pacing || '',
     cbStyle: p.style || '',
-    cbConstraints: p.constraints || '',
+    cbConstraints: normalizeSpecialConstraints(p.specialConstraints || p.constraints).join('\n'),
   };
 }
 
@@ -1763,10 +1870,22 @@ async function createBookFromModal() {
   if (submitButton.disabled) return;
   let payload;
   try {
-    const targetChapters = Number(document.getElementById('cbTargetChapters').value || 200);
-    const chapterWords = Number(document.getElementById('cbChapterWords').value || 3000);
+    const budget = longFormBudgetFromCreateForm();
+    const targetChapters = budget.targetChapters;
+    const chapterWords = budget.targetChapterWords;
+    const specialConstraints = normalizeSpecialConstraints(document.getElementById('cbConstraints').value);
+    if (!Number.isInteger(budget.targetTotalWords) || budget.targetTotalWords < 1000 || budget.targetTotalWords > MAX_LONG_FORM_WORDS) {
+      throw new Error(`目标总字数必须是 1,000-${MAX_LONG_FORM_WORDS.toLocaleString('zh-CN')} 的整数`);
+    }
+    if (!Number.isInteger(budget.volumeCount) || budget.volumeCount < 1 || budget.volumeCount > 100) {
+      throw new Error('分卷数必须是 1-100 的整数');
+    }
     if (!Number.isInteger(targetChapters) || targetChapters < 1) throw new Error('目标章数必须是大于 0 的整数');
-    if (!Number.isInteger(chapterWords) || chapterWords < 500) throw new Error('单章字数必须是至少 500 的整数');
+    if (!Number.isInteger(chapterWords) || chapterWords < 500 || chapterWords > 20000) throw new Error('目标单章字数必须是 500-20,000 的整数');
+    if (!Number.isInteger(budget.chapterWordTolerance) || budget.chapterWordTolerance < 0 || budget.chapterWordTolerance > 50) {
+      throw new Error('单章字数容差必须是 0-50 的整数百分比');
+    }
+    if (specialConstraints.length === 0) throw new Error('请至少填写一条特殊约束');
     payload = {
       title: requiredValue('cbTitle', '书名'),
       language: document.getElementById('cbLanguage').value,
@@ -1774,7 +1893,12 @@ async function createBookFromModal() {
       platform: document.getElementById('cbPlatform').value.trim() || 'tomato',
       targetChapters,
       chapterWords,
-      totalWords: document.getElementById('cbTotalWords').value.trim(),
+      totalWords: String(budget.targetTotalWords),
+      targetTotalWords: budget.targetTotalWords,
+      volumeCount: budget.volumeCount,
+      targetChapterWords: chapterWords,
+      chapterWordTolerance: budget.chapterWordTolerance,
+      specialConstraints,
       premise: requiredValue('cbPremise', '核心创意 / 卖点'),
       characters: requiredValue('cbCharacters', '主角与主要人物'),
       worldbuilding: requiredValue('cbWorldbuilding', '世界观与规则'),
@@ -1782,7 +1906,7 @@ async function createBookFromModal() {
       volumePlan: requiredValue('cbVolumePlan', '分卷规划'),
       pacing: document.getElementById('cbPacing').value.trim(),
       style: document.getElementById('cbStyle').value.trim(),
-      constraints: document.getElementById('cbConstraints').value.trim(),
+      constraints: specialConstraints.join('\n'),
     };
   } catch (err) {
     alert(err.message);
@@ -1971,6 +2095,7 @@ window.addEventListener('beforeunload', event => {
   event.preventDefault();
   event.returnValue = '';
 });
+window.addEventListener('beforeunload', () => closeDebugStream());
 
 // Close modal on backdrop click
 document.getElementById('importModal').addEventListener('click', (e) => {
@@ -2293,7 +2418,10 @@ function switchSettingsPane(pane) {
     target.classList.add('active');
     target.hidden = false;
   }
-  if (pane === 'utility') loadFanqieAccount();
+  if (pane === 'utility') {
+    loadFanqieAccount();
+    if (!debugLoaded) loadDebugPanel();
+  }
 }
 
 document.querySelector('.settings-tabs')?.addEventListener('keydown', event => {
@@ -2448,6 +2576,154 @@ async function fanqieLogout() {
 }
 
 // ====== 书籍设定工作区 ======
+function formatPlanWords(value) {
+  const words = Number(value);
+  return Number.isFinite(words) ? `${Math.round(words).toLocaleString('zh-CN')} 字` : '-';
+}
+
+function longFormPlanInputValues() {
+  return {
+    targetTotalWords: Number(document.getElementById('lfTargetTotalWords')?.value),
+    volumeCount: Number(document.getElementById('lfVolumeCount')?.value),
+    targetChapterWords: Number(document.getElementById('lfTargetChapterWords')?.value),
+    chapterWordTolerance: Number(document.getElementById('lfChapterWordTolerance')?.value),
+    specialConstraints: normalizeSpecialConstraints(document.getElementById('lfSpecialConstraints')?.value),
+  };
+}
+
+function serializeLongFormPlanInputs(values = longFormPlanInputValues()) {
+  return JSON.stringify(values);
+}
+
+function hasUnsavedLongFormPlanChanges() {
+  return Boolean(settingsLongFormPlan && document.getElementById('lfTargetTotalWords'))
+    && serializeLongFormPlanInputs() !== settingsLongFormInputSnapshot;
+}
+
+function markLongFormPlanDirty() {
+  const status = document.getElementById('longFormPlanStatus');
+  if (status) status.textContent = hasUnsavedLongFormPlanChanges() ? '有未保存的长篇计划修改。' : '计划未修改。';
+}
+
+function renderLongFormPlanPanel() {
+  const panel = document.getElementById('longFormPlanPanel');
+  if (!panel) return;
+  if (!settingsBookId) {
+    panel.innerHTML = '<div class="long-form-plan-empty">选择书籍后加载长篇计划。</div>';
+    return;
+  }
+  if (!settingsLongFormPlan) {
+    panel.innerHTML = `<div class="long-form-plan-empty">${escapeHtml(settingsLongFormLoadError || '正在读取长篇计划...')}</div>`;
+    return;
+  }
+
+  const plan = settingsLongFormPlan;
+  const constraints = plan.constraints || {};
+  const budget = plan.plan || {};
+  const volumes = Array.isArray(budget.volumes) ? budget.volumes : [];
+  const chapters = Array.isArray(settingsLongFormChapters) ? settingsLongFormChapters : [];
+  const writtenWords = chapters.reduce((sum, chapter) => sum + (Number(chapter.wordCount) || 0), 0);
+  const writtenChapterNumbers = new Set(chapters.map(chapter => Number(chapter.number)).filter(Number.isFinite));
+  const targetTotalWords = Number(constraints.targetTotalWords) || 0;
+  const wordProgress = targetTotalWords > 0 ? Math.min(100, Math.round(writtenWords / targetTotalWords * 100)) : 0;
+  const nextChapter = writtenChapterNumbers.size > 0 ? Math.max(...writtenChapterNumbers) + 1 : 1;
+  const activeVolume = volumes.find(volume => nextChapter >= volume.startChapter && nextChapter <= volume.endChapter)
+    || volumes.at(-1)
+    || null;
+  const sourceMap = { created: '创建计划', migrated: '旧书迁移', updated: '已更新' };
+
+  panel.innerHTML = `
+    <div class="long-form-plan-head">
+      <div><h3 id="longFormPlanTitle">长篇字数与分卷计划</h3><span>${escapeHtml(sourceMap[plan.source] || plan.source || '结构化计划')} · revision ${escapeHtml(plan.revision || 1)}</span></div>
+      <button class="btn btn-primary btn-sm" id="saveLongFormPlanBtn" type="button" onclick="saveLongFormPlan()">保存计划</button>
+    </div>
+    <div class="long-form-plan-fields">
+      <div class="form-group"><label for="lfTargetTotalWords">目标总字数</label><input class="form-input" id="lfTargetTotalWords" type="number" min="1000" max="3000000" step="1000" value="${escapeHtml(constraints.targetTotalWords || '')}"></div>
+      <div class="form-group"><label for="lfVolumeCount">分卷数</label><input class="form-input" id="lfVolumeCount" type="number" min="1" max="100" step="1" value="${escapeHtml(constraints.volumeCount || '')}"></div>
+      <div class="form-group"><label for="lfTargetChapterWords">目标单章字数</label><input class="form-input" id="lfTargetChapterWords" type="number" min="500" max="20000" step="100" value="${escapeHtml(constraints.targetChapterWords || '')}"></div>
+      <div class="form-group"><label for="lfChapterWordTolerance">单章容差（%）</label><input class="form-input" id="lfChapterWordTolerance" type="number" min="0" max="50" step="1" value="${escapeHtml(constraints.chapterWordTolerance ?? '')}"></div>
+      <div class="form-group long-form-plan-constraints"><label for="lfSpecialConstraints">特殊约束（每行一条）</label><textarea class="form-textarea" id="lfSpecialConstraints">${escapeHtml(normalizeSpecialConstraints(constraints.specialConstraints).join('\n'))}</textarea></div>
+    </div>
+    <div class="long-form-plan-metrics">
+      <div class="long-form-plan-metric"><span>全书预算</span><strong>${formatPlanWords(targetTotalWords)}</strong></div>
+      <div class="long-form-plan-metric"><span>章节进度</span><strong>${chapters.length.toLocaleString('zh-CN')} / ${Number(budget.targetChapters || 0).toLocaleString('zh-CN')}</strong></div>
+      <div class="long-form-plan-metric"><span>累计正文</span><strong>${formatPlanWords(writtenWords)} · ${wordProgress}%</strong></div>
+      <div class="long-form-plan-metric"><span>当前分卷</span><strong>${activeVolume ? `第 ${activeVolume.number} 卷` : '-'}</strong></div>
+    </div>
+    <div class="long-form-volume-list">
+      ${volumes.map(volume => {
+        const volumeChapters = chapters.filter(chapter => chapter.number >= volume.startChapter && chapter.number <= volume.endChapter);
+        const volumeWords = volumeChapters.reduce((sum, chapter) => sum + (Number(chapter.wordCount) || 0), 0);
+        const progress = volume.targetWords > 0 ? Math.min(100, Math.round(volumeWords / volume.targetWords * 100)) : 0;
+        return `<div class="long-form-volume-row">
+          <strong>第 ${escapeHtml(volume.number)} 卷</strong>
+          <span>第 ${escapeHtml(volume.startChapter)}-${escapeHtml(volume.endChapter)} 章 · ${escapeHtml(volume.chapterCount)} 章</span>
+          <span><span>${formatPlanWords(volumeWords)} / ${formatPlanWords(volume.targetWords)}</span><span class="long-form-progress-track"><span style="width:${progress}%"></span></span></span>
+        </div>`;
+      }).join('') || '<div class="long-form-plan-empty">计划没有分卷预算。</div>'}
+    </div>
+    <div class="long-form-plan-foot"><div class="long-form-plan-status" id="longFormPlanStatus">计划由后端重新分配逐章与逐卷预算，保存后 revision 自动递增。</div></div>`;
+
+  panel.querySelectorAll('input, textarea').forEach(input => {
+    input.addEventListener('input', markLongFormPlanDirty);
+    input.addEventListener('change', markLongFormPlanDirty);
+  });
+  settingsLongFormInputSnapshot = serializeLongFormPlanInputs();
+}
+
+function validateLongFormPlanInputs(values) {
+  if (!Number.isInteger(values.targetTotalWords) || values.targetTotalWords < 1000 || values.targetTotalWords > MAX_LONG_FORM_WORDS) {
+    throw new Error(`目标总字数必须是 1,000-${MAX_LONG_FORM_WORDS.toLocaleString('zh-CN')} 的整数`);
+  }
+  if (!Number.isInteger(values.volumeCount) || values.volumeCount < 1 || values.volumeCount > 100) throw new Error('分卷数必须是 1-100 的整数');
+  if (!Number.isInteger(values.targetChapterWords) || values.targetChapterWords < 500 || values.targetChapterWords > 20000) throw new Error('目标单章字数必须是 500-20,000 的整数');
+  if (!Number.isInteger(values.chapterWordTolerance) || values.chapterWordTolerance < 0 || values.chapterWordTolerance > 50) throw new Error('单章容差必须是 0-50 的整数百分比');
+  if (values.specialConstraints.length === 0) throw new Error('请至少保留一条特殊约束');
+}
+
+async function saveLongFormPlan() {
+  if (!settingsBookId || !settingsLongFormPlan) return;
+  const values = longFormPlanInputValues();
+  try {
+    validateLongFormPlanInputs(values);
+  } catch (err) {
+    alert(err.message);
+    return;
+  }
+  if (!hasUnsavedLongFormPlanChanges()) {
+    markLongFormPlanDirty();
+    return;
+  }
+  const bookId = settingsBookId;
+  const expectedRevision = settingsLongFormPlan.revision;
+  const button = document.getElementById('saveLongFormPlanBtn');
+  const status = document.getElementById('longFormPlanStatus');
+  if (button) button.disabled = true;
+  if (status) status.textContent = '正在保存长篇计划...';
+  try {
+    const updated = await api(`/books/${encodeURIComponent(bookId)}/long-form-plan`, {
+      method: 'PATCH',
+      body: JSON.stringify({ expectedRevision, constraints: values }),
+    });
+    if (settingsBookId !== bookId) return;
+    settingsLongFormPlan = updated;
+    renderLongFormPlanPanel();
+    const liveStatus = document.getElementById('longFormPlanStatus');
+    if (liveStatus) liveStatus.textContent = `已保存 revision ${updated.revision}。`;
+  } catch (err) {
+    if (status) status.textContent = `保存失败：${err.message}`;
+    if (err.httpStatus === 409) {
+      alert('计划已被其他任务更新，正在重新加载最新 revision。');
+      await loadBookSettingsWorkspace({ discardChanges: true });
+    } else {
+      alert('长篇计划保存失败：' + err.message);
+    }
+  } finally {
+    const liveButton = document.getElementById('saveLongFormPlanBtn');
+    if (liveButton) liveButton.disabled = false;
+  }
+}
+
 function settingsFileUrl(bookId, relPath) {
   const encodedPath = String(relPath || '').split('/').map(encodeURIComponent).join('/');
   return `${API}/books/${encodeURIComponent(bookId)}/settings/${encodedPath}`;
@@ -2457,7 +2733,7 @@ function selectedBookSettingsFile() {
   return settingsBookFiles.find(file => file.path === settingsSelectedFilePath) || null;
 }
 
-function clearBookSettingsWorkspace(message = '选择书籍后，可查看用途并直接编辑。') {
+function clearBookSettingsWorkspace(message = '选择书籍后，可查看用途并直接编辑。', { clearPlan = false } = {}) {
   settingsBookFiles = [];
   settingsBookGroups = [];
   settingsSelectedFilePath = '';
@@ -2466,6 +2742,13 @@ function clearBookSettingsWorkspace(message = '选择书籍后，可查看用途
   const editor = document.getElementById('settingsEditorSurface');
   if (list) list.innerHTML = '';
   if (editor) editor.innerHTML = `<div class="settings-editor-empty">${escapeHtml(message)}</div>`;
+  if (clearPlan) {
+    settingsLongFormPlan = null;
+    settingsLongFormChapters = [];
+    settingsLongFormInputSnapshot = '';
+    settingsLongFormLoadError = '';
+    renderLongFormPlanPanel();
+  }
 }
 
 function hasUnsavedBookSettingsChanges() {
@@ -2474,19 +2757,21 @@ function hasUnsavedBookSettingsChanges() {
 }
 
 function confirmDiscardBookSettingsChanges() {
-  return !hasUnsavedBookSettingsChanges() || confirm('当前设定文件有未保存的修改，确定放弃这些修改吗？');
+  return (!hasUnsavedBookSettingsChanges() && !hasUnsavedLongFormPlanChanges())
+    || confirm('当前设定或长篇计划有未保存的修改，确定放弃这些修改吗？');
 }
 
-async function loadBookSettingsWorkspace() {
+async function loadBookSettingsWorkspace(options = {}) {
+  const requestSequence = ++settingsWorkspaceRequestSequence;
   const selector = document.getElementById('settingsBookSelector');
   const bookId = selector?.value || '';
-  if (bookId !== settingsBookId && settingsBookId && !confirmDiscardBookSettingsChanges()) {
+  if (!options.discardChanges && bookId !== settingsBookId && settingsBookId && !confirmDiscardBookSettingsChanges()) {
     if (selector) selector.value = settingsBookId;
     return;
   }
   if (!bookId) {
     settingsBookId = '';
-    clearBookSettingsWorkspace();
+    clearBookSettingsWorkspace('选择书籍后，可查看用途并直接编辑。', { clearPlan: true });
     return;
   }
 
@@ -2497,14 +2782,31 @@ async function loadBookSettingsWorkspace() {
     settingsSelectedFilePath = '';
     settingsSelectedFileContent = '';
   }
+  settingsLongFormPlan = null;
+  settingsLongFormChapters = [];
+  settingsLongFormInputSnapshot = '';
+  settingsLongFormLoadError = '';
+  renderLongFormPlanPanel();
   const list = document.getElementById('settingsFileList');
   const editor = document.getElementById('settingsEditorSurface');
   if (list) list.innerHTML = '<div class="fq-empty" style="padding:16px 8px;font-size:12px;">加载设定文件...</div>';
   if (editor) editor.innerHTML = '<div class="settings-editor-empty">正在读取书籍设定...</div>';
 
   try {
-    const data = await api(`/books/${encodeURIComponent(bookId)}/settings`);
-    if (settingsBookId !== bookId) return;
+    const [data, planResult, chaptersResult] = await Promise.all([
+      api(`/books/${encodeURIComponent(bookId)}/settings`),
+      api(`/books/${encodeURIComponent(bookId)}/long-form-plan`)
+        .then(value => ({ value }))
+        .catch(error => ({ error })),
+      api(`/books/${encodeURIComponent(bookId)}/chapters`)
+        .then(value => ({ value }))
+        .catch(error => ({ error })),
+    ]);
+    if (requestSequence !== settingsWorkspaceRequestSequence || settingsBookId !== bookId) return;
+    settingsLongFormPlan = planResult.value || null;
+    settingsLongFormLoadError = planResult.error ? `长篇计划加载失败：${planResult.error.message}` : '';
+    settingsLongFormChapters = Array.isArray(chaptersResult.value?.chapters) ? chaptersResult.value.chapters : [];
+    renderLongFormPlanPanel();
     settingsBookFiles = Array.isArray(data.files) ? data.files : [];
     settingsBookGroups = Array.isArray(data.groups) ? data.groups : [];
     if (!settingsBookFiles.length) {
@@ -2654,43 +2956,335 @@ async function saveSelectedBookSetting() {
   }
 }
 
-async function loadDebugPanel() {
+function debugFilterValues() {
+  const level = document.getElementById('debugLevel')?.value.trim() || '';
+  const component = document.getElementById('debugComponent')?.value.trim() || '';
+  const traceId = document.getElementById('debugTraceId')?.value.trim() || '';
+  const bookId = document.getElementById('debugBookId')?.value.trim() || '';
+  const chapterNumber = document.getElementById('debugChapterNumber')?.value.trim() || '';
+  const text = document.getElementById('debugText')?.value.trim() || '';
+  const requestedLimit = Number(document.getElementById('debugLimit')?.value || 100);
+  return {
+    level,
+    component,
+    traceId,
+    bookId,
+    chapterNumber: chapterNumber && Number.isInteger(Number(chapterNumber)) ? chapterNumber : '',
+    text,
+    limit: Math.min(5000, Math.max(1, Number.isInteger(requestedLimit) ? requestedLimit : 100)),
+  };
+}
+
+function debugQueryString(values = debugFilterValues(), format = '') {
+  const params = new URLSearchParams();
+  for (const key of ['level', 'component', 'traceId', 'bookId', 'chapterNumber', 'text']) {
+    if (values[key]) params.set(key, values[key]);
+  }
+  if (values.limit) params.set('limit', String(values.limit));
+  if (format) params.set('format', format);
+  return params.toString();
+}
+
+function debugEventMatches(event, values = debugFilterValues()) {
+  if (values.level && event.level !== values.level) return false;
+  if (values.component && event.component !== values.component && event.scope !== values.component) return false;
+  if (values.traceId && event.traceId !== values.traceId) return false;
+  if (values.bookId && event.bookId !== values.bookId) return false;
+  if (values.chapterNumber && Number(event.chapterNumber) !== Number(values.chapterNumber)) return false;
+  if (values.text) {
+    const haystack = `${event.message || ''} ${JSON.stringify(event.data || {})}`.toLowerCase();
+    if (!haystack.includes(values.text.toLowerCase())) return false;
+  }
+  return true;
+}
+
+function debugTimestamp(value) {
+  const date = new Date(value || '');
+  return Number.isNaN(date.getTime()) ? String(value || '-') : date.toLocaleString('zh-CN', { hour12: false });
+}
+
+function debugJson(value) {
+  try { return JSON.stringify(value, null, 2); } catch { return String(value || ''); }
+}
+
+function debugEventDetails(event) {
+  const details = {
+    ...(event.data ? { data: event.data } : {}),
+    ...(event.error ? { error: event.error } : {}),
+  };
+  return Object.keys(details).length > 0
+    ? `<details class="debug-event-details"><summary>查看结构化数据</summary><pre>${escapeHtml(debugJson(details))}</pre></details>`
+    : '';
+}
+
+function renderDebugEvents(events = debugEventsCache) {
   const panel = document.getElementById('debugPanel');
+  const count = document.getElementById('debugEventCount');
   if (!panel) return;
-  panel.textContent = '加载中...';
-  try {
-    const [jobs, events] = await Promise.all([
-      api('/debug/jobs'),
-      api('/debug/events?limit=80'),
-    ]);
-    const lines = [];
-    lines.push('=== Active Jobs ===');
-    lines.push(JSON.stringify(jobs.generationJobs || [], null, 2));
-    lines.push('');
-    lines.push('=== Creation Jobs ===');
-    lines.push(JSON.stringify(jobs.creationJobs || [], null, 2));
-    lines.push('');
-    lines.push('=== Debug Files ===');
-    lines.push(JSON.stringify(events.files || jobs.debug || {}, null, 2));
-    lines.push('');
-    lines.push('=== Recent Events ===');
-    for (const e of (events.events || []).slice(-80)) {
-      lines.push(`${e.ts} [${e.level}] ${e.scope}: ${e.message} ${e.data ? JSON.stringify(e.data) : ''}`);
-    }
-    panel.textContent = lines.join('\n');
-  } catch (err) {
-    panel.textContent = 'Debug 加载失败: ' + err.message;
+  if (count) count.textContent = String(events.length);
+  if (!events.length) {
+    panel.innerHTML = '<div class="debug-empty">没有符合当前筛选条件的事件。</div>';
+    return;
+  }
+  panel.innerHTML = events.slice().sort((left, right) => Number(left.sequence || 0) - Number(right.sequence || 0)).reverse().map(event => {
+    const level = ['debug', 'info', 'warn', 'error'].includes(event.level) ? event.level : 'info';
+    const context = [
+      event.operation ? `<span>操作 <code>${escapeHtml(event.operation)}</code></span>` : '',
+      event.phase ? `<span>阶段 ${escapeHtml(event.phase)}</span>` : '',
+      event.traceId ? `<span>Trace <code>${escapeHtml(event.traceId)}</code></span>` : '',
+      event.bookId ? `<span>书籍 <code>${escapeHtml(event.bookId)}</code></span>` : '',
+      Number.isSafeInteger(Number(event.chapterNumber)) ? `<span>第${escapeHtml(event.chapterNumber)}章</span>` : '',
+      event.durationMs !== undefined ? `<span>${escapeHtml(event.durationMs)} ms</span>` : '',
+    ].filter(Boolean).join('');
+    return `<article class="debug-event-row" data-sequence="${escapeHtml(event.sequence)}">
+      <div class="debug-event-meta"><span class="debug-event-sequence">#${escapeHtml(event.sequence)}</span><span>${escapeHtml(debugTimestamp(event.ts || event.timestamp))}</span><span class="debug-event-badge level-${level}">${level}</span><span class="debug-event-badge">${escapeHtml(event.component || event.scope || 'debug')}</span><span class="debug-event-id">${escapeHtml(event.eventId || '')}</span></div>
+      <div class="debug-event-message">${escapeHtml(event.message || event.operation || '未命名事件')}</div>
+      ${context ? `<div class="debug-event-context">${context}</div>` : ''}
+      ${debugEventDetails(event)}
+    </article>`;
+  }).join('');
+}
+
+function renderDebugComponentOptions(events = debugEventsCache) {
+  const list = document.getElementById('debugComponentOptions');
+  if (!list) return;
+  const components = [...new Set(events.map(event => event.component || event.scope).filter(Boolean))].sort();
+  list.innerHTML = components.map(component => `<option value="${escapeHtml(component)}"></option>`).join('');
+}
+
+function renderDebugJobs(jobs = debugJobsSnapshot) {
+  const list = document.getElementById('debugJobsList');
+  const count = document.getElementById('debugJobCount');
+  if (!list) return;
+  const entries = [
+    ...(jobs.generationJobs || []).map(job => ({ ...job, kind: '生成', title: `${job.bookId || '-'} · 第${job.chapterNum || '-'}章`, state: job.phase || 'queued' })),
+    ...(jobs.creationJobs || []).map(job => ({ ...job, kind: '创建', title: job.title || job.jobId || '-', state: job.status || 'queued' })),
+  ].sort((left, right) => String(right.updatedAt || right.createdAt || '').localeCompare(String(left.updatedAt || left.createdAt || '')));
+  if (count) count.textContent = String(entries.length);
+  if (!entries.length) {
+    list.innerHTML = '<div class="debug-empty">暂无任务</div>';
+    return;
+  }
+  list.innerHTML = entries.slice(0, 40).map(job => `<div class="debug-job-row"><div class="debug-job-title">${escapeHtml(job.kind)} · ${escapeHtml(job.title)}</div><div class="debug-job-meta">${escapeHtml(job.state)} · ${escapeHtml(debugTimestamp(job.updatedAt || job.createdAt))}</div></div>`).join('');
+}
+
+function renderDebugFiles(files = debugFilesSnapshot) {
+  const list = document.getElementById('debugFilesList');
+  const count = document.getElementById('debugFileCount');
+  if (!list) return;
+  files = Array.isArray(files) ? files : [];
+  if (count) count.textContent = String(files.length);
+  if (!files.length) {
+    list.innerHTML = '<div class="debug-empty">暂无文件</div>';
+    return;
+  }
+  list.innerHTML = files.map(file => `<div class="debug-file-row"><div class="debug-file-name">${escapeHtml(file.name || '')}</div><div class="debug-file-meta">${escapeHtml(file.size || 0)} bytes · ${escapeHtml(debugTimestamp(file.mtime))}</div></div>`).join('');
+}
+
+function updateDebugSummary(result = {}) {
+  const meta = document.getElementById('debugResultMeta');
+  const health = document.getElementById('debugHealthMeta');
+  if (meta) {
+    const cursor = result.cursor || debugCursorSnapshot || {};
+    meta.textContent = `${debugEventsCache.length} 条事件 · 最新序号 ${cursor.newestSequence || '-'}${result.hasMore ? ' · 还有更早事件' : ''}`;
+  }
+  if (health) {
+    const debug = result.debug || debugJobsSnapshot.debug || {};
+    const fileCount = Array.isArray(debug.files) ? debug.files.length : debugFilesSnapshot.length;
+    health.textContent = `诊断目录 ${fileCount} 个文件 · 序号 ${debug.currentSequence || '-'}${debugHealthState ? ` · ${debugHealthState}` : ''}`;
   }
 }
 
-async function copyDebugSummary() {
-  await loadDebugPanel();
-  const text = document.getElementById('debugPanel')?.textContent || '';
+let debugHealthState = '';
+
+function setDebugStatus(message, state = '') {
+  const status = document.getElementById('debugPanelStatus');
+  const connection = document.getElementById('debugStreamStatus');
+  if (status) status.textContent = message || '';
+  if (connection) {
+    connection.textContent = state === 'connected' ? '实时已连接' : state === 'connecting' ? '正在连接实时事件' : state === 'failed' ? '实时连接异常，浏览器将重试' : '实时未开启';
+    connection.className = `debug-connection-status ${state}`.trim();
+  }
+}
+
+async function loadDebugPanel({ restartStream = true } = {}) {
+  const panel = document.getElementById('debugPanel');
+  if (!panel) return;
+  const requestId = ++debugRequestSequence;
+  const shouldResumeStream = restartStream && Boolean(debugEventSource);
+  if (shouldResumeStream) closeDebugStream();
+  panel.innerHTML = '<div class="debug-empty">加载中...</div>';
+  setDebugStatus('正在读取调试事件…');
+  const values = debugFilterValues();
   try {
-    await copyTextToClipboard(text);
-    alert('Debug 摘要已复制');
+    const query = debugQueryString(values);
+    const [jobs, events, health] = await Promise.all([
+      api('/debug/jobs'),
+      api(`/debug/events?${query}`),
+      api('/debug/health').catch(error => ({ status: 'failed', error: error.message })),
+    ]);
+    if (requestId !== debugRequestSequence) return;
+    debugEventsCache = Array.isArray(events.events) ? events.events : [];
+    debugJobsSnapshot = jobs || { generationJobs: [], creationJobs: [], debug: null };
+    const fileInfo = events.files || jobs.debug || {};
+    debugFilesSnapshot = Array.isArray(fileInfo) ? fileInfo : (Array.isArray(fileInfo.files) ? fileInfo.files : []);
+    debugCursorSnapshot = events.cursor || null;
+    debugHealthState = health?.status || 'unknown';
+    debugLoaded = true;
+    renderDebugEvents();
+    renderDebugComponentOptions();
+    renderDebugJobs();
+    renderDebugFiles();
+    updateDebugSummary({ ...events, debug: events.files || jobs.debug });
+    setDebugStatus(`已更新 ${debugEventsCache.length} 条事件`, debugEventSource ? 'connected' : '');
+    if (shouldResumeStream || document.getElementById('debugLiveToggle')?.checked) startDebugStream();
+  } catch (err) {
+    if (requestId !== debugRequestSequence) return;
+    debugLoaded = false;
+    panel.innerHTML = `<div class="debug-empty">读取失败：${escapeHtml(err.message)}</div>`;
+    setDebugStatus(`Debug 加载失败：${err.message}`, 'failed');
+  }
+}
+
+function closeDebugStream() {
+  if (debugEventSource) {
+    debugEventSource.close();
+    debugEventSource = null;
+  }
+  if (debugStreamReconnectTimer) {
+    clearTimeout(debugStreamReconnectTimer);
+    debugStreamReconnectTimer = null;
+  }
+  if (debugJobsRefreshTimer) {
+    clearInterval(debugJobsRefreshTimer);
+    debugJobsRefreshTimer = null;
+  }
+  if (document.getElementById('debugLiveToggle')?.checked) setDebugStatus('实时已关闭');
+}
+
+function startDebugStream() {
+  if (!window.EventSource) {
+    setDebugStatus('当前浏览器不支持实时事件', 'failed');
+    return;
+  }
+  closeDebugStream();
+  const values = debugFilterValues();
+  const latest = debugEventsCache.reduce((max, event) => Math.max(max, Number(event.sequence) || 0), 0);
+  const params = debugQueryString(values);
+  const streamParams = new URLSearchParams(params);
+  if (latest > 0) streamParams.set('after', String(latest));
+  debugEventSource = new EventSource(`${API}/debug/stream?${streamParams.toString()}`);
+  setDebugStatus('正在连接实时事件…', 'connecting');
+  const handleEvent = message => {
+    try {
+      const event = JSON.parse(message.data || '{}');
+      const currentValues = debugFilterValues();
+      if (!debugEventMatches(event, currentValues)) return;
+      if (debugEventsCache.some(item => Number(item.sequence) === Number(event.sequence))) return;
+      debugEventsCache = [...debugEventsCache, event].sort((left, right) => Number(left.sequence || 0) - Number(right.sequence || 0)).slice(-currentValues.limit);
+      debugCursorSnapshot = { ...(debugCursorSnapshot || {}), newestSequence: event.sequence, nextAfter: event.sequence };
+      renderDebugEvents();
+      renderDebugComponentOptions();
+      updateDebugSummary({ cursor: debugCursorSnapshot });
+    } catch {
+      setDebugStatus('收到无法解析的实时事件', 'failed');
+    }
+  };
+  debugEventSource.addEventListener('diagnostic', handleEvent);
+  debugEventSource.onmessage = handleEvent;
+  debugEventSource.onopen = () => setDebugStatus('实时已连接', 'connected');
+  const source = debugEventSource;
+  debugEventSource.onerror = () => {
+    if (debugEventSource !== source) return;
+    source.close();
+    debugEventSource = null;
+    if (debugJobsRefreshTimer) {
+      clearInterval(debugJobsRefreshTimer);
+      debugJobsRefreshTimer = null;
+    }
+    setDebugStatus('实时连接异常，正在重试', 'failed');
+    if (document.getElementById('debugLiveToggle')?.checked) {
+      debugStreamReconnectTimer = setTimeout(startDebugStream, 1500);
+    }
+  };
+  debugJobsRefreshTimer = setInterval(async () => {
+    try {
+      debugJobsSnapshot = await api('/debug/jobs');
+      debugFilesSnapshot = debugJobsSnapshot.debug?.files || debugFilesSnapshot;
+      renderDebugJobs();
+      renderDebugFiles();
+    } catch {}
+  }, 10_000);
+}
+
+async function toggleDebugStream(enabled) {
+  if (!enabled) {
+    closeDebugStream();
+    setDebugStatus('实时已关闭');
+    return;
+  }
+  if (!debugLoaded) {
+    await loadDebugPanel({ restartStream: false });
+    return;
+  }
+  if (document.getElementById('debugLiveToggle')?.checked) startDebugStream();
+}
+
+function resetDebugFilters() {
+  ['debugComponent', 'debugTraceId', 'debugBookId', 'debugChapterNumber', 'debugText'].forEach(id => {
+    const input = document.getElementById(id);
+    if (input) input.value = '';
+  });
+  const level = document.getElementById('debugLevel');
+  if (level) level.value = '';
+  const limit = document.getElementById('debugLimit');
+  if (limit) limit.value = '100';
+  loadDebugPanel();
+}
+
+function debugSummaryText() {
+  const generationJobs = debugJobsSnapshot.generationJobs || [];
+  const creationJobs = debugJobsSnapshot.creationJobs || [];
+  const lines = [
+    `Debug events: ${debugEventsCache.length}`,
+    `Health: ${debugHealthState || 'unknown'}`,
+    `Generation jobs: ${generationJobs.length}`,
+    `Creation jobs: ${creationJobs.length}`,
+    `Log files: ${debugFilesSnapshot.length}`,
+  ];
+  for (const event of debugEventsCache.slice().reverse()) {
+    lines.push(`${event.ts || event.timestamp || ''} [${event.level || 'info'}] ${event.component || event.scope || 'debug'} ${event.operation || ''} ${event.message || ''}${event.traceId ? ` trace=${event.traceId}` : ''}${event.bookId ? ` book=${event.bookId}` : ''}`.trim());
+  }
+  return lines.join('\n');
+}
+
+async function copyDebugSummary() {
+  if (!debugLoaded) await loadDebugPanel();
+  try {
+    await copyTextToClipboard(debugSummaryText());
+    setDebugStatus('Debug 摘要已复制');
   } catch {
-    alert('复制失败，请手动选择 Debug 文本');
+    alert('复制失败，请检查浏览器剪贴板权限');
+  }
+}
+
+async function downloadDebugJsonl() {
+  const query = debugQueryString(debugFilterValues(), 'jsonl');
+  try {
+    const response = await fetch(`${API}/debug/events?${query}`, { headers: { Accept: 'application/x-ndjson' } });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `debug-events-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    setDebugStatus('JSONL 已开始下载');
+  } catch (err) {
+    setDebugStatus(`JSONL 下载失败：${err.message}`, 'failed');
   }
 }
 

@@ -1,5 +1,33 @@
 import { describe, expect, it } from "vitest";
-import { buildSettlerUserPrompt } from "../agents/settler-prompts.js";
+import { buildSettlerSystemPrompt, buildSettlerUserPrompt } from "../agents/settler-prompts.js";
+import type { BookConfig } from "../models/book.js";
+import type { GenreProfile } from "../models/genre-profile.js";
+
+const BOOK: BookConfig = {
+  id: "settler-book",
+  title: "Settler Book",
+  platform: "tomato",
+  genre: "other",
+  status: "active",
+  targetChapters: 20,
+  chapterWordCount: 3000,
+  createdAt: "2026-07-20T00:00:00.000Z",
+  updatedAt: "2026-07-20T00:00:00.000Z",
+};
+
+const GENRE: GenreProfile = {
+  id: "other",
+  name: "General",
+  language: "en",
+  chapterTypes: ["mainline"],
+  fatigueWords: [],
+  numericalSystem: false,
+  powerScaling: false,
+  eraResearch: false,
+  pacingRule: "",
+  satisfactionTypes: [],
+  auditDimensions: [],
+};
 
 describe("buildSettlerUserPrompt", () => {
   it("includes the persistent object ledger in settlement context", () => {
@@ -26,5 +54,13 @@ describe("buildSettlerUserPrompt", () => {
     expect(prompt).toContain("xuanwei-token");
     expect(prompt).toContain("木质");
     expect(prompt).toContain("玄微摸出镇妖司旧令牌");
+  });
+
+  it("emits English long-form delta rules for English books", () => {
+    const prompt = buildSettlerSystemPrompt(BOOK, GENRE, null, "en");
+    expect(prompt).toContain("Long-form consistency delta");
+    expect(prompt).toContain("write every body-supported change to longFormConsistency");
+    expect(prompt).toContain('"longFormConsistency"');
+    expect(prompt).not.toContain("长篇连续性增量");
   });
 });

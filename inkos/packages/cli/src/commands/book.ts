@@ -2,7 +2,7 @@ import { Command } from "commander";
 import { access, readFile, rm } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { join, resolve } from "node:path";
-import { deriveBookIdFromTitle, normalizePlatformOrOther, PipelineRunner, StateManager, type BookConfig } from "@actalk/inkos-core";
+import { createInkOSRuntime, deriveBookIdFromTitle, normalizePlatformOrOther, StateManager, type BookConfig } from "@actalk/inkos-core";
 import {
   formatBookCreateCreated,
   formatBookCreateCreating,
@@ -40,10 +40,12 @@ bookCommand
         if (await state.isCompleteBookDirectory(bookDir)) {
           throw new Error(`Book "${bookId}" already exists at books/${bookId}/. Use a different title or delete the existing book first.`);
         }
-        await rm(bookDir, { recursive: true, force: true });
+        throw new Error(
+          `Incomplete book directory already exists at books/${bookId}/. `
+          + "Move it to a recovery location or remove it explicitly before creating this title.",
+        );
       } catch (e) {
-        if (e instanceof Error && e.message.includes("already exists")) throw e;
-        // Directory doesn't exist, good
+        if ((e as NodeJS.ErrnoException)?.code !== "ENOENT") throw e;
       }
 
       const config = await loadConfig();
@@ -68,9 +70,12 @@ bookCommand
         ? await readFile(resolve(opts.brief), "utf-8")
         : undefined;
 
-      const pipeline = new PipelineRunner(buildPipelineConfig(config, root, { externalContext: brief }));
-
-      await pipeline.initBook(book);
+      const runtime = createInkOSRuntime(buildPipelineConfig(config, root, { externalContext: brief }));
+      try {
+        await runtime.inkos.initBook(book, { externalContext: brief });
+      } finally {
+        await runtime.kernel.shutdown();
+      }
 
       if (opts.json) {
         log(JSON.stringify({

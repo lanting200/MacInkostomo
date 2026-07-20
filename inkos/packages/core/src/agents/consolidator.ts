@@ -7,6 +7,11 @@ import {
   renderHookSnapshot,
 } from "../utils/story-markdown.js";
 import type { StoredHook } from "../state/memory-db.js";
+import {
+  hasCompleteChapterRange,
+  loadLongFormPlan,
+  resolvePlanVolumeBoundaries,
+} from "../utils/long-form-plan.js";
 
 export interface ConsolidationResult {
   readonly volumeSummaries: string;
@@ -41,9 +46,10 @@ export class ConsolidatorAgent extends BaseAgent {
     const summariesPath = join(storyDir, "chapter_summaries.md");
     const volumeSummariesPath = join(storyDir, "volume_summaries.md");
 
-    const [summariesRaw, outlineRaw] = await Promise.all([
+    const [summariesRaw, outlineRaw, longFormPlan] = await Promise.all([
       readFile(summariesPath, "utf-8").catch(() => ""),
       readVolumeMap(bookDir, ""),
+      loadLongFormPlan(bookDir),
     ]);
 
     // Phase 7 hotfix 2: pre-archive re-promotion pass. Runs independently of
@@ -52,12 +58,14 @@ export class ConsolidatorAgent extends BaseAgent {
     // threshold.
     const promotedHookCount = await this.rerunAdvancedCountPromotion(storyDir);
 
-    if (!summariesRaw || !outlineRaw) {
+    if (!summariesRaw || (!longFormPlan && !outlineRaw)) {
       return { volumeSummaries: "", archivedVolumes: 0, retainedChapters: 0, promotedHookCount };
     }
 
     // Parse volume boundaries from outline
-    const volumeBoundaries = this.parseVolumeBoundaries(outlineRaw);
+    const volumeBoundaries = longFormPlan
+      ? resolvePlanVolumeBoundaries(longFormPlan.plan)
+      : this.parseVolumeBoundaries(outlineRaw);
     if (volumeBoundaries.length === 0) {
       return { volumeSummaries: "", archivedVolumes: 0, retainedChapters: 0, promotedHookCount };
     }
@@ -68,15 +76,13 @@ export class ConsolidatorAgent extends BaseAgent {
       return { volumeSummaries: "", archivedVolumes: 0, retainedChapters: 0, promotedHookCount };
     }
 
-    const maxChapter = Math.max(...rows.map((r) => r.chapter));
-
     // Determine which volumes are "completed" (all chapters written)
     const completedVolumes: Array<{ name: string; startCh: number; endCh: number; rows: typeof rows }> = [];
     const currentVolumeRows: typeof rows = [];
 
     for (const vol of volumeBoundaries) {
       const volRows = rows.filter((r) => r.chapter >= vol.startCh && r.chapter <= vol.endCh);
-      if (vol.endCh <= maxChapter && volRows.length > 0) {
+      if (hasCompleteChapterRange(vol, volRows.map((row) => row.chapter))) {
         completedVolumes.push({ ...vol, rows: volRows });
       } else {
         // Current/incomplete volume — keep detailed rows

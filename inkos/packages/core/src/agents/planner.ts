@@ -1,5 +1,6 @@
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { writeAtomicText } from "../utils/runtime-writer.js";
 import { BaseAgent } from "./base.js";
 import type { BookConfig } from "../models/book.js";
 import { readBookRules as readAuthoritativeBookRules } from "./rules-reader.js";
@@ -42,6 +43,8 @@ export interface PlanChapterInput {
   readonly bookDir: string;
   readonly chapterNumber: number;
   readonly externalContext?: string;
+  /** Fixed-size authoritative long-form budget/canon context. */
+  readonly longFormContext?: string;
 }
 
 export interface PlanChapterOutput {
@@ -139,7 +142,10 @@ export class PlannerAgent extends BaseAgent {
       chapterSummariesRaw: seedMaterials.chapterSummariesRaw,
       previousEndingExcerpt: seedMaterials.previousEndingExcerpt,
       brief: seedMaterials.brief,
-      chapterContext: input.externalContext,
+      chapterContext: [input.longFormContext, input.externalContext]
+        .map((value) => value?.trim())
+        .filter((value): value is string => Boolean(value))
+        .join("\n\n"),
       recyclableHooks: memorySelection.recyclableHooks,
       // Phase hotfix 4: thread book language through so the planner uses
       // English prompts (system + user template + golden opening guidance)
@@ -161,13 +167,15 @@ export class PlannerAgent extends BaseAgent {
       renderSummarySnapshot(memorySelection.summaries, input.book.language ?? "zh"),
       activeHookCount,
     );
-    await writeFile(runtimePath, intentMarkdown, "utf-8");
+    await writeAtomicText(runtimePath, intentMarkdown);
 
     return {
       intent,
       memo,
       intentMarkdown,
-      plannerInputs: materials.plannerInputs,
+      plannerInputs: input.longFormContext?.trim()
+        ? [...materials.plannerInputs, "long-form-plan.json#chapter-context"]
+        : materials.plannerInputs,
       runtimePath,
     };
   }

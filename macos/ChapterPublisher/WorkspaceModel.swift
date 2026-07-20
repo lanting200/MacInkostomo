@@ -20,6 +20,8 @@ final class WorkspaceModel: ObservableObject {
   @Published private(set) var bookSettings: BookSettingsResponse?
   @Published private(set) var selectedSettingPath: String?
   @Published var selectedSettingContent = ""
+  @Published private(set) var longFormPlan: LongFormPlanResponse?
+  @Published private(set) var isLongFormPlanUnavailable = false
 
   @Published private(set) var fanqieLogin: FanqieLoginState?
   @Published private(set) var fanqieAccount: FanqieAccount?
@@ -69,6 +71,7 @@ final class WorkspaceModel: ObservableObject {
   private var configToken = UUID()
   private var settingsToken = UUID()
   private var settingContentToken = UUID()
+  private var longFormPlanToken = UUID()
   private var fanqieToken = UUID()
   private var fanqieChaptersToken = UUID()
   private var fanqieContentToken = UUID()
@@ -106,6 +109,7 @@ final class WorkspaceModel: ObservableObject {
     case .settings:
       await loadInkOSConfig()
       await loadBookSettings()
+      await loadLongFormPlan()
     case .activity:
       await refreshActivity()
     }
@@ -179,11 +183,14 @@ final class WorkspaceModel: ObservableObject {
       bookSettings = nil
       selectedSettingPath = nil
       selectedSettingContent = ""
+      longFormPlan = nil
+      isLongFormPlanUnavailable = false
     }
     guard id != nil else { return }
     await refreshChapters()
     if section == .settings {
       await loadBookSettings()
+      await loadLongFormPlan()
     }
   }
 
@@ -349,7 +356,10 @@ final class WorkspaceModel: ObservableObject {
   }
 
   @discardableResult
-  func createBook(_ request: CreateBookRequest) async -> CreateBookResponse? {
+  func createBook(
+    _ request: CreateBookRequest,
+    requirements: String = ""
+  ) async -> CreateBookResponse? {
     let title = request.title.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !title.isEmpty else {
       errorMessage = "请填写书名"
@@ -359,6 +369,11 @@ final class WorkspaceModel: ObservableObject {
     defer { endMutation() }
     do {
       let response = try await api.createBook(request)
+      CreateBookDraftPersistence.markPending(
+        jobID: response.jobId,
+        request: request,
+        requirements: requirements
+      )
       startCreationJobPolling(response.jobId)
       await refreshActivity()
       return response
@@ -399,6 +414,7 @@ final class WorkspaceModel: ObservableObject {
       do {
         let job = try await api.fetchCreationJob(id: jobID)
         if !job.isActive {
+          CreateBookDraftPersistence.reconcile(creationJobs: [job])
           await refreshActivity()
           await refreshWorkspaceAfterWorkflowCompletion()
           return job
@@ -478,6 +494,7 @@ final class WorkspaceModel: ObservableObject {
     do {
       let jobs = try await api.fetchWorkflowJobs()
       guard activityToken == token else { return }
+      CreateBookDraftPersistence.reconcile(creationJobs: jobs.creationJobs)
       workflowJobs = jobs
       resumeWorkflowTrackingFromSnapshot()
       let events = try await api.fetchDebugEvents(limit: 300)
@@ -497,6 +514,7 @@ final class WorkspaceModel: ObservableObject {
     do {
       let jobs = try await api.fetchWorkflowJobs()
       guard activityToken == token else { return }
+      CreateBookDraftPersistence.reconcile(creationJobs: jobs.creationJobs)
       workflowJobs = jobs
       resumeWorkflowTrackingFromSnapshot()
     } catch is CancellationError {
@@ -763,6 +781,74 @@ final class WorkspaceModel: ObservableObject {
     }
   }
 
+  // MARK: - Structured long-form plan
+
+  func loadLongFormPlan() async {
+    guard let bookID = currentBookID else {
+      longFormPlan = nil
+      isLongFormPlanUnavailable = false
+      return
+    }
+    let token = UUID()
+    longFormPlanToken = token
+    beginLoading()
+    defer { endLoading() }
+    do {
+      let response = try await api.fetchLongFormPlan(bookID: bookID)
+      guard longFormPlanToken == token, currentBookID == bookID else { return }
+      longFormPlan = response
+      isLongFormPlanUnavailable = false
+    } catch is CancellationError {
+      return
+    } catch let apiError as APIError where apiError.statusCode == 404 {
+      guard longFormPlanToken == token, currentBookID == bookID else { return }
+      longFormPlan = nil
+      isLongFormPlanUnavailable = true
+    } catch {
+      guard longFormPlanToken == token, currentBookID == bookID else { return }
+      longFormPlan = nil
+      isLongFormPlanUnavailable = false
+      setError(error)
+    }
+  }
+
+  @discardableResult
+  func updateLongFormPlan(
+    constraints: LongFormConstraints? = nil,
+    continuity: LongFormContinuity? = nil,
+    expectedRevision: Int?
+  ) async -> LongFormPlanResponse? {
+    guard let bookID = currentBookID else {
+      errorMessage = "请先选择书籍"
+      return nil
+    }
+    guard constraints != nil || continuity != nil else {
+      errorMessage = "长篇计划没有需要保存的修改"
+      return nil
+    }
+    beginMutation()
+    defer { endMutation() }
+    do {
+      let response = try await api.updateLongFormPlan(
+        bookID: bookID,
+        expectedRevision: expectedRevision,
+        constraints: constraints,
+        continuity: continuity
+      )
+      guard currentBookID == bookID else { return nil }
+      longFormPlanToken = UUID()
+      longFormPlan = response
+      isLongFormPlanUnavailable = false
+      return response
+    } catch is CancellationError {
+      return nil
+    } catch {
+      guard currentBookID == bookID else { return nil }
+      setError(error)
+      return nil
+    }
+  }
+
   // MARK: - Fanqie
 
   func refreshFanqie(force: Bool = false) async {
@@ -930,6 +1016,7 @@ final class WorkspaceModel: ObservableObject {
     chapterToken = UUID()
     settingsToken = UUID()
     settingContentToken = UUID()
+    longFormPlanToken = UUID()
   }
 
   private func invalidateRequests(for section: WorkspaceSection) {
@@ -947,6 +1034,7 @@ final class WorkspaceModel: ObservableObject {
       configToken = UUID()
       settingsToken = UUID()
       settingContentToken = UUID()
+      longFormPlanToken = UUID()
     case .activity:
       activityToken = UUID()
     }

@@ -909,7 +909,7 @@ You MUST emit all **5 SECTION blocks in order**: story_frame → volume_map → 
       mkdir(rolesMinorDir, { recursive: true }),
     ]);
 
-    const writes: Array<Promise<void>> = [];
+    const writes: Array<() => Promise<void>> = [];
 
     const storyFrameBody = output.storyFrame ?? output.storyBible;
     const volumeMap = output.volumeMap ?? output.volumeOutline;
@@ -932,10 +932,10 @@ You MUST emit all **5 SECTION blocks in order**: story_frame → volume_map → 
     }
 
     if (!isPhase5Output) {
-      writes.push(writeFile(join(storyDir, "story_bible.md"), output.storyBible, "utf-8"));
-      writes.push(writeFile(join(storyDir, "volume_outline.md"), output.volumeOutline, "utf-8"));
-      writes.push(writeFile(join(storyDir, "book_rules.md"), output.bookRules, "utf-8"));
-      writes.push(writeFile(
+      writes.push(() => writeFile(join(storyDir, "story_bible.md"), output.storyBible, "utf-8"));
+      writes.push(() => writeFile(join(storyDir, "volume_outline.md"), output.volumeOutline, "utf-8"));
+      writes.push(() => writeFile(join(storyDir, "book_rules.md"), output.bookRules, "utf-8"));
+      writes.push(() => writeFile(
         join(storyDir, "character_matrix.md"),
         language === "en"
           ? "# Character Matrix\n\n<!-- One ## section per character. Add new characters as new ## blocks. -->\n"
@@ -949,9 +949,9 @@ You MUST emit all **5 SECTION blocks in order**: story_frame → volume_map → 
           : (language === "en"
               ? "# Current State\n\n> Seeded at book creation. Runtime state is appended by the consolidator after each chapter.\n"
               : "# 当前状态\n\n> 建书时占位。运行时每章之后由 consolidator 追加最新状态。\n");
-        writes.push(writeFile(join(storyDir, "current_state.md"), currentStateSeed, "utf-8"));
-        writes.push(writeFile(join(storyDir, "pending_hooks.md"), output.pendingHooks, "utf-8"));
-        writes.push(writeFile(
+        writes.push(() => writeFile(join(storyDir, "current_state.md"), currentStateSeed, "utf-8"));
+        writes.push(() => writeFile(join(storyDir, "pending_hooks.md"), output.pendingHooks, "utf-8"));
+        writes.push(() => writeFile(
           join(storyDir, "emotional_arcs.md"),
           language === "en"
             ? "# Emotional Arcs\n\n| Character | Chapter | Emotional State | Trigger Event | Intensity (1-10) | Arc Direction |\n| --- | --- | --- | --- | --- | --- |\n"
@@ -960,15 +960,15 @@ You MUST emit all **5 SECTION blocks in order**: story_frame → volume_map → 
         ));
       }
 
-      await Promise.all(writes);
+      for (const write of writes) await write();
       return;
     }
 
     const storyFrame = storyFrameBody.trim();
 
     // Phase 5 primary prose files
-    writes.push(writeFile(join(outlineDir, "story_frame.md"), storyFrame, "utf-8"));
-    writes.push(writeFile(join(outlineDir, "volume_map.md"), volumeMap, "utf-8"));
+    writes.push(() => writeFile(join(outlineDir, "story_frame.md"), storyFrame, "utf-8"));
+    writes.push(() => writeFile(join(outlineDir, "volume_map.md"), volumeMap, "utf-8"));
     // Phase 5 consolidation: rhythm principles live inside the last paragraph
     // of volume_map. A separate 节奏原则.md / rhythm_principles.md file is only
     // written when the architect happened to produce a standalone block (legacy
@@ -978,7 +978,7 @@ You MUST emit all **5 SECTION blocks in order**: story_frame → volume_map → 
     // content already pull it from volume_map's closing paragraph.
     if (rhythmPrinciples.trim()) {
       const rhythmFileName = language === "en" ? "rhythm_principles.md" : "节奏原则.md";
-      writes.push(writeFile(join(outlineDir, rhythmFileName), rhythmPrinciples, "utf-8"));
+      writes.push(() => writeFile(join(outlineDir, rhythmFileName), rhythmPrinciples, "utf-8"));
     }
 
     // Roles — one file per character
@@ -986,16 +986,16 @@ You MUST emit all **5 SECTION blocks in order**: story_frame → volume_map → 
       const targetDir = role.tier === "major" ? rolesMajorDir : rolesMinorDir;
       const safeName = role.name.replace(/[/\\:*?"<>|]/g, "_").trim();
       if (!safeName) continue;
-      writes.push(writeFile(join(targetDir, `${safeName}.md`), role.content, "utf-8"));
+      writes.push(() => writeFile(join(targetDir, `${safeName}.md`), role.content, "utf-8"));
     }
 
     // Compat shims — these are pointer files, not authoritative content.
-    writes.push(writeFile(
+    writes.push(() => writeFile(
       join(storyDir, "story_bible.md"),
       this.buildStoryBibleShim(storyFrame, language),
       "utf-8",
     ));
-    writes.push(writeFile(
+    writes.push(() => writeFile(
       join(storyDir, "character_matrix.md"),
       this.buildCharacterMatrixShim(roles, language),
       "utf-8",
@@ -1006,7 +1006,7 @@ You MUST emit all **5 SECTION blocks in order**: story_frame → volume_map → 
     // outline/volume_map.md and falls back to legacy volume_outline.md for
     // books initialized before Phase 5.
 
-    writes.push(writeFile(join(storyDir, "book_rules.md"), output.bookRules.trim() + "\n", "utf-8"));
+    writes.push(() => writeFile(join(storyDir, "book_rules.md"), output.bookRules.trim() + "\n", "utf-8"));
 
     // Runtime state files.
     // Phase 5 consolidation: the architect no longer emits a current_state
@@ -1024,9 +1024,9 @@ You MUST emit all **5 SECTION blocks in order**: story_frame → volume_map → 
         : (language === "en"
             ? "# Current State\n\n> Seeded at book creation. Runtime state is appended by the consolidator after each chapter. Initial per-character state lives in roles/*.Current_State; load-bearing initial world facts live in pending_hooks rows with start_chapter=0.\n"
             : "# 当前状态\n\n> 建书时占位。运行时每章之后由 consolidator 追加最新状态。每个角色的初始状态详见 roles/*.当前现状；承重的初始世界设定见 pending_hooks 里 startChapter=0 的行。\n");
-      writes.push(writeFile(join(storyDir, "current_state.md"), currentStateSeed, "utf-8"));
-      writes.push(writeFile(join(storyDir, "pending_hooks.md"), output.pendingHooks, "utf-8"));
-      writes.push(writeFile(
+      writes.push(() => writeFile(join(storyDir, "current_state.md"), currentStateSeed, "utf-8"));
+      writes.push(() => writeFile(join(storyDir, "pending_hooks.md"), output.pendingHooks, "utf-8"));
+      writes.push(() => writeFile(
         join(storyDir, "emotional_arcs.md"),
         language === "en"
           ? "# Emotional Arcs\n\n| Character | Chapter | Emotional State | Trigger Event | Intensity (1-10) | Arc Direction |\n| --- | --- | --- | --- | --- | --- |\n"
@@ -1044,7 +1044,7 @@ You MUST emit all **5 SECTION blocks in order**: story_frame → volume_map → 
     // them naturally. The `_numericalSystem` parameter is kept for API
     // compatibility with existing callers.
 
-    await Promise.all(writes);
+    for (const write of writes) await write();
   }
 
   /**

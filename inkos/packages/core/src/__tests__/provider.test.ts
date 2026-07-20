@@ -233,6 +233,40 @@ describe("chatCompletion via pi-ai", () => {
     expect(opts.maxTokens).toBe(256);
   });
 
+  it("passes the request AbortSignal to pi-ai stream options", async () => {
+    mockStreamSimple.mockReturnValue(makeTextStream("ok"));
+    const controller = new AbortController();
+
+    await chatCompletion(makeClient(), "test-model", [{ role: "user", content: "hi" }], {
+      signal: controller.signal,
+    });
+
+    const opts = mockStreamSimple.mock.calls[0]?.[2] as Record<string, unknown>;
+    expect(opts.signal).toBe(controller.signal);
+  });
+
+  it("does not retry a transient pi-ai failure after the request is cancelled", async () => {
+    const controller = new AbortController();
+    mockStreamSimple.mockReturnValue({
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            controller.abort(new Error("request cancelled"));
+            throw new Error("terminated: UND_ERR_SOCKET");
+          },
+        };
+      },
+    });
+
+    await expect(chatCompletion(
+      makeClient(),
+      "test-model",
+      [{ role: "user", content: "hi" }],
+      { signal: controller.signal },
+    )).rejects.toThrow("request cancelled");
+    expect(mockStreamSimple).toHaveBeenCalledTimes(1);
+  });
+
   it("drops non-ByteString headers before calling pi-ai", async () => {
     mockStreamSimple.mockReturnValue(makeTextStream("ok"));
 

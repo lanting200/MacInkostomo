@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { PipelineRunner, StateManager, splitChapters } from "@actalk/inkos-core";
+import { PipelineRunner, StateManager, createInkOSRuntime, splitChapters } from "@actalk/inkos-core";
 import { readFile, readdir, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { loadConfig, buildPipelineConfig, findProjectRoot, resolveBookId, log, logError } from "../utils.js";
@@ -126,14 +126,14 @@ importCommand
         }
       }
 
-      const pipeline = new PipelineRunner(buildPipelineConfig(config, root));
-
-      const result = await pipeline.importChapters({
-        bookId,
-        chapters,
-        resumeFrom: opts.resumeFrom,
-        importMode: opts.series ? "series" : "continuation",
-      });
+      const runtime = createInkOSRuntime(buildPipelineConfig(config, root));
+      const result = await runtime.inkos.importChapters({
+          bookId,
+          chapters,
+          resumeFrom: opts.resumeFrom,
+          importMode: opts.series ? "series" : "continuation",
+        })
+        .finally(() => runtime.kernel.shutdown());
 
       if (opts.json) {
         log(JSON.stringify(result, null, 2));

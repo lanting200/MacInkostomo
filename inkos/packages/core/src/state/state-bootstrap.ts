@@ -1,5 +1,6 @@
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { writeAtomicText } from "../utils/runtime-writer.js";
 import {
   ChapterSummariesStateSchema,
   CurrentStateStateSchema,
@@ -161,12 +162,10 @@ export async function rewriteStructuredStateFromMarkdown(params: {
     ]),
   });
 
-  await Promise.all([
-    writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf-8"),
-    writeFile(currentStatePath, JSON.stringify(currentState, null, 2), "utf-8"),
-    writeFile(hooksPath, JSON.stringify(hooksState, null, 2), "utf-8"),
-    writeFile(summariesPath, JSON.stringify(summariesState, null, 2), "utf-8"),
-  ]);
+  await writeAtomicText(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  await writeAtomicText(currentStatePath, `${JSON.stringify(currentState, null, 2)}\n`);
+  await writeAtomicText(hooksPath, `${JSON.stringify(hooksState, null, 2)}\n`);
+  await writeAtomicText(summariesPath, `${JSON.stringify(summariesState, null, 2)}\n`);
 
   return {
     createdFiles: [],

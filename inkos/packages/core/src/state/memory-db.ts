@@ -69,6 +69,7 @@ export interface StoredHook {
 export class MemoryDB {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private db: any;
+  private transactionDepth = 0;
 
   constructor(bookDir: string) {
     // node:sqlite requires Node 22+; require() via createRequire for ESM compat
@@ -112,6 +113,11 @@ export class MemoryDB {
         expected_payoff TEXT NOT NULL DEFAULT '',
         payoff_timing TEXT NOT NULL DEFAULT '',
         notes TEXT NOT NULL DEFAULT ''
+      );
+
+      CREATE TABLE IF NOT EXISTS memory_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
       );
 
       CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject);
@@ -210,14 +216,14 @@ export class MemoryDB {
   }
 
   replaceCurrentFacts(facts: ReadonlyArray<Omit<Fact, "id">>): void {
-    this.db.exec("DELETE FROM facts WHERE valid_until_chapter IS NULL");
-    for (const fact of facts) {
-      this.addFact(fact);
-    }
+    this.transaction(() => {
+      this.db.exec("DELETE FROM facts WHERE valid_until_chapter IS NULL");
+      for (const fact of facts) this.addFact(fact);
+    });
   }
 
   resetFacts(): void {
-    this.db.exec("DELETE FROM facts");
+    this.transaction(() => this.db.exec("DELETE FROM facts"));
   }
 
   // ---------------------------------------------------------------------------
@@ -236,10 +242,10 @@ export class MemoryDB {
   }
 
   replaceSummaries(summaries: ReadonlyArray<StoredSummary>): void {
-    this.db.exec("DELETE FROM chapter_summaries");
-    for (const summary of summaries) {
-      this.upsertSummary(summary);
-    }
+    this.transaction(() => {
+      this.db.exec("DELETE FROM chapter_summaries");
+      for (const summary of summaries) this.upsertSummary(summary);
+    });
   }
 
   /** Get summaries for a range of chapters. */
@@ -287,6 +293,10 @@ export class MemoryDB {
     return row.count;
   }
 
+  deleteSummary(chapter: number): void {
+    this.db.prepare("DELETE FROM chapter_summaries WHERE chapter = ?").run(chapter);
+  }
+
   /** Get the most recent N summaries. */
   getRecentSummaries(count: number): ReadonlyArray<StoredSummary> {
     return this.db.prepare(
@@ -326,10 +336,10 @@ export class MemoryDB {
   }
 
   replaceHooks(hooks: ReadonlyArray<StoredHook>): void {
-    this.db.exec("DELETE FROM hooks");
-    for (const hook of hooks) {
-      this.upsertHook(hook);
-    }
+    this.transaction(() => {
+      this.db.exec("DELETE FROM hooks");
+      for (const hook of hooks) this.upsertHook(hook);
+    });
   }
 
   getActiveHooks(): ReadonlyArray<StoredHook> {
@@ -352,6 +362,51 @@ export class MemoryDB {
   // ---------------------------------------------------------------------------
   // Lifecycle
   // ---------------------------------------------------------------------------
+
+  getMetadata(key: string): string | undefined {
+    const row = this.db.prepare("SELECT value FROM memory_meta WHERE key = ?").get(key) as
+      | { value: string }
+      | undefined;
+    return row?.value;
+  }
+
+  setMetadata(key: string, value: string): void {
+    this.db.prepare(
+      "INSERT OR REPLACE INTO memory_meta (key, value) VALUES (?, ?)",
+    ).run(key, value);
+  }
+
+  transaction<TResult>(operation: () => TResult): TResult {
+    if (this.transactionDepth > 0) return operation();
+    this.db.exec("BEGIN IMMEDIATE");
+    this.transactionDepth += 1;
+    try {
+      const result = operation();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    } finally {
+      this.transactionDepth -= 1;
+    }
+  }
+
+  async transactionAsync<TResult>(operation: () => Promise<TResult>): Promise<TResult> {
+    if (this.transactionDepth > 0) return operation();
+    this.db.exec("BEGIN IMMEDIATE");
+    this.transactionDepth += 1;
+    try {
+      const result = await operation();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    } finally {
+      this.transactionDepth -= 1;
+    }
+  }
 
   close(): void {
     this.db.close();

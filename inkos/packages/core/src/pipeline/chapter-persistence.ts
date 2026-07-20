@@ -1,6 +1,7 @@
 import type { AuditIssue, AuditResult } from "../agents/continuity.js";
 import type { ChapterMeta } from "../models/chapter.js";
 import type { LengthTelemetry } from "../models/length-governance.js";
+import { withChapterCommitTransaction } from "../state/chapter-commit-transaction.js";
 import { buildStateDegradedReviewNote } from "./chapter-state-recovery.js";
 
 export interface ChapterPersistenceUsage {
@@ -10,6 +11,15 @@ export interface ChapterPersistenceUsage {
 }
 
 export type ChapterPersistenceStatus = "ready-for-review" | "audit-failed" | "state-degraded";
+
+/** Runs all durable chapter artifacts inside the book-scoped rollback journal. */
+export function persistChapterTransaction<TResult>(params: {
+  readonly bookDir: string;
+  readonly chapterNumber: number;
+  readonly commit: () => Promise<TResult>;
+}): Promise<TResult> {
+  return withChapterCommitTransaction(params.bookDir, params.chapterNumber, params.commit);
+}
 
 export async function persistChapterArtifacts(params: {
   readonly chapterNumber: number;

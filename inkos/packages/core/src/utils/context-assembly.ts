@@ -125,6 +125,10 @@ export function buildGovernedTrace(params: {
 
 export function isProtectedContextSource(source: string): boolean {
   return source === "runtime/chapter_memo"
+    || source === "long-form-plan.json"
+    || source.startsWith("long-form-plan.json#")
+    || source === "long_form_plan.json"
+    || source.startsWith("long_form_plan.json#")
     || source === "story/current_focus.md"
     || source === "story/author_intent.md"
     || source === "story/audit_drift.md"

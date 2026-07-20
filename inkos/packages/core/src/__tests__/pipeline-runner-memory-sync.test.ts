@@ -63,6 +63,7 @@ interface FakeStore {
     notes: string;
   }>;
   nextFactId: number;
+  metadata: Map<string, string>;
 }
 
 class FakeMemoryDB {
@@ -82,6 +83,7 @@ class FakeMemoryDB {
       summaries: [],
       hooks: [],
       nextFactId: 1,
+      metadata: new Map(),
     };
     FakeMemoryDB.stores.set(bookDir, created);
     this.store = created;
@@ -89,8 +91,27 @@ class FakeMemoryDB {
 
   close(): void {}
 
+  transaction<TResult>(operation: () => TResult): TResult {
+    return operation();
+  }
+
+  transactionAsync<TResult>(operation: () => Promise<TResult>): Promise<TResult> {
+    return operation();
+  }
+
   replaceSummaries(summaries: FakeStore["summaries"]): void {
     this.store.summaries = summaries.map((summary) => ({ ...summary }));
+  }
+
+  upsertSummary(summary: FakeStore["summaries"][number]): void {
+    this.store.summaries = [
+      ...this.store.summaries.filter((value) => value.chapter !== summary.chapter),
+      { ...summary },
+    ];
+  }
+
+  deleteSummary(chapter: number): void {
+    this.store.summaries = this.store.summaries.filter((value) => value.chapter !== chapter);
   }
 
   replaceHooks(hooks: FakeStore["hooks"]): void {
@@ -116,6 +137,18 @@ class FakeMemoryDB {
         validUntilChapter: untilChapter,
       };
     }
+  }
+
+  getCurrentFacts(): FakeStore["facts"] {
+    return this.store.facts.filter((fact) => fact.validUntilChapter === null);
+  }
+
+  getMetadata(key: string): string | undefined {
+    return this.store.metadata.get(key);
+  }
+
+  setMetadata(key: string, value: string): void {
+    this.store.metadata.set(key, value);
   }
 }
 
