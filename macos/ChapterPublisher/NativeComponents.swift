@@ -4,6 +4,7 @@ enum NativeLayout {
   static let cornerRadius: CGFloat = 8
   static let compactSpacing: CGFloat = 8
   static let panelSpacing: CGFloat = 12
+  static let workspaceFooterHeight: CGFloat = 54
 }
 
 struct AdaptiveGlassSurface<Content: View>: View {

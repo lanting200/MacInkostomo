@@ -111,7 +111,9 @@ struct ReviewWorkspaceView: View {
           deletingBook = selectedBook
         }
       }
-      .padding(10)
+      .padding(.horizontal, 14)
+      .frame(height: NativeLayout.workspaceFooterHeight)
+      .background(.bar)
     }
     .background(Color(nsColor: .controlBackgroundColor).opacity(0.38))
   }
@@ -192,8 +194,9 @@ struct ReviewWorkspaceView: View {
         }
         Spacer(minLength: 4)
       }
-      .padding(.horizontal, 11)
-      .frame(height: 42)
+      .padding(.horizontal, 14)
+      .frame(height: NativeLayout.workspaceFooterHeight)
+      .background(.bar)
     }
     .background(Color(nsColor: .controlBackgroundColor).opacity(0.22))
   }
@@ -466,7 +469,7 @@ private struct ChapterReviewDetail: View {
       }
       .controlSize(.regular)
       .padding(.horizontal, 14)
-      .frame(height: 54)
+      .frame(height: NativeLayout.workspaceFooterHeight)
       .background(.bar)
     }
     .background(Color(nsColor: .textBackgroundColor))
