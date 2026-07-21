@@ -55,11 +55,12 @@ struct ReviewWorkspaceView: View {
         }
       }
       .padding(.horizontal, 12)
-      .frame(height: 52)
+      .frame(height: NativeLayout.workspaceHeaderHeight)
 
       NativeSearchField(prompt: "搜索作品", text: $bookSearch)
         .padding(.horizontal, 10)
         .padding(.bottom, 8)
+        .frame(height: NativeLayout.workspaceUtilityHeight, alignment: .top)
 
       Divider()
 
@@ -133,11 +134,12 @@ struct ReviewWorkspaceView: View {
         }
       }
       .padding(.horizontal, 12)
-      .frame(height: 52)
+      .frame(height: NativeLayout.workspaceHeaderHeight)
 
       NativeSearchField(prompt: "搜索章节", text: $chapterSearch)
         .padding(.horizontal, 10)
         .padding(.bottom, 8)
+        .frame(height: NativeLayout.workspaceUtilityHeight, alignment: .top)
 
       Divider()
 
@@ -212,21 +214,27 @@ struct ReviewWorkspaceView: View {
         generate: { showingGenerate = true }
       )
     } else if model.isLoading, model.currentChapterNumber != nil {
-      VStack(spacing: 12) {
-        ProgressView()
-        Text("正在加载章节")
-          .font(.callout)
-          .foregroundStyle(.secondary)
+      ReviewDetailPlaceholder(title: "章节审核", detail: "正在加载章节") {
+        VStack(spacing: 12) {
+          ProgressView()
+          Text("正在加载章节")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+        }
       }
-      .frame(maxWidth: .infinity, maxHeight: .infinity)
     } else {
-      NativeEmptyState(
-        title: model.currentBookID == nil ? "作品审核工作台" : "选择章节开始审核",
-        detail: model.currentBookID == nil
-          ? "左侧管理作品，中间浏览章节，右侧完成正文终审。"
-          : "章节正文、初审结论与人工操作会显示在这里。",
-        systemImage: "checkmark.seal"
-      )
+      ReviewDetailPlaceholder(
+        title: model.currentBookID == nil ? "作品审核工作台" : "章节审核",
+        detail: model.currentBookID == nil ? "等待选择作品" : "等待选择章节"
+      ) {
+        NativeEmptyState(
+          title: model.currentBookID == nil ? "作品审核工作台" : "选择章节开始审核",
+          detail: model.currentBookID == nil
+            ? "左侧管理作品，中间浏览章节，右侧完成正文终审。"
+            : "章节正文、初审结论与人工操作会显示在这里。",
+          systemImage: "checkmark.seal"
+        )
+      }
     }
   }
 
@@ -385,31 +393,7 @@ private struct ChapterReviewDetail: View {
 
   var body: some View {
     VStack(spacing: 0) {
-      HStack(alignment: .center, spacing: 12) {
-        VStack(alignment: .leading, spacing: 3) {
-          Text("第\(chapter.number)章 \(chapter.title)")
-            .font(.title3.weight(.semibold))
-            .lineLimit(2)
-          HStack(spacing: 8) {
-            Text("\(chapter.wordCount) 字")
-              .monospacedDigit()
-            if let volume = chapter.volume {
-              Text("卷 \(volume)")
-            }
-            if !chapter.revisionHistory.isEmpty {
-              Text("修改 \(chapter.revisionHistory.count) 次")
-            }
-          }
-          .font(.caption)
-          .foregroundStyle(.secondary)
-        }
-        Spacer(minLength: 10)
-        ChapterStatusBadge(status: chapter.status)
-      }
-      .padding(.horizontal, 18)
-      .frame(minHeight: 62)
-
-      Divider()
+      ChapterReviewHeader(chapter: chapter)
 
       if hasReviewMetadata {
         ScrollView {
@@ -483,24 +467,220 @@ private struct ChapterReviewDetail: View {
   }
 }
 
+private struct ReviewDetailPlaceholder<Content: View>: View {
+  let title: String
+  let detail: String
+  private let content: Content
+
+  init(
+    title: String,
+    detail: String,
+    @ViewBuilder content: () -> Content
+  ) {
+    self.title = title
+    self.detail = detail
+    self.content = content()
+  }
+
+  var body: some View {
+    VStack(spacing: 0) {
+      HStack(spacing: 10) {
+        Text(title)
+          .font(.headline)
+          .lineLimit(1)
+        Spacer(minLength: 8)
+      }
+      .padding(.horizontal, 14)
+      .frame(height: NativeLayout.workspaceHeaderHeight)
+
+      HStack(spacing: 7) {
+        Image(systemName: "checkmark.seal")
+          .foregroundStyle(.secondary)
+          .accessibilityHidden(true)
+        Text(detail)
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .lineLimit(1)
+        Spacer(minLength: 8)
+      }
+      .padding(.horizontal, 14)
+      .frame(height: NativeLayout.workspaceUtilityHeight)
+
+      Divider()
+
+      content
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+      Divider()
+
+      Color.clear
+        .frame(height: NativeLayout.workspaceFooterHeight)
+        .background(.bar)
+    }
+    .background(Color(nsColor: .textBackgroundColor))
+  }
+}
+
+private struct ChapterReviewHeader: View {
+  let chapter: ChapterDetail
+
+  var body: some View {
+    VStack(spacing: 0) {
+      HStack(spacing: 10) {
+        Text("第\(chapter.number)章 \(chapter.title)")
+          .font(.headline)
+          .lineLimit(1)
+          .truncationMode(.tail)
+          .help("第\(chapter.number)章 \(chapter.title)")
+        Spacer(minLength: 8)
+        ChapterStatusBadge(status: chapter.status)
+      }
+      .padding(.horizontal, 14)
+      .frame(height: NativeLayout.workspaceHeaderHeight)
+
+      HStack(spacing: 7) {
+        Label("章节正文", systemImage: "doc.text")
+          .font(.caption.weight(.medium))
+          .foregroundStyle(.secondary)
+        Text(chapterMetadata)
+          .font(.caption.monospacedDigit())
+          .foregroundStyle(.secondary)
+          .lineLimit(1)
+        Spacer(minLength: 8)
+        SystemReviewBadge(review: chapter.llmReview, chapterStatus: chapter.status)
+      }
+      .padding(.horizontal, 14)
+      .frame(height: NativeLayout.workspaceUtilityHeight)
+
+      Divider()
+    }
+  }
+
+  private var chapterMetadata: String {
+    var values = ["\(chapter.wordCount) 字"]
+    if let volume = chapter.volume {
+      values.append("卷 \(volume)")
+    }
+    if !chapter.revisionHistory.isEmpty {
+      values.append("修改 \(chapter.revisionHistory.count) 次")
+    }
+    return values.joined(separator: " · ")
+  }
+}
+
+private struct SystemReviewBadge: View {
+  let review: LLMReview?
+  let chapterStatus: String
+
+  var body: some View {
+    let visual = SystemReviewVisual(review: review, chapterStatus: chapterStatus)
+    HStack(spacing: 4) {
+      Image(systemName: visual.systemImage)
+        .accessibilityHidden(true)
+      Text("初审 \(visual.label)")
+        .lineLimit(1)
+    }
+    .font(.caption.weight(.medium))
+    .foregroundStyle(visual.color)
+    .padding(.horizontal, 7)
+    .frame(height: 22)
+    .background(visual.color.opacity(0.12), in: Capsule())
+    .help(visual.help)
+    .accessibilityElement(children: .combine)
+    .accessibilityLabel(visual.help)
+  }
+}
+
+private struct SystemReviewVisual {
+  let label: String
+  let help: String
+  let systemImage: String
+  let color: Color
+
+  init(review: LLMReview?, chapterStatus: String? = nil) {
+    guard let review else {
+      if let chapterStatus, ["approved", "published"].contains(chapterStatus) {
+        label = "历史章节"
+        help = "本章已完成审核，旧版系统初审记录未存档"
+        systemImage = "archivebox"
+      } else {
+        label = "未记录"
+        help = "系统 LLM 初审记录缺失，需要先完成初审后再人工通过"
+        systemImage = "questionmark.circle"
+      }
+      color = .secondary
+      return
+    }
+
+    switch review.status {
+    case "inkos_writing":
+      label = "生成中"
+      help = "InkOS 正在生成并自审章节"
+      systemImage = "clock.arrow.circlepath"
+      color = .blue
+    case "inkos_revising":
+      label = "修改中"
+      help = "InkOS 正在根据修改意见修订章节"
+      systemImage = "clock.arrow.circlepath"
+      color = .blue
+    case "inkos_failed":
+      label = "InkOS 未过"
+      help = "InkOS 自审未通过，需先修改章节"
+      systemImage = "exclamationmark.triangle.fill"
+      color = .orange
+    case "reviewing":
+      label = "审核中"
+      help = "系统 LLM 正在初审章节"
+      systemImage = "clock.arrow.circlepath"
+      color = .blue
+    case "fixing":
+      label = "自动修改中"
+      help = "系统正根据初审意见自动修改章节"
+      systemImage = "arrow.triangle.2.circlepath"
+      color = .blue
+    case "passed":
+      label = "通过"
+      help = "系统 LLM 初审已通过，可进行人工终审"
+      systemImage = "checkmark.seal.fill"
+      color = .green
+    case "failed":
+      label = "未通过"
+      help = "系统 LLM 初审未通过，需先修改章节"
+      systemImage = "exclamationmark.triangle.fill"
+      color = .orange
+    case "error":
+      label = "异常"
+      help = "系统 LLM 初审异常，需先重新修改或检查任务日志"
+      systemImage = "xmark.octagon.fill"
+      color = .red
+    default:
+      label = review.status
+      help = "系统 LLM 初审状态：\(review.status)"
+      systemImage = "questionmark.circle"
+      color = .secondary
+    }
+  }
+}
+
 private struct ReviewStatusPanel: View {
   let review: LLMReview
 
   var body: some View {
+    let visual = SystemReviewVisual(review: review)
     AdaptiveGlassSurface(padding: 12, tint: reviewColor.opacity(0.08)) {
       VStack(alignment: .leading, spacing: 9) {
         HStack(spacing: 8) {
-          Image(systemName: reviewSystemImage)
-            .foregroundStyle(reviewColor)
+          Image(systemName: visual.systemImage)
+            .foregroundStyle(visual.color)
             .accessibilityHidden(true)
           Text("初审状态")
             .font(.headline)
-          Text(reviewLabel)
+          Text(visual.label)
             .font(.caption.weight(.semibold))
-            .foregroundStyle(reviewColor)
+            .foregroundStyle(visual.color)
             .padding(.horizontal, 7)
             .frame(height: 22)
-            .background(reviewColor.opacity(0.12), in: Capsule())
+            .background(visual.color.opacity(0.12), in: Capsule())
           Spacer(minLength: 8)
           if let model = review.model, !model.isEmpty {
             Text(model)
@@ -533,7 +713,7 @@ private struct ReviewStatusPanel: View {
               HStack(alignment: .top, spacing: 7) {
                 Text("\(index + 1).")
                   .font(.caption.monospacedDigit())
-                  .foregroundStyle(reviewColor)
+                  .foregroundStyle(visual.color)
                 Text(cleanIssue(issue))
                   .font(.callout)
                   .fixedSize(horizontal: false, vertical: true)
@@ -557,34 +737,11 @@ private struct ReviewStatusPanel: View {
     .accessibilityElement(children: .contain)
   }
 
-  private var reviewLabel: String {
-    switch review.status {
-    case "inkos_writing": "生成中"
-    case "inkos_revising": "修改中"
-    case "inkos_failed": "基础校验未过"
-    case "reviewing": "审核中"
-    case "fixing": "自动修改中"
-    case "passed": "通过"
-    case "failed": "未通过"
-    case "error": "异常"
-    default: review.status
-    }
-  }
-
   private var reviewColor: Color {
     if review.isPassed { return .green }
     if review.isBusy { return .blue }
     if review.status == "failed" || review.status == "inkos_failed" { return .orange }
     return .red
-  }
-
-  private var reviewSystemImage: String {
-    if review.isPassed { return "checkmark.seal.fill" }
-    if review.isBusy { return "clock.arrow.circlepath" }
-    if review.status == "failed" || review.status == "inkos_failed" {
-      return "exclamationmark.triangle.fill"
-    }
-    return "xmark.octagon.fill"
   }
 
   private func cleanIssue(_ issue: String) -> String {

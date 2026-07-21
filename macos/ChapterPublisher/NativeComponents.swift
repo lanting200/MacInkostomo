@@ -4,6 +4,8 @@ enum NativeLayout {
   static let cornerRadius: CGFloat = 8
   static let compactSpacing: CGFloat = 8
   static let panelSpacing: CGFloat = 12
+  static let workspaceHeaderHeight: CGFloat = 52
+  static let workspaceUtilityHeight: CGFloat = 38
   static let workspaceFooterHeight: CGFloat = 54
 }
 

@@ -111,6 +111,13 @@ private enum LongFormContinuitySection: String, CaseIterable, Identifiable {
   }
 }
 
+private enum LongFormPlanMode: String, CaseIterable, Identifiable {
+  case budget = "结构预算"
+  case continuity = "连续性"
+
+  var id: String { rawValue }
+}
+
 private struct LongFormContinuityDraft: Equatable, Sendable {
   var immutableCanon: String
   var worldRules: String
@@ -276,6 +283,7 @@ struct SettingsWorkspaceView: View {
 
   @State private var tab: SettingsTab = .book
   @State private var bookSettingsMode: BookSettingsMode = .plan
+  @State private var planEditorMode: LongFormPlanMode = .budget
   @State private var editorDraft = ""
   @State private var editorBookID: String?
   @State private var editorPath: String?
@@ -423,7 +431,21 @@ struct SettingsWorkspaceView: View {
           }
         }
         .pickerStyle(.segmented)
-        .frame(width: 260)
+        .labelsHidden()
+        .accessibilityLabel("书籍设定视图")
+        .frame(width: 230)
+
+        if bookSettingsMode == .plan {
+          Picker("长篇计划内容", selection: $planEditorMode) {
+            ForEach(LongFormPlanMode.allCases) { mode in
+              Text(mode.rawValue).tag(mode)
+            }
+          }
+          .pickerStyle(.segmented)
+          .labelsHidden()
+          .accessibilityLabel("长篇计划内容")
+          .frame(width: 210)
+        }
 
         Spacer()
 
@@ -434,7 +456,7 @@ struct SettingsWorkspaceView: View {
         }
       }
       .padding(.horizontal, 14)
-      .frame(height: 46)
+      .frame(height: NativeLayout.workspaceUtilityHeight)
 
       Divider()
 
@@ -548,6 +570,7 @@ struct SettingsWorkspaceView: View {
         draft: $planDraft,
         specialConstraintsText: $planSpecialConstraints,
         continuityDraft: $continuityDraft,
+        mode: planEditorMode,
         budgetValidationMessage: longFormPlanValidationMessage,
         continuityValidationMessage: continuityValidationMessage,
         isContinuityValidationPending: isContinuityValidationPending,
@@ -1179,18 +1202,12 @@ struct SettingsWorkspaceView: View {
 }
 
 private struct LongFormPlanEditor: View {
-  private enum Mode: String, CaseIterable, Identifiable {
-    case budget = "结构预算"
-    case continuity = "连续性"
-
-    var id: String { rawValue }
-  }
-
   let response: LongFormPlanResponse
   let chapters: [ChapterSummary]
   @Binding var draft: LongFormConstraints
   @Binding var specialConstraintsText: String
   @Binding var continuityDraft: LongFormContinuityDraft
+  let mode: LongFormPlanMode
   let budgetValidationMessage: String?
   let continuityValidationMessage: String?
   let isContinuityValidationPending: Bool
@@ -1202,35 +1219,8 @@ private struct LongFormPlanEditor: View {
   let discardBudget: () -> Void
   let discardContinuity: () -> Void
 
-  @State private var mode: Mode = .budget
-
   var body: some View {
-    VStack(spacing: 0) {
-      HStack(spacing: 12) {
-        Picker("长篇计划内容", selection: $mode) {
-          ForEach(Mode.allCases) { item in
-            Text(item.rawValue).tag(item)
-          }
-        }
-        .pickerStyle(.segmented)
-        .frame(width: 260)
-
-        Spacer()
-
-        if mode == .budget, isBudgetDirty {
-          Label("结构预算未保存", systemImage: "circle.fill")
-            .foregroundStyle(.orange)
-        } else if mode == .continuity, isContinuityDirty {
-          Label("连续性未保存", systemImage: "circle.fill")
-            .foregroundStyle(.orange)
-        }
-      }
-      .font(.caption)
-      .padding(.horizontal, 12)
-      .frame(height: 42)
-
-      Divider()
-
+    Group {
       switch mode {
       case .budget:
         HSplitView {
@@ -1357,7 +1347,9 @@ private struct LongFormPlanEditor: View {
         .disabled(!isBudgetDirty || budgetValidationMessage != nil || isSaving)
         .keyboardShortcut("s", modifiers: .command)
       }
-      .padding(12)
+      .padding(.horizontal, 14)
+      .frame(height: NativeLayout.workspaceFooterHeight)
+      .background(.bar)
     }
   }
 
@@ -1405,6 +1397,12 @@ private struct LongFormPlanEditor: View {
         .frame(maxWidth: 980, alignment: .leading)
         .frame(maxWidth: .infinity)
       }
+
+      Divider()
+
+      Color.clear
+        .frame(height: NativeLayout.workspaceFooterHeight)
+        .background(.bar)
     }
   }
 
@@ -1595,6 +1593,21 @@ private struct LongFormContinuityEditor: View {
         }
       }
       .listStyle(.sidebar)
+
+      Divider()
+
+      HStack(spacing: 7) {
+        Text("连续性分组")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+        Spacer(minLength: 8)
+        Text("\(LongFormContinuitySection.allCases.count) 项")
+          .font(.caption.monospacedDigit())
+          .foregroundStyle(.secondary)
+      }
+      .padding(.horizontal, 14)
+      .frame(height: NativeLayout.workspaceFooterHeight)
+      .background(.bar)
     }
   }
 
@@ -1677,7 +1690,9 @@ private struct LongFormContinuityEditor: View {
         .disabled(!isDirty || validationMessage != nil || isValidationPending || isSaving)
         .keyboardShortcut("s", modifiers: .command)
       }
-      .padding(12)
+      .padding(.horizontal, 14)
+      .frame(height: NativeLayout.workspaceFooterHeight)
+      .background(.bar)
     }
   }
 
