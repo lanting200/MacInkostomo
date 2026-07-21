@@ -408,36 +408,35 @@ private struct ChapterReviewDetail: View {
 
       Divider()
 
-      ScrollView {
-        LazyVStack(alignment: .leading, spacing: 14) {
-          if let review = chapter.llmReview {
-            ReviewStatusPanel(review: review)
-          }
+      if hasReviewMetadata {
+        ScrollView {
+          LazyVStack(alignment: .leading, spacing: 14) {
+            if let review = chapter.llmReview {
+              ReviewStatusPanel(review: review)
+            }
 
-          if !chapter.auditIssues.isEmpty || !chapter.lengthWarnings.isEmpty {
-            ChapterWarningsPanel(
-              auditIssues: chapter.auditIssues,
-              lengthWarnings: chapter.lengthWarnings
-            )
-          }
+            if !chapter.auditIssues.isEmpty || !chapter.lengthWarnings.isEmpty {
+              ChapterWarningsPanel(
+                auditIssues: chapter.auditIssues,
+                lengthWarnings: chapter.lengthWarnings
+              )
+            }
 
-          Text(chapter.content.isEmpty ? "本章暂时没有正文。" : chapter.content)
-            .font(.system(size: 15, design: .serif))
-            .lineSpacing(6)
-            .foregroundStyle(chapter.content.isEmpty ? .secondary : .primary)
-            .textSelection(.enabled)
-            .frame(maxWidth: 760, alignment: .leading)
-            .padding(.horizontal, 4)
-            .accessibilityLabel("章节正文")
-
-          if !chapter.revisionHistory.isEmpty {
-            RevisionHistoryView(records: chapter.revisionHistory)
+            if !chapter.revisionHistory.isEmpty {
+              RevisionHistoryView(records: chapter.revisionHistory)
+            }
           }
+          .frame(maxWidth: 800, alignment: .leading)
+          .padding(18)
+          .frame(maxWidth: .infinity, alignment: .top)
         }
-        .frame(maxWidth: 800, alignment: .leading)
-        .padding(18)
-        .frame(maxWidth: .infinity, alignment: .top)
+        .frame(maxHeight: 240)
+
+        Divider()
       }
+
+      NativeChapterTextReader(content: chapter.content)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
 
       Divider()
 
@@ -471,6 +470,13 @@ private struct ChapterReviewDetail: View {
       .background(.bar)
     }
     .background(Color(nsColor: .textBackgroundColor))
+  }
+
+  private var hasReviewMetadata: Bool {
+    chapter.llmReview != nil
+      || !chapter.auditIssues.isEmpty
+      || !chapter.lengthWarnings.isEmpty
+      || !chapter.revisionHistory.isEmpty
   }
 }
 

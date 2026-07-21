@@ -390,3 +390,71 @@ struct NativeSearchField: View {
       .quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
   }
 }
+
+/// A TextKit reader keeps glyph layout incremental while the split view resizes.
+/// SwiftUI's selectable Text eagerly redraws a complete long chapter on every width change.
+struct NativeChapterTextReader: NSViewRepresentable {
+  let content: String
+
+  func makeCoordinator() -> Coordinator {
+    Coordinator()
+  }
+
+  func makeNSView(context: Context) -> NSScrollView {
+    let scrollView = NSScrollView()
+    scrollView.hasVerticalScroller = true
+    scrollView.autohidesScrollers = true
+    scrollView.borderType = .noBorder
+    scrollView.drawsBackground = true
+    scrollView.backgroundColor = .textBackgroundColor
+    scrollView.setAccessibilityLabel("章节正文")
+
+    let textView = NSTextView(frame: .zero)
+    textView.isEditable = false
+    textView.isSelectable = true
+    textView.isRichText = false
+    textView.importsGraphics = false
+    textView.usesFindBar = true
+    textView.allowsUndo = false
+    textView.drawsBackground = false
+    textView.textContainerInset = NSSize(width: 22, height: 18)
+    textView.textContainer?.lineFragmentPadding = 0
+    textView.isHorizontallyResizable = false
+    textView.isVerticallyResizable = true
+    textView.minSize = .zero
+    textView.maxSize = NSSize(
+      width: CGFloat.greatestFiniteMagnitude,
+      height: CGFloat.greatestFiniteMagnitude
+    )
+    textView.autoresizingMask = [.width]
+    textView.textContainer?.widthTracksTextView = true
+    textView.textContainer?.heightTracksTextView = false
+    textView.layoutManager?.allowsNonContiguousLayout = true
+    scrollView.documentView = textView
+
+    configure(textView, for: content, coordinator: context.coordinator)
+    return scrollView
+  }
+
+  func updateNSView(_ scrollView: NSScrollView, context: Context) {
+    guard let textView = scrollView.documentView as? NSTextView else { return }
+    configure(textView, for: content, coordinator: context.coordinator)
+  }
+
+  private func configure(_ textView: NSTextView, for content: String, coordinator: Coordinator) {
+    let displayedContent = content.isEmpty ? "本章暂时没有正文。" : content
+    guard coordinator.content != content else { return }
+
+    let paragraphStyle = NSMutableParagraphStyle()
+    paragraphStyle.lineSpacing = 6
+    textView.defaultParagraphStyle = paragraphStyle
+    textView.font = NSFont(name: "Songti SC", size: 15) ?? .systemFont(ofSize: 15)
+    textView.textColor = content.isEmpty ? .secondaryLabelColor : .labelColor
+    textView.string = displayedContent
+    coordinator.content = content
+  }
+
+  final class Coordinator {
+    var content: String?
+  }
+}
