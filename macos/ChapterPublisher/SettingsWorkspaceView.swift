@@ -1745,7 +1745,7 @@ private struct LongFormContinuityEditor: View {
     detail: String,
     keyPath: WritableKeyPath<LongFormContinuityPolicy, Bool>
   ) -> some View {
-    Toggle(isOn: policyBinding(keyPath)) {
+    HStack(alignment: .center, spacing: 20) {
       VStack(alignment: .leading, spacing: 3) {
         Text(title)
           .font(.callout.weight(.medium))
@@ -1753,8 +1753,14 @@ private struct LongFormContinuityEditor: View {
           .font(.caption)
           .foregroundStyle(.secondary)
       }
+      Spacer(minLength: 16)
+      Toggle("", isOn: policyBinding(keyPath))
+        .labelsHidden()
+        .toggleStyle(.switch)
+        .accessibilityLabel(title)
+        .frame(width: 52, alignment: .trailing)
     }
-    .toggleStyle(.switch)
+    .frame(maxWidth: .infinity, alignment: .leading)
     .padding(.vertical, 14)
   }
 
