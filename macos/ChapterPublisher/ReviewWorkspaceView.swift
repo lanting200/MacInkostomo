@@ -395,33 +395,6 @@ private struct ChapterReviewDetail: View {
     VStack(spacing: 0) {
       ChapterReviewHeader(chapter: chapter)
 
-      if hasReviewMetadata {
-        ScrollView {
-          LazyVStack(alignment: .leading, spacing: 14) {
-            if let review = chapter.llmReview {
-              ReviewStatusPanel(review: review)
-            }
-
-            if !chapter.auditIssues.isEmpty || !chapter.lengthWarnings.isEmpty {
-              ChapterWarningsPanel(
-                auditIssues: chapter.auditIssues,
-                lengthWarnings: chapter.lengthWarnings
-              )
-            }
-
-            if !chapter.revisionHistory.isEmpty {
-              RevisionHistoryView(records: chapter.revisionHistory)
-            }
-          }
-          .frame(maxWidth: 800, alignment: .leading)
-          .padding(18)
-          .frame(maxWidth: .infinity, alignment: .top)
-        }
-        .frame(maxHeight: 240)
-
-        Divider()
-      }
-
       NativeChapterTextReader(content: chapter.content)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -457,13 +430,6 @@ private struct ChapterReviewDetail: View {
       .background(.bar)
     }
     .background(Color(nsColor: .textBackgroundColor))
-  }
-
-  private var hasReviewMetadata: Bool {
-    chapter.llmReview != nil
-      || !chapter.auditIssues.isEmpty
-      || !chapter.lengthWarnings.isEmpty
-      || !chapter.revisionHistory.isEmpty
   }
 }
 
@@ -523,6 +489,9 @@ private struct ReviewDetailPlaceholder<Content: View>: View {
 
 private struct ChapterReviewHeader: View {
   let chapter: ChapterDetail
+  @State private var showingReviewDetails = false
+  @State private var showingRevisionHistory = false
+  @State private var showingInkosWarnings = false
 
   var body: some View {
     VStack(spacing: 0) {
@@ -547,7 +516,42 @@ private struct ChapterReviewHeader: View {
           .foregroundStyle(.secondary)
           .lineLimit(1)
         Spacer(minLength: 8)
-        SystemReviewBadge(review: chapter.llmReview, chapterStatus: chapter.status)
+        if !chapter.revisionHistory.isEmpty {
+          ReviewHeaderIconButton(
+            title: "查看修改记录（\(chapter.revisionHistory.count) 条）",
+            systemImage: "clock.arrow.circlepath",
+            color: .secondary
+          ) {
+            showingRevisionHistory = true
+          }
+          .popover(isPresented: $showingRevisionHistory, arrowEdge: .bottom) {
+            RevisionHistoryPopoverContent(records: chapter.revisionHistory)
+          }
+        }
+        SystemReviewBadge(
+          review: chapter.llmReview,
+          chapterStatus: chapter.status,
+          action: chapter.llmReview == nil ? nil : { showingReviewDetails = true }
+        )
+        .popover(isPresented: $showingReviewDetails, arrowEdge: .bottom) {
+          if let review = chapter.llmReview {
+            ReviewStatusPopoverContent(review: review)
+          } else {
+            EmptyView()
+          }
+        }
+        if hasInkosWarnings {
+          ReviewHeaderIconButton(
+            title: "查看 InkOS 校验提示（\(inkosWarnings.count) 条）",
+            systemImage: "exclamationmark.triangle.fill",
+            color: .orange
+          ) {
+            showingInkosWarnings = true
+          }
+          .popover(isPresented: $showingInkosWarnings, arrowEdge: .bottom) {
+            InkOSWarningsPopoverContent(warnings: inkosWarnings)
+          }
+        }
       }
       .padding(.horizontal, 14)
       .frame(height: NativeLayout.workspaceUtilityHeight)
@@ -566,14 +570,41 @@ private struct ChapterReviewHeader: View {
     }
     return values.joined(separator: " · ")
   }
+
+  private var inkosWarnings: [String] {
+    chapter.auditIssues + chapter.lengthWarnings
+  }
+
+  private var hasInkosWarnings: Bool {
+    !inkosWarnings.isEmpty
+  }
 }
 
 private struct SystemReviewBadge: View {
   let review: LLMReview?
   let chapterStatus: String
+  var action: (() -> Void)?
 
+  @ViewBuilder
   var body: some View {
     let visual = SystemReviewVisual(review: review, chapterStatus: chapterStatus)
+    if let action {
+      Button(action: action) {
+        badgeLabel(visual)
+      }
+      .buttonStyle(.plain)
+      .help(visual.help)
+      .accessibilityElement(children: .combine)
+      .accessibilityLabel(visual.help)
+    } else {
+      badgeLabel(visual)
+        .help(visual.help)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(visual.help)
+    }
+  }
+
+  private func badgeLabel(_ visual: SystemReviewVisual) -> some View {
     HStack(spacing: 4) {
       Image(systemName: visual.systemImage)
         .accessibilityHidden(true)
@@ -585,9 +616,26 @@ private struct SystemReviewBadge: View {
     .padding(.horizontal, 7)
     .frame(height: 22)
     .background(visual.color.opacity(0.12), in: Capsule())
-    .help(visual.help)
-    .accessibilityElement(children: .combine)
-    .accessibilityLabel(visual.help)
+  }
+}
+
+private struct ReviewHeaderIconButton: View {
+  let title: String
+  let systemImage: String
+  let color: Color
+  let action: () -> Void
+
+  var body: some View {
+    Button(action: action) {
+      Image(systemName: systemImage)
+        .symbolRenderingMode(.hierarchical)
+        .foregroundStyle(color)
+        .frame(width: 28, height: 28)
+        .background(color.opacity(0.1), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+    }
+    .buttonStyle(.plain)
+    .help(title)
+    .accessibilityLabel(title)
   }
 }
 
@@ -662,13 +710,13 @@ private struct SystemReviewVisual {
   }
 }
 
-private struct ReviewStatusPanel: View {
+private struct ReviewStatusPopoverContent: View {
   let review: LLMReview
 
   var body: some View {
     let visual = SystemReviewVisual(review: review)
-    AdaptiveGlassSurface(padding: 12, tint: reviewColor.opacity(0.08)) {
-      VStack(alignment: .leading, spacing: 9) {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 12) {
         HStack(spacing: 8) {
           Image(systemName: visual.systemImage)
             .foregroundStyle(visual.color)
@@ -734,14 +782,9 @@ private struct ReviewStatusPanel: View {
         }
       }
     }
+    .padding(16)
+    .frame(width: 460, height: 360, alignment: .topLeading)
     .accessibilityElement(children: .contain)
-  }
-
-  private var reviewColor: Color {
-    if review.isPassed { return .green }
-    if review.isBusy { return .blue }
-    if review.status == "failed" || review.status == "inkos_failed" { return .orange }
-    return .red
   }
 
   private func cleanIssue(_ issue: String) -> String {
@@ -753,62 +796,80 @@ private struct ReviewStatusPanel: View {
   }
 }
 
-private struct ChapterWarningsPanel: View {
-  let auditIssues: [String]
-  let lengthWarnings: [String]
+private struct InkOSWarningsPopoverContent: View {
+  let warnings: [String]
 
   var body: some View {
-    AdaptiveGlassSurface(padding: 12, tint: .orange.opacity(0.08)) {
-      VStack(alignment: .leading, spacing: 8) {
-        Label("InkOS 校验提示", systemImage: "exclamationmark.triangle")
-          .font(.headline)
-          .foregroundStyle(.orange)
-        ForEach(Array((auditIssues + lengthWarnings).enumerated()), id: \.offset) { _, issue in
-          Text("• \(issue)")
-            .font(.callout)
-            .fixedSize(horizontal: false, vertical: true)
-            .textSelection(.enabled)
-        }
-      }
-    }
-  }
-}
+    VStack(alignment: .leading, spacing: 12) {
+      Label("InkOS 校验提示", systemImage: "exclamationmark.triangle.fill")
+        .font(.headline)
+        .foregroundStyle(.orange)
 
-private struct RevisionHistoryView: View {
-  let records: [RevisionRecord]
+      Divider()
 
-  var body: some View {
-    DisclosureGroup("修改记录（\(records.count)）") {
-      VStack(alignment: .leading, spacing: 10) {
-        ForEach(Array(records.enumerated().reversed()), id: \.offset) { _, record in
-          VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 7) {
-              Image(systemName: record.success == false ? "xmark.circle" : "clock.arrow.circlepath")
-                .foregroundStyle(record.success == false ? .red : .secondary)
-                .accessibilityHidden(true)
-              Text(record.time ?? "时间未知")
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
-            }
-            if let note = record.note, !note.isEmpty {
-              Text(note)
+      ScrollView {
+        VStack(alignment: .leading, spacing: 10) {
+          ForEach(Array(warnings.enumerated()), id: \.offset) { index, warning in
+            HStack(alignment: .top, spacing: 8) {
+              Text("\(index + 1).")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.orange)
+              Text(warning)
                 .font(.callout)
-                .textSelection(.enabled)
-            }
-            if let error = record.error, !error.isEmpty {
-              Text(error)
-                .font(.caption)
-                .foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
             }
           }
-          .frame(maxWidth: .infinity, alignment: .leading)
-          .padding(.vertical, 2)
         }
       }
-      .padding(.top, 8)
     }
-    .font(.callout)
+    .padding(16)
+    .frame(width: 460, height: 320, alignment: .topLeading)
+  }
+}
+
+private struct RevisionHistoryPopoverContent: View {
+  let records: [RevisionRecord]
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Label("修改记录（\(records.count)）", systemImage: "clock.arrow.circlepath")
+        .font(.headline)
+
+      Divider()
+
+      ScrollView {
+        VStack(alignment: .leading, spacing: 10) {
+          ForEach(Array(records.enumerated().reversed()), id: \.offset) { _, record in
+            VStack(alignment: .leading, spacing: 3) {
+              HStack(spacing: 7) {
+                Image(systemName: record.success == false ? "xmark.circle" : "clock.arrow.circlepath")
+                  .foregroundStyle(record.success == false ? .red : .secondary)
+                  .accessibilityHidden(true)
+                Text(record.time ?? "时间未知")
+                  .font(.caption.monospaced())
+                  .foregroundStyle(.secondary)
+              }
+              if let note = record.note, !note.isEmpty {
+                Text(note)
+                  .font(.callout)
+                  .textSelection(.enabled)
+              }
+              if let error = record.error, !error.isEmpty {
+                Text(error)
+                  .font(.caption)
+                  .foregroundStyle(.red)
+                  .textSelection(.enabled)
+              }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 2)
+          }
+        }
+      }
+    }
+    .padding(16)
+    .frame(width: 460, height: 360, alignment: .topLeading)
   }
 }
 
