@@ -246,6 +246,8 @@ describe("framework module registry", () => {
 
     let settleUnknown!: () => void;
     const unresolved = new Promise<void>((resolve) => { settleUnknown = resolve; });
+    let outcomeUnknownNotified = false;
+    let underlyingMutationSettled = false;
     const unknown = registry.invoke("uncertain-mutation", "unknown", async () => {
       await unresolved;
       return "eventual success";
@@ -253,11 +255,17 @@ describe("framework module registry", () => {
       operationKind: "mutation",
       timeoutMs: 10,
       cancellationGraceMs: 15,
+      onOutcomeUnknown: (settlement) => {
+        outcomeUnknownNotified = true;
+        void settlement.then(() => { underlyingMutationSettled = true; });
+      },
     });
     await expect(unknown).rejects.toMatchObject({
       code: "FRAMEWORK_MODULE_OUTCOME_UNKNOWN",
       retryable: false,
     });
+    expect(outcomeUnknownNotified).toBe(true);
+    expect(underlyingMutationSettled).toBe(false);
     let queuedStarted = false;
     await expect(registry.invoke("uncertain-mutation", "queued", () => {
       queuedStarted = true;
@@ -272,6 +280,7 @@ describe("framework module registry", () => {
     expect(queuedStarted).toBe(false);
     settleUnknown();
     await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(underlyingMutationSettled).toBe(true);
   });
 });
 

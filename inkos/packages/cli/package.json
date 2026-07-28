@@ -43,6 +43,7 @@
     "prebuild": "pnpm run prepare:workspace-core",
     "build": "tsc",
     "dev": "tsc --watch",
+    "lint": "pnpm run typecheck",
     "pretest": "pnpm run build",
     "test": "vitest run --passWithNoTests",
     "pretypecheck": "pnpm run prepare:workspace-core",

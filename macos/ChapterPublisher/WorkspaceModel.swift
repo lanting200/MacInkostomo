@@ -59,7 +59,7 @@ final class WorkspaceModel: ObservableObject {
 
   var isBusy: Bool { isLoading || isMutating }
 
-  private let api: APIClient
+  private let inkOS: InkOSLibrary
   private var loadingCount = 0
   private var mutationCount = 0
 
@@ -78,8 +78,8 @@ final class WorkspaceModel: ObservableObject {
   private var generationWorkflowTask: Task<Void, Never>?
   private var creationPollingTasks: [String: Task<Void, Never>] = [:]
 
-  init(api: APIClient = .shared) {
-    self.api = api
+  init(inkOS: InkOSLibrary = .shared) {
+    self.inkOS = inkOS
   }
 
   func bootstrap() async {
@@ -128,7 +128,7 @@ final class WorkspaceModel: ObservableObject {
     defer { endLoading() }
 
     do {
-      let response = try await api.fetchBooks()
+      let response = try await inkOS.fetchBooks()
       guard booksToken == token else { return }
       let previousID = currentBookID
       books = response
@@ -155,7 +155,7 @@ final class WorkspaceModel: ObservableObject {
     beginLoading()
     defer { endLoading() }
     do {
-      let response = try await api.fetchAvailableBooks()
+      let response = try await inkOS.fetchAvailableBooks()
       guard availableBooksToken == token else { return }
       availableBooks = response.filter { candidate in
         !books.contains { $0.id == candidate }
@@ -208,7 +208,7 @@ final class WorkspaceModel: ObservableObject {
     beginLoading()
     defer { endLoading() }
     do {
-      let response = try await api.fetchChapters(bookID: bookID)
+      let response = try await inkOS.fetchChapters(bookID: bookID)
       guard chaptersToken == token, currentBookID == bookID else { return }
       chapterContext = response
       chapters = response.chapters
@@ -257,7 +257,7 @@ final class WorkspaceModel: ObservableObject {
     beginLoading()
     defer { endLoading() }
     do {
-      let response = try await api.fetchChapter(bookID: bookID, number: number)
+      let response = try await inkOS.fetchChapter(bookID: bookID, number: number)
       guard chapterToken == token,
         currentBookID == bookID,
         currentChapterNumber == number
@@ -283,12 +283,13 @@ final class WorkspaceModel: ObservableObject {
     beginMutation()
     defer { endMutation() }
     do {
-      let response = try await api.approveChapter(bookID: bookID, number: number)
+      let response = try await inkOS.approveChapter(bookID: bookID, number: number)
       if currentBookID == bookID, currentChapterNumber == number {
         currentChapter = response
       }
       await refreshChapters()
       await refreshBooks()
+      await loadLongFormPlan()
       return response
     } catch is CancellationError {
       return nil
@@ -312,7 +313,7 @@ final class WorkspaceModel: ObservableObject {
     beginMutation()
     defer { endMutation() }
     do {
-      let response = try await api.reviseChapter(
+      let response = try await inkOS.reviseChapter(
         bookID: bookID,
         number: number,
         note: trimmedNote,
@@ -340,7 +341,7 @@ final class WorkspaceModel: ObservableObject {
     beginMutation()
     defer { endMutation() }
     do {
-      let response = try await api.generateChapter(
+      let response = try await inkOS.generateChapter(
         bookID: bookID,
         guidance: trimmed.isEmpty ? nil : trimmed
       )
@@ -368,7 +369,7 @@ final class WorkspaceModel: ObservableObject {
     beginMutation()
     defer { endMutation() }
     do {
-      let response = try await api.createBook(request)
+      let response = try await inkOS.createBook(request)
       CreateBookDraftPersistence.markPending(
         jobID: response.jobId,
         request: request,
@@ -386,16 +387,11 @@ final class WorkspaceModel: ObservableObject {
   }
 
   @discardableResult
-  func assistCreateBook(requirements: String) async -> CreateBookRequest? {
-    let text = requirements.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !text.isEmpty else {
-      errorMessage = "请填写创作需求"
-      return nil
-    }
+  func assistCreateBook(guide: CreateBookGuide) async -> CreateBookAssistResponse? {
     beginMutation()
     defer { endMutation() }
     do {
-      return try await api.assistCreateBook(requirements: text).payload
+      return try await inkOS.assistCreateBook(guide: guide)
     } catch is CancellationError {
       return nil
     } catch {
@@ -412,7 +408,7 @@ final class WorkspaceModel: ObservableObject {
   ) async -> CreationJob? {
     for _ in 0..<maxAttempts {
       do {
-        let job = try await api.fetchCreationJob(id: jobID)
+        let job = try await inkOS.fetchCreationJob(id: jobID)
         if !job.isActive {
           CreateBookDraftPersistence.reconcile(creationJobs: [job])
           await refreshActivity()
@@ -440,7 +436,7 @@ final class WorkspaceModel: ObservableObject {
     beginMutation()
     defer { endMutation() }
     do {
-      let response = try await api.deleteBook(id: id)
+      let response = try await inkOS.deleteBook(id: id)
       if currentBookID == id {
         currentBookID = nil
         invalidateBookDependentRequests()
@@ -469,7 +465,7 @@ final class WorkspaceModel: ObservableObject {
     beginMutation()
     defer { endMutation() }
     do {
-      let response = try await api.importBook(id: id)
+      let response = try await inkOS.importBook(id: id)
       await refreshBooks()
       await refreshAvailableBooks()
       if currentBookID == selectionAtStart || currentBookID == nil {
@@ -492,12 +488,12 @@ final class WorkspaceModel: ObservableObject {
     beginLoading()
     defer { endLoading() }
     do {
-      let jobs = try await api.fetchWorkflowJobs()
+      let jobs = try await inkOS.fetchWorkflowJobs()
       guard activityToken == token else { return }
       CreateBookDraftPersistence.reconcile(creationJobs: jobs.creationJobs)
       workflowJobs = jobs
       resumeWorkflowTrackingFromSnapshot()
-      let events = try await api.fetchDebugEvents(limit: 300)
+      let events = try await inkOS.fetchDebugEvents(limit: 300)
       guard activityToken == token else { return }
       debugEvents = events.events
     } catch is CancellationError {
@@ -512,7 +508,7 @@ final class WorkspaceModel: ObservableObject {
     let token = UUID()
     activityToken = token
     do {
-      let jobs = try await api.fetchWorkflowJobs()
+      let jobs = try await inkOS.fetchWorkflowJobs()
       guard activityToken == token else { return }
       CreateBookDraftPersistence.reconcile(creationJobs: jobs.creationJobs)
       workflowJobs = jobs
@@ -527,7 +523,7 @@ final class WorkspaceModel: ObservableObject {
 
   func generationJob(bookID: String, chapterNumber: Int) async -> GenerationJob? {
     do {
-      return try await api.fetchGenerationJob(bookID: bookID, chapterNumber: chapterNumber).job
+      return try await inkOS.fetchGenerationJob(bookID: bookID, chapterNumber: chapterNumber).job
     } catch is CancellationError {
       return nil
     } catch {
@@ -626,7 +622,7 @@ final class WorkspaceModel: ObservableObject {
     beginLoading()
     defer { endLoading() }
     do {
-      let response = try await api.fetchInkOSConfig()
+      let response = try await inkOS.fetchInkOSConfig()
       guard configToken == token else { return }
       inkOSConfig = response
     } catch is CancellationError {
@@ -642,7 +638,7 @@ final class WorkspaceModel: ObservableObject {
     beginMutation()
     defer { endMutation() }
     do {
-      let response = try await api.updateInkOSConfig(update)
+      let response = try await inkOS.updateInkOSConfig(update)
       await loadInkOSConfig()
       return response
     } catch is CancellationError {
@@ -660,7 +656,7 @@ final class WorkspaceModel: ObservableObject {
   ) async -> [RemoteModel] {
     do {
       let request = ModelEndpointRequest(role: role, baseUrl: normalized(baseURL), apiKey: apiKey)
-      return try await api.fetchModels(request).models
+      return try await inkOS.fetchModels(request).models
     } catch is CancellationError {
       return []
     } catch {
@@ -682,7 +678,7 @@ final class WorkspaceModel: ObservableObject {
         baseUrl: normalized(baseURL),
         apiKey: apiKey
       )
-      return try await api.testModel(request)
+      return try await inkOS.testModel(request)
     } catch is CancellationError {
       return nil
     } catch {
@@ -705,7 +701,7 @@ final class WorkspaceModel: ObservableObject {
     beginLoading()
     defer { endLoading() }
     do {
-      let response = try await api.fetchBookSettings(bookID: bookID)
+      let response = try await inkOS.fetchBookSettings(bookID: bookID)
       guard settingsToken == token, currentBookID == bookID else { return }
       bookSettings = response
       let nextPath =
@@ -742,7 +738,7 @@ final class WorkspaceModel: ObservableObject {
     beginLoading()
     defer { endLoading() }
     do {
-      let content = try await api.fetchBookSetting(bookID: bookID, path: path)
+      let content = try await inkOS.fetchBookSetting(bookID: bookID, path: path)
       guard settingContentToken == token,
         currentBookID == bookID,
         selectedSettingPath == path
@@ -768,7 +764,7 @@ final class WorkspaceModel: ObservableObject {
     beginMutation()
     defer { endMutation() }
     do {
-      let response = try await api.saveBookSetting(bookID: bookID, path: path, content: content)
+      let response = try await inkOS.saveBookSetting(bookID: bookID, path: path, content: content)
       if currentBookID == bookID, selectedSettingPath == path {
         selectedSettingContent = content
       }
@@ -794,13 +790,13 @@ final class WorkspaceModel: ObservableObject {
     beginLoading()
     defer { endLoading() }
     do {
-      let response = try await api.fetchLongFormPlan(bookID: bookID)
+      let response = try await inkOS.fetchLongFormPlan(bookID: bookID)
       guard longFormPlanToken == token, currentBookID == bookID else { return }
       longFormPlan = response
       isLongFormPlanUnavailable = false
     } catch is CancellationError {
       return
-    } catch let apiError as APIError where apiError.statusCode == 404 {
+    } catch let coreError as InkOSCoreError where coreError.statusCode == 404 {
       guard longFormPlanToken == token, currentBookID == bookID else { return }
       longFormPlan = nil
       isLongFormPlanUnavailable = true
@@ -829,7 +825,7 @@ final class WorkspaceModel: ObservableObject {
     beginMutation()
     defer { endMutation() }
     do {
-      let response = try await api.updateLongFormPlan(
+      let response = try await inkOS.updateLongFormPlan(
         bookID: bookID,
         expectedRevision: expectedRevision,
         constraints: constraints,
@@ -858,7 +854,7 @@ final class WorkspaceModel: ObservableObject {
     beginLoading()
     defer { endLoading() }
     do {
-      let login = try await api.fetchFanqieLoginState()
+      let login = try await inkOS.fetchFanqieLoginState()
       guard fanqieToken == token else { return }
       fanqieLogin = login
       guard login.loggedIn else {
@@ -866,7 +862,7 @@ final class WorkspaceModel: ObservableObject {
         return
       }
 
-      let account = try await api.fetchFanqieAccount()
+      let account = try await inkOS.fetchFanqieAccount()
       guard fanqieToken == token else { return }
       fanqieAccount = account
       guard account.loggedIn else {
@@ -878,7 +874,7 @@ final class WorkspaceModel: ObservableObject {
         clearFanqieData(keepingAccount: true)
         return
       }
-      let response = try await api.fetchFanqieBooks()
+      let response = try await inkOS.fetchFanqieBooks()
       guard fanqieToken == token else { return }
       fanqieBooks = response.books
 
@@ -892,6 +888,126 @@ final class WorkspaceModel: ObservableObject {
     } catch {
       guard fanqieToken == token else { return }
       setFanqieError(error)
+    }
+  }
+
+  func completeFanqieLogin(cookies: [FanqieCookie]) async -> Bool {
+    beginMutation()
+    defer { endMutation() }
+    do {
+      let account = try await inkOS.saveFanqieCookies(cookies)
+      fanqieAccount = account
+      fanqieLogin = FanqieLoginState(loggedIn: true, needRelogin: false, reason: nil)
+      await refreshFanqie(force: true)
+      return fanqieLogin?.loggedIn == true
+    } catch is CancellationError {
+      return false
+    } catch {
+      setFanqieError(error)
+      return false
+    }
+  }
+
+  func fetchFanqieCategories(gender: Int) async -> [FanqieCategory] {
+    do {
+      return try await inkOS.fetchFanqieCategories(gender: gender)
+    } catch is CancellationError {
+      return []
+    } catch {
+      setFanqieError(error)
+      return []
+    }
+  }
+
+  func fetchLocalChapters(bookID: String) async -> [ChapterSummary] {
+    do {
+      return try await inkOS.fetchChapters(bookID: bookID).chapters
+    } catch is CancellationError {
+      return []
+    } catch {
+      setError(error)
+      return []
+    }
+  }
+
+  func fetchLocalBookSetting(bookID: String, path: String) async -> String? {
+    do {
+      return try await inkOS.fetchBookSetting(bookID: bookID, path: path)
+    } catch is CancellationError {
+      return nil
+    } catch {
+      setError(error)
+      return nil
+    }
+  }
+
+  func generateFanqieAbstract(
+    bookID: String,
+    source: String,
+    protagonistNames: [String]
+  ) async -> String? {
+    beginMutation()
+    defer { endMutation() }
+    do {
+      return try await inkOS.generateFanqieAbstract(
+        bookID: bookID,
+        source: source,
+        protagonistNames: protagonistNames
+      )
+    } catch is CancellationError {
+      return nil
+    } catch {
+      setError(error)
+      return nil
+    }
+  }
+
+  @discardableResult
+  func createFanqieBook(_ input: FanqieCreateBookInput) async -> FanqieMutationResponse? {
+    beginMutation()
+    defer { endMutation() }
+    do {
+      let response = try await inkOS.createFanqieBook(input)
+      await refreshFanqie(force: true)
+      if let bookID = response.bookId {
+        await selectFanqieBook(id: bookID)
+      }
+      return response
+    } catch is CancellationError {
+      return nil
+    } catch {
+      setFanqieError(error)
+      return nil
+    }
+  }
+
+  @discardableResult
+  func transferFanqieChapter(
+    _ input: FanqieChapterTransferInput,
+    replacing: Bool
+  ) async -> FanqieMutationResponse? {
+    beginMutation()
+    defer { endMutation() }
+    do {
+      let response = replacing
+        ? try await inkOS.replaceFanqieChapter(input)
+        : try await inkOS.publishFanqieChapter(input)
+      guard let remoteBook = fanqieBooks.first(where: { $0.bookId == input.remoteBookId }) else {
+        await refreshFanqie(force: true)
+        return response
+      }
+      await selectFanqieBook(remoteBook)
+      if let chapterID = response.chapterId,
+        let chapter = fanqieChapters.first(where: { $0.chapterId == chapterID })
+      {
+        await loadFanqieChapterContent(chapter)
+      }
+      return response
+    } catch is CancellationError {
+      return nil
+    } catch {
+      setFanqieError(error)
+      return nil
     }
   }
 
@@ -910,7 +1026,7 @@ final class WorkspaceModel: ObservableObject {
     beginLoading()
     defer { endLoading() }
     do {
-      let response = try await api.fetchFanqieChapters(bookID: book.bookId, title: book.title)
+      let response = try await inkOS.fetchFanqieChapters(bookID: book.bookId, title: book.title)
       guard fanqieChaptersToken == token,
         selectedFanqieBookID == book.bookId
       else { return }
@@ -940,7 +1056,7 @@ final class WorkspaceModel: ObservableObject {
     beginLoading()
     defer { endLoading() }
     do {
-      let response = try await api.fetchFanqieChapterContent(
+      let response = try await inkOS.fetchFanqieChapterContent(
         bookID: bookID,
         chapterID: chapter.chapterId
       )
@@ -963,7 +1079,7 @@ final class WorkspaceModel: ObservableObject {
     beginMutation()
     defer { endMutation() }
     do {
-      let response = try await api.logoutFanqie()
+      let response = try await inkOS.logoutFanqie()
       fanqieToken = UUID()
       fanqieLogin = FanqieLoginState(loggedIn: false, needRelogin: true, reason: response.message)
       clearFanqieData()
@@ -978,7 +1094,7 @@ final class WorkspaceModel: ObservableObject {
 
   func fanqieLoginURL() async -> FanqieLoginURLResponse? {
     do {
-      return try await api.fetchFanqieLoginURL()
+      return try await inkOS.fetchFanqieLoginURL()
     } catch is CancellationError {
       return nil
     } catch {
@@ -988,13 +1104,11 @@ final class WorkspaceModel: ObservableObject {
   }
 
   private func setFanqieError(_ error: Error) {
-    if let apiError = error as? APIError,
-      apiError.details["needRelogin"] == .bool(true)
-    {
+    if let coreError = error as? InkOSCoreError, coreError.statusCode == 401 {
       fanqieLogin = FanqieLoginState(
         loggedIn: false,
         needRelogin: true,
-        reason: apiError.errorDescription ?? "番茄登录状态已失效"
+        reason: coreError.errorDescription ?? "番茄登录状态已失效"
       )
       clearFanqieData()
     }

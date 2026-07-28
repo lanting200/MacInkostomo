@@ -2,11 +2,211 @@ import SwiftUI
 
 enum NativeLayout {
   static let cornerRadius: CGFloat = 8
+  static let cardCornerRadius: CGFloat = 12
   static let compactSpacing: CGFloat = 8
   static let panelSpacing: CGFloat = 12
+  static let sidebarWidth: CGFloat = 238
   static let workspaceHeaderHeight: CGFloat = 52
   static let workspaceUtilityHeight: CGFloat = 38
   static let workspaceFooterHeight: CGFloat = 54
+}
+
+/// Color tokens lifted from the fanqie writer center production stylesheets.
+/// Light mode matches the web values exactly; dark mode keeps the same brand
+/// and alpha ladder on a warm dark base.
+enum NativeTheme {
+  private static func adaptive(_ light: UInt32, _ dark: UInt32, lightAlpha: Double = 1, darkAlpha: Double = 1) -> Color {
+    Color(nsColor: NSColor(name: nil) { appearance in
+      if appearance.isDarkAppearance {
+        return NSColor(fanqieHex: dark, alpha: darkAlpha)
+      }
+      return NSColor(fanqieHex: light, alpha: lightAlpha)
+    })
+  }
+
+  /// Fanqie brand orange #FF5F00.
+  static let brand = Color(nsColor: NSColor(fanqieHex: 0xFF5F00))
+  /// Hover #FF721F.
+  static let brandHover = Color(nsColor: NSColor(fanqieHex: 0xFF721F))
+  /// Pressed #D24600.
+  static let brandPressed = Color(nsColor: NSColor(fanqieHex: 0xD24600))
+  /// Selected menu background #FF5F000A (4% alpha; stronger on dark).
+  static let brandFaint = adaptive(0xFF5F00, 0xFF5F00, lightAlpha: 0.04, darkAlpha: 0.16)
+  /// Tag / countdown capsule background #FF5F0014 (8% alpha).
+  static let brandSoft = adaptive(0xFF5F00, 0xFF5F00, lightAlpha: 0.08, darkAlpha: 0.22)
+  /// Calendar stamp background #FF5F001F (12% alpha).
+  static let brandStamp = adaptive(0xFF5F00, 0xFF5F00, lightAlpha: 0.12, darkAlpha: 0.28)
+
+  /// Page background #F9F9F9 (kept for opaque surfaces such as dialogs).
+  static let page = adaptive(0xF9F9F9, 0x161614)
+  /// White serial-card background.
+  static let card = adaptive(0xFFFFFF, 0x232322)
+  /// Serial card at 50% opacity for floating over the glass page.
+  static var cardGlass: Color { card.opacity(0.5) }
+  /// Hover fill #00000005.
+  static let hoverFill = adaptive(0x000000, 0xFFFFFF, lightAlpha: 0.02, darkAlpha: 0.05)
+  /// Subtle fill #0000000A.
+  static let subtleFill = adaptive(0x000000, 0xFFFFFF, lightAlpha: 0.04, darkAlpha: 0.09)
+  /// Hairline separator.
+  static let hairline = adaptive(0x000000, 0xFFFFFF, lightAlpha: 0.06, darkAlpha: 0.10)
+
+  /// Frosted chip used for selected controls sitting on clear glass.
+  static let chipFill = Color(nsColor: .white).opacity(0.55)
+  /// Hover chip on clear glass.
+  static let chipHover = Color(nsColor: .white).opacity(0.25)
+
+  /// Primary text (web #000).
+  static let textPrimary = Color.primary
+  /// Secondary text #000000A3 (64%).
+  static let textSecondary = Color.primary.opacity(0.64)
+  /// Tertiary text #00000066 (40%).
+  static let textTertiary = Color.primary.opacity(0.40)
+  /// Placeholder / disabled #0000003D (24%).
+  static let textQuaternary = Color.primary.opacity(0.24)
+}
+
+extension NSColor {
+  convenience init(fanqieHex rgb: UInt32, alpha: Double = 1) {
+    self.init(
+      srgbRed: CGFloat((rgb >> 16) & 0xFF) / 255,
+      green: CGFloat((rgb >> 8) & 0xFF) / 255,
+      blue: CGFloat(rgb & 0xFF) / 255,
+      alpha: alpha
+    )
+  }
+}
+
+extension NSAppearance {
+  var isDarkAppearance: Bool {
+    bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+  }
+}
+
+/// Clear or regular liquid glass for window chrome (sidebar and content
+/// backdrop). An ultra-thin gaussian-blur material diluted to 20% opacity,
+/// plus Glass on macOS 26 for liquid-glass refraction. (Refraction strength
+/// is not tunable.)
+enum NativeGlassKind {
+  case clear
+  case regular
+}
+
+struct NativeGlassChrome: ViewModifier {
+  var kind: NativeGlassKind = .clear
+  var frost: Double = 0.2
+
+  func body(content: Content) -> some View {
+    if #available(macOS 26.0, *) {
+      switch kind {
+      case .clear:
+        content
+          .background { NativeGlassFrost(opacity: frost) }
+          .glassEffect(.clear, in: .rect)
+      case .regular:
+        content
+          .background { NativeGlassFrost(opacity: frost) }
+          .glassEffect(.regular, in: .rect)
+      }
+    } else {
+      content.background { NativeGlassFrost(opacity: frost) }
+    }
+  }
+}
+
+private struct NativeGlassFrost: View {
+  let opacity: Double
+
+  var body: some View {
+    Rectangle()
+      .fill(.ultraThinMaterial)
+      .opacity(opacity)
+  }
+}
+
+extension View {
+  func nativeGlassChrome(_ kind: NativeGlassKind = .clear, frost: Double = 0.2) -> some View {
+    modifier(NativeGlassChrome(kind: kind, frost: frost))
+  }
+}
+
+/// Vertical navigation item matching the fanqie writer center menu metrics:
+/// 14pt PingFang, 44pt row height, 8pt corner radius, selected rows use the
+/// brand color at 4% fill with brand-colored text. On macOS 26 the selected
+/// row upgrades to an interactive liquid-glass capsule tinted with the brand.
+struct NativeSidebarNavItem: View {
+  let title: String
+  let systemImage: String
+  let selected: Bool
+  let action: () -> Void
+
+  @State private var hovering = false
+
+  var body: some View {
+    Button(action: action) {
+      rowContent
+        .padding(.horizontal, 20)
+        .frame(height: 44)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .modifier(NativeSidebarNavItemChrome(selected: selected, hovering: hovering))
+        .contentShape(RoundedRectangle(cornerRadius: NativeLayout.cornerRadius, style: .continuous))
+        .animation(.easeOut(duration: 0.18), value: hovering)
+        .animation(.easeOut(duration: 0.18), value: selected)
+    }
+    .buttonStyle(.plain)
+    .onHover { hovering = $0 }
+    .accessibilityAddTraits(selected ? .isSelected : [])
+  }
+
+  private var rowContent: some View {
+    HStack(spacing: 10) {
+      Image(systemName: systemImage)
+        .font(.system(size: 15, weight: selected ? .bold : .semibold))
+        .frame(width: 20, alignment: .center)
+        .accessibilityHidden(true)
+      Text(title)
+        .font(.system(size: 14, weight: selected ? .bold : .semibold))
+        .lineLimit(1)
+      Spacer(minLength: 0)
+    }
+    .foregroundStyle(selected ? NativeTheme.brand : Color.white)
+    .shadow(color: .black.opacity(selected ? 0 : 0.7), radius: 2.5, x: 0, y: 1)
+  }
+}
+
+private struct NativeSidebarNavItemChrome: ViewModifier {
+  let selected: Bool
+  let hovering: Bool
+
+  @ViewBuilder
+  func body(content: Content) -> some View {
+    if #available(macOS 26.0, *) {
+      if selected {
+        content
+          .background(
+            NativeTheme.chipFill,
+            in: RoundedRectangle(cornerRadius: NativeLayout.cornerRadius, style: .continuous)
+          )
+          .glassEffect(.clear.interactive(), in: .rect(cornerRadius: NativeLayout.cornerRadius))
+      } else {
+        content.background {
+          if hovering {
+            RoundedRectangle(cornerRadius: NativeLayout.cornerRadius, style: .continuous)
+              .fill(NativeTheme.chipHover)
+          }
+        }
+      }
+    } else {
+      content.background {
+        if selected {
+          RoundedRectangle(cornerRadius: NativeLayout.cornerRadius, style: .continuous)
+            .fill(NativeTheme.chipFill)
+        } else if hovering {
+          RoundedRectangle(cornerRadius: NativeLayout.cornerRadius, style: .continuous)
+            .fill(NativeTheme.chipHover)
+        }
+      }
+    }
+  }
 }
 
 struct AdaptiveGlassSurface<Content: View>: View {
@@ -82,6 +282,30 @@ enum NativeActionProminence {
   case destructive
 }
 
+/// Fanqie primary button: flat brand-orange fill, white text, 6pt radius.
+/// Hover uses #FF721F, pressed #D24600 — the same ladder as the web buttons.
+private struct FanqiePrimaryButtonStyle: ButtonStyle {
+  @Environment(\.isEnabled) private var isEnabled
+  @State private var hovering = false
+
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .foregroundStyle(.white)
+      .padding(.horizontal, 14)
+      .padding(.vertical, 6)
+      .background(
+        configuration.isPressed
+          ? NativeTheme.brandPressed
+          : hovering ? NativeTheme.brandHover : NativeTheme.brand,
+        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+      )
+      .opacity(isEnabled ? 1 : 0.45)
+      .contentShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+      .onHover { hovering = $0 }
+      .animation(.easeOut(duration: 0.15), value: hovering)
+  }
+}
+
 struct NativeActionButton<Label: View>: View {
   let prominence: NativeActionProminence
   let action: () -> Void
@@ -99,31 +323,17 @@ struct NativeActionButton<Label: View>: View {
 
   @ViewBuilder
   var body: some View {
-    if #available(macOS 26.0, *) {
-      switch prominence {
-      case .prominent:
-        Button(action: action) { label }
-          .buttonStyle(.glassProminent)
-      case .standard:
-        Button(action: action) { label }
-          .buttonStyle(.glass)
-      case .destructive:
-        Button(role: .destructive, action: action) { label }
-          .buttonStyle(.glass(.regular.tint(.red.opacity(0.18))))
-      }
-    } else {
-      switch prominence {
-      case .prominent:
-        Button(action: action) { label }
-          .buttonStyle(.borderedProminent)
-      case .standard:
-        Button(action: action) { label }
-          .buttonStyle(.bordered)
-      case .destructive:
-        Button(role: .destructive, action: action) { label }
-          .buttonStyle(.bordered)
-          .tint(.red)
-      }
+    switch prominence {
+    case .prominent:
+      Button(action: action) { label }
+        .buttonStyle(FanqiePrimaryButtonStyle())
+    case .standard:
+      Button(action: action) { label }
+        .buttonStyle(.bordered)
+    case .destructive:
+      Button(role: .destructive, action: action) { label }
+        .buttonStyle(.bordered)
+        .tint(.red)
     }
   }
 }
@@ -459,5 +669,29 @@ struct NativeChapterTextReader: NSViewRepresentable {
 
   final class Coordinator {
     var content: String?
+  }
+}
+
+
+/// Gives SwiftUI access to the hosting NSWindow so the chrome can become
+/// real glass: with an opaque window, SwiftUI materials only flatten against
+/// the window's own background. Clearing the window background lets
+/// `.regularMaterial` / `.thinMaterial` blend with the desktop backdrop,
+/// which is what produces genuine frosted translucency.
+struct WindowAccessor: NSViewRepresentable {
+  let configure: (NSWindow) -> Void
+
+  func makeNSView(context: Context) -> NSView {
+    let view = NSView()
+    DispatchQueue.main.async { [weak view] in
+      guard let window = view?.window else { return }
+      configure(window)
+    }
+    return view
+  }
+
+  func updateNSView(_ nsView: NSView, context: Context) {
+    guard let window = nsView.window else { return }
+    configure(window)
   }
 }

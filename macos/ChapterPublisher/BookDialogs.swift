@@ -1,21 +1,29 @@
 import SwiftUI
 
 struct CreateBookSheet: View {
-  private struct ProjectedVolume: Identifiable {
-    let number: Int
-    let startChapter: Int
-    let endChapter: Int
-    let chapterCount: Int
-    let targetWords: Int
+  private enum GuideStep: Int, CaseIterable, Identifiable {
+    case idea
+    case length
+    case review
 
-    var id: Int { number }
+    var id: Int { rawValue }
+
+    var title: String {
+      switch self {
+      case .idea: return "你的故事"
+      case .length: return "写作规模"
+      case .review: return "确认方案"
+      }
+    }
   }
 
   @ObservedObject var model: WorkspaceModel
   @Environment(\.dismiss) private var dismiss
   @FocusState private var titleFocused: Bool
   @State private var request: CreateBookRequest
+  @State private var guide: CreateBookGuide
   @State private var requirements: String
+  @State private var guideStep: GuideStep
   @State private var pendingCreationJobID: String?
   @State private var draftPersistenceTask: Task<Void, Never>? = nil
   @State private var isAssisting = false
@@ -26,12 +34,18 @@ struct CreateBookSheet: View {
     _model = ObservedObject(wrappedValue: model)
     let draft = CreateBookDraftPersistence.load()
     _request = State(initialValue: draft.request)
+    _guide = State(initialValue: draft.request.creationGuide ?? CreateBookGuide(request: draft.request))
     _requirements = State(initialValue: draft.requirements)
     _pendingCreationJobID = State(initialValue: draft.pendingCreationJobID)
+    let hasGeneratedPlan = !draft.request.outline.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      && !draft.request.volumePlan.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    _assistCompleted = State(initialValue: hasGeneratedPlan)
+    _guideStep = State(initialValue: hasGeneratedPlan ? .review : .idea)
   }
 
   private var canSubmit: Bool {
-    !request.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    assistCompleted
+      && !guide.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
       && validationMessage == nil
       && !isAssisting
       && !isSubmitting
@@ -44,56 +58,128 @@ struct CreateBookSheet: View {
   }
 
   private var validationMessage: String? {
-    if request.targetTotalWords < 1_000 {
-      return "目标总字数不能少于 1,000 字"
+    ideaValidationMessage ?? lengthValidationMessage ?? preferenceValidationMessage
+  }
+
+  private var ideaValidationMessage: String? {
+    if guide.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      return "请填写小说暂定名"
     }
-    if request.targetTotalWords > 3_000_000 {
-      return "目标总字数上限为 300 万字"
+    if guide.storyPremise.trimmingCharacters(in: .whitespacesAndNewlines).count < 20 {
+      return "请用至少 20 个字讲讲你想写的故事"
     }
-    if !(500...20_000).contains(request.chapterWords) {
-      return "目标章字数需在 500 至 20,000 字之间"
+    if guide.protagonistName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      return "请填写主角叫什么"
     }
-    if !(1...100).contains(request.volumeCount) {
-      return "分卷数需在 1 至 100 卷之间"
-    }
-    if request.targetTotalWords * 2 < request.chapterWords {
-      return "目标总字数不足以形成一章"
-    }
-    if request.volumeCount > request.derivedTargetChapters {
-      return "分卷数不能超过推导章节数"
-    }
-    if !(0...50).contains(request.chapterWordTolerance) {
-      return "单章字数容差需在 0% 至 50% 之间"
-    }
-    let chapterCount = request.derivedTargetChapters
-    let exactMinimum = request.targetTotalWords / chapterCount
-    let exactMaximum = (request.targetTotalWords + chapterCount - 1) / chapterCount
-    if exactMinimum < request.chapterWordRange.lowerBound
-      || exactMaximum > request.chapterWordRange.upperBound
-    {
-      return "总字数与目标章字数、容差组合不相容"
-    }
-    let specialConstraints = LongFormConstraints.lines(from: request.constraints)
-    if specialConstraints.isEmpty {
-      return "请填写特殊约束；没有额外要求时可填写“无”"
-    }
-    if specialConstraints.count > 100 {
-      return "特殊约束不能超过 100 条"
-    }
-    if specialConstraints.contains(where: { $0.count > 2_000 }) {
-      return "单条特殊约束不能超过 2,000 个字符"
-    }
-    if specialConstraints.reduce(0, { $0 + $1.count }) > 20_000 {
-      return "特殊约束总长度不能超过 20,000 个字符"
+    if guide.protagonistProfile.trimmingCharacters(in: .whitespacesAndNewlines).count < 10 {
+      return "请简单说明主角的处境和目标"
     }
     return nil
+  }
+
+  private var lengthValidationMessage: String? {
+    let input = projectedRequest
+    if input.targetTotalWords < 1_000 {
+      return "预计总字数至少需要 1,000 字"
+    }
+    if input.targetTotalWords > 3_000_000 {
+      return "预计总字数最高支持 300 万字"
+    }
+    if !(500...20_000).contains(input.chapterWords) {
+      return "每章字数需要在 500 至 20,000 字之间"
+    }
+    if !(1...100).contains(input.volumeCount) {
+      return "分卷数量需要在 1 至 100 卷之间"
+    }
+    if input.targetTotalWords * 2 < input.chapterWords {
+      return "目标总字数不足以形成一章"
+    }
+    if input.volumeCount > input.derivedTargetChapters {
+      return "分卷数量不能超过章节数量"
+    }
+    if !(0...50).contains(input.chapterWordTolerance) {
+      return "单章字数浮动范围需要在 0% 至 50% 之间"
+    }
+    let chapterCount = input.derivedTargetChapters
+    let exactMinimum = input.targetTotalWords / chapterCount
+    let exactMaximum = (input.targetTotalWords + chapterCount - 1) / chapterCount
+    if exactMinimum < input.chapterWordRange.lowerBound
+      || exactMaximum > input.chapterWordRange.upperBound
+    {
+      return "章数和每章字数组合超出了当前字数范围"
+    }
+    return nil
+  }
+
+  private var preferenceValidationMessage: String? {
+    let specialConstraints = guide.specialConstraints
+    if specialConstraints.count > 100 {
+      return "补充要求最多填写 100 条"
+    }
+    if specialConstraints.contains(where: { $0.count > 2_000 }) {
+      return "每条补充要求最多填写 2,000 个字符"
+    }
+    if specialConstraints.reduce(0, { $0 + $1.count }) > 20_000 {
+      return "补充要求总长度最多为 20,000 个字符"
+    }
+    return nil
+  }
+
+  private var currentStepValidationMessage: String? {
+    switch guideStep {
+    case .idea: return ideaValidationMessage
+    case .length: return lengthValidationMessage
+    case .review: return preferenceValidationMessage
+    }
+  }
+
+  private var synchronizedGuide: CreateBookGuide {
+    var value = guide
+    value.synchronizeBudget()
+    return value
+  }
+
+  private var projectedRequest: CreateBookRequest {
+    let lockedGuide = synchronizedGuide
+    var value = request
+    value.title = lockedGuide.title
+    value.language = lockedGuide.language
+    value.genre = lockedGuide.genre
+    value.platform = lockedGuide.platform
+    value.targetChapters = lockedGuide.targetChapters
+    value.chapterWords = lockedGuide.targetChapterWords
+    value.targetTotalWords = lockedGuide.targetTotalWords
+    value.totalWords = String(lockedGuide.targetTotalWords)
+    value.volumeCount = lockedGuide.volumeCount
+    value.chapterWordTolerance = lockedGuide.chapterWordTolerance
+    var mergedConstraints = LongFormConstraints.lines(from: value.constraints)
+    mergedConstraints.append(contentsOf: lockedGuide.specialConstraints)
+    var seenConstraints = Set<String>()
+    value.constraints = mergedConstraints
+      .filter { seenConstraints.insert($0).inserted }
+      .joined(separator: "\n")
+    if value.pacing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      value.pacing = lockedGuide.pacing
+    }
+    if value.style.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      value.style = lockedGuide.style
+    }
+    value.creationGuide = lockedGuide
+    return value
+  }
+
+  private var specialConstraintsText: Binding<String> {
+    Binding(
+      get: { guide.specialConstraints.joined(separator: "\n") },
+      set: { guide.specialConstraints = LongFormConstraints.lines(from: $0) }
+    )
   }
 
   var body: some View {
     VStack(spacing: 0) {
       dialogHeader(
         title: "新建小说",
-        subtitle: "创建 InkOS 设定、大纲、分卷与写作节奏",
+        subtitle: "回答几个问题，由 LLM 整理成完整小说方案",
         systemImage: "book.closed.fill"
       )
 
@@ -128,164 +214,20 @@ struct CreateBookSheet: View {
 
       ScrollView {
         VStack(alignment: .leading, spacing: 18) {
-          dialogSection("快速创建") {
-            VStack(alignment: .leading, spacing: 8) {
-              ZStack(alignment: .topLeading) {
-                if requirements.isEmpty {
-                  Text("例如：番茄玄幻，60 万字，6 卷，单章 3000 字，容差 15%，主角不得降智")
-                    .font(.callout)
-                    .foregroundStyle(.tertiary)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 8)
-                    .allowsHitTesting(false)
-                }
-                TextEditor(text: $requirements)
-                  .font(.body)
-                  .scrollContentBackground(.hidden)
-                  .padding(3)
-              }
-              .frame(minHeight: 70)
-              .background(
-                .quaternary.opacity(0.35),
-                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
-              )
-              .overlay {
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                  .stroke(.quaternary, lineWidth: 1)
-              }
-              .accessibilityLabel("小说创作需求")
+          guideProgress
 
-              HStack(spacing: 8) {
-                NativeActionButton {
-                  assistCreation()
-                } label: {
-                  Label(isAssisting ? "正在生成" : "生成并填入设定", systemImage: "wand.and.stars")
-                }
-                .disabled(
-                  requirements.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    || isAssisting || isSubmitting || pendingCreationJobID != nil
-                )
-
-                if isAssisting {
-                  ProgressView()
-                    .controlSize(.small)
-                    .accessibilityLabel("正在生成小说设定")
-                } else if assistCompleted {
-                  Label("已填入", systemImage: "checkmark.circle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.green)
-                }
-              }
-            }
+          switch guideStep {
+          case .idea: ideaQuestions
+          case .length: lengthQuestions
+          case .review: reviewAndSummary
           }
 
-          dialogSection("基础信息") {
-            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
-              GridRow {
-                dialogField("书名", required: true) {
-                  TextField("例如：道衍封诡录", text: $request.title)
-                    .focused($titleFocused)
-                }
-                dialogField("语言") {
-                  Picker("语言", selection: $request.language) {
-                    Text("中文").tag("zh")
-                    Text("English").tag("en")
-                  }
-                  .labelsHidden()
-                }
-              }
-
-              GridRow {
-                dialogField("类型") {
-                  TextField("xuanhuan / urban / fanfic", text: $request.genre)
-                }
-                dialogField("平台") {
-                  Picker("平台", selection: $request.platform) {
-                    Text("番茄").tag("tomato")
-                    Text("起点").tag("qidian")
-                    Text("其他").tag("other")
-                  }
-                  .labelsHidden()
-                }
-              }
-
-              GridRow {
-                dialogField("节奏要求") {
-                  TextField("例如：前三章强钩子", text: $request.pacing)
-                }
-                Color.clear
-              }
-            }
-          }
-
-          dialogSection("长篇结构预算") {
-            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
-              GridRow {
-                dialogField("目标总字数", required: true) {
-                  HStack(spacing: 8) {
-                    TextField(
-                      "600000",
-                      value: $request.targetTotalWords,
-                      format: .number.grouping(.never)
-                    )
-                    .frame(minWidth: 120)
-                    Text("字")
-                      .foregroundStyle(.secondary)
-                  }
-                }
-                dialogField("分卷数", required: true) {
-                  Stepper(value: $request.volumeCount, in: 1...100) {
-                    Text("\(request.volumeCount) 卷")
-                      .monospacedDigit()
-                  }
-                }
-              }
-
-              GridRow {
-                dialogField("目标章字数", required: true) {
-                  Stepper(value: $request.chapterWords, in: 500...20_000, step: 100) {
-                    Text("\(request.chapterWords) 字")
-                      .monospacedDigit()
-                  }
-                }
-                dialogField("单章容差", required: true) {
-                  Stepper(value: $request.chapterWordTolerance, in: 0...50) {
-                    Text("±\(request.chapterWordTolerance)%")
-                      .monospacedDigit()
-                  }
-                }
-              }
-            }
-
-            longFormProjection
-
-            if let validationMessage {
-              Label(validationMessage, systemImage: "exclamationmark.triangle.fill")
-                .font(.caption)
-                .foregroundStyle(.red)
-                .fixedSize(horizontal: false, vertical: true)
-                .accessibilityLabel("结构预算错误：\(validationMessage)")
-            }
-          }
-
-          dialogSection("故事设定") {
-            createTextArea("核心创意", placeholder: "主角、目标、冲突与核心卖点", text: $request.premise)
-            createTextArea("主要人物", placeholder: "主角与关键角色的人设、关系和动机", text: $request.characters)
-            createTextArea("世界观与规则", placeholder: "世界结构、力量体系、限制与代价", text: $request.worldbuilding)
-          }
-
-          dialogSection("结构与风格") {
-            createTextArea(
-              "主线大纲", placeholder: "主要剧情阶段与终局方向", text: $request.outline, minHeight: 90)
-            createTextArea(
-              "分卷规划", placeholder: "每卷标题、章节范围和阶段目标", text: $request.volumePlan, minHeight: 90)
-            createTextArea("文风要求", placeholder: "叙事视角、语气、节奏与表达偏好", text: $request.style)
-            createTextArea(
-              "特殊约束",
-              placeholder: "必须遵守的人设、结构、内容边界；没有额外要求时填写“无”",
-              text: $request.constraints,
-              required: true
-            )
+          if let currentStepValidationMessage {
+            Label(currentStepValidationMessage, systemImage: "exclamationmark.triangle.fill")
+              .font(.caption)
+              .foregroundStyle(.red)
+              .fixedSize(horizontal: false, vertical: true)
+              .accessibilityLabel("创建引导错误：\(currentStepValidationMessage)")
           }
         }
         .padding(20)
@@ -295,20 +237,35 @@ struct CreateBookSheet: View {
       Divider()
 
       HStack(spacing: 10) {
-        Text("创建会启动后台任务，进度可在“任务状态”查看。")
-          .font(.caption)
-          .foregroundStyle(.secondary)
-        Spacer()
         Button("取消") { dismiss() }
           .keyboardShortcut(.cancelAction)
           .disabled(isSubmitting || isAssisting)
-        NativeActionButton(prominence: .prominent) {
-          submit()
-        } label: {
-          Label(isSubmitting ? "正在创建" : "创建小说", systemImage: "plus")
+        Spacer()
+        if guideStep != .idea {
+          Button {
+            moveBackward()
+          } label: {
+            Label("上一步", systemImage: "chevron.left")
+          }
+          .disabled(isSubmitting || isAssisting)
         }
-        .disabled(!canSubmit)
-        .keyboardShortcut(.defaultAction)
+        if guideStep == .review, assistCompleted {
+          NativeActionButton(prominence: .prominent) {
+            submit()
+          } label: {
+            Label(isSubmitting ? "正在创建" : "创建小说", systemImage: "plus")
+          }
+          .disabled(!canSubmit)
+          .keyboardShortcut(.defaultAction)
+        } else if guideStep != .review {
+          NativeActionButton(prominence: .prominent) {
+            moveForward()
+          } label: {
+            Label("下一步", systemImage: "chevron.right")
+          }
+          .disabled(currentStepValidationMessage != nil || isAssisting || isSubmitting)
+          .keyboardShortcut(.defaultAction)
+        }
       }
       .padding(14)
     }
@@ -323,8 +280,11 @@ struct CreateBookSheet: View {
       }
     }
     .onChange(of: request) { _ in scheduleDraftPersistence() }
-    .onChange(of: requirements) { _ in
-      assistCompleted = false
+    .onChange(of: guide) { _ in
+      if !isAssisting {
+        if assistCompleted { discardGeneratedPlan() }
+        assistCompleted = false
+      }
       scheduleDraftPersistence()
     }
     .onChange(of: model.workflowJobs?.creationJobs) { jobs in
@@ -335,8 +295,290 @@ struct CreateBookSheet: View {
     .interactiveDismissDisabled(isSubmitting || isAssisting)
   }
 
+  private var guideProgress: some View {
+    HStack(spacing: 10) {
+      ForEach(GuideStep.allCases) { step in
+        HStack(spacing: 7) {
+          Image(systemName: step.rawValue < guideStep.rawValue
+            ? "checkmark.circle.fill"
+            : "\(step.rawValue + 1).circle.fill")
+            .foregroundStyle(step.rawValue <= guideStep.rawValue ? Color.accentColor : .secondary)
+          Text(step.title)
+            .font(.callout.weight(step == guideStep ? .semibold : .regular))
+            .foregroundStyle(step.rawValue <= guideStep.rawValue ? .primary : .secondary)
+            .lineLimit(1)
+          if step != GuideStep.allCases.last {
+            Rectangle()
+              .fill(step.rawValue < guideStep.rawValue ? Color.accentColor : Color.secondary.opacity(0.25))
+              .frame(minWidth: 24, maxWidth: .infinity, maxHeight: 1)
+          }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+      }
+    }
+    .accessibilityElement(children: .combine)
+    .accessibilityLabel("第 \(guideStep.rawValue + 1) 步，共 \(GuideStep.allCases.count) 步：\(guideStep.title)")
+  }
+
+  private var ideaQuestions: some View {
+    dialogSection("你想写一个什么故事？") {
+      Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
+        GridRow {
+          dialogField("这本小说暂定叫什么？", required: true) {
+            TextField("暂定名也可以", text: $guide.title)
+              .focused($titleFocused)
+          }
+          dialogField("主角叫什么？", required: true) {
+            TextField("填写主角姓名", text: $guide.protagonistName)
+          }
+        }
+        GridRow {
+          dialogField("它属于哪类故事？", required: true) {
+            Picker("故事类型", selection: $guide.genre) {
+              Text("玄幻").tag("xuanhuan")
+              Text("都市").tag("urban")
+              Text("奇幻").tag("fantasy")
+              Text("科幻").tag("sci-fi")
+              Text("同人").tag("fanfic")
+              Text("其他").tag("other")
+            }
+            .labelsHidden()
+          }
+          dialogField("准备发到哪里？", required: true) {
+            Picker("发布平台", selection: $guide.platform) {
+              Text("番茄").tag("tomato")
+              Text("起点").tag("qidian")
+              Text("晋江").tag("jjwxc")
+              Text("其他").tag("other")
+            }
+            .labelsHidden()
+          }
+        }
+      }
+      createTextArea(
+        "用自己的话讲讲故事",
+        placeholder: "例如：一个被逐出宗门的少年发现自己能修复失传功法，他想查清家族覆灭的真相。",
+        text: $guide.storyPremise,
+        minHeight: 100,
+        required: true
+      )
+      createTextArea(
+        "主角现在是什么处境，最想得到什么？",
+        placeholder: "例如：身无分文、修为尽失；他想救回妹妹，并让陷害家族的人付出代价。",
+        text: $guide.protagonistProfile,
+        minHeight: 82,
+        required: true
+      )
+    }
+  }
+
+  private var lengthQuestions: some View {
+    dialogSection("你准备写多长？") {
+      Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 14) {
+        GridRow {
+          dialogField("大约写多少章？", required: true) {
+            HStack(spacing: 6) {
+              TextField("章数", value: $guide.targetChapters, format: .number)
+                .textFieldStyle(.roundedBorder)
+                .monospacedDigit()
+              Text("章").foregroundStyle(.secondary)
+              Stepper("调整章数", value: $guide.targetChapters, in: 1...6_000)
+                .labelsHidden()
+                .fixedSize()
+            }
+          }
+          dialogField("每章大约多少字？", required: true) {
+            HStack(spacing: 6) {
+              TextField("每章字数", value: $guide.targetChapterWords, format: .number)
+                .textFieldStyle(.roundedBorder)
+                .monospacedDigit()
+              Text("字").foregroundStyle(.secondary)
+              Stepper("调整每章字数", value: $guide.targetChapterWords, in: 500...20_000, step: 100)
+                .labelsHidden()
+                .fixedSize()
+            }
+          }
+        }
+        GridRow {
+          dialogField("想分成几卷？", required: true) {
+            HStack(spacing: 6) {
+              TextField("分卷数", value: $guide.volumeCount, format: .number)
+                .textFieldStyle(.roundedBorder)
+                .monospacedDigit()
+              Text("卷").foregroundStyle(.secondary)
+              Stepper(
+                "调整分卷数",
+                value: $guide.volumeCount,
+                in: 1...max(1, min(100, guide.targetChapters))
+              )
+              .labelsHidden()
+              .fixedSize()
+            }
+          }
+          dialogField("预计总字数") {
+            Text("\(formatted(synchronizedGuide.targetTotalWords)) 字")
+              .font(.body.weight(.semibold).monospacedDigit())
+          }
+        }
+      }
+
+      Divider()
+
+      HStack(spacing: 24) {
+        projectionValue("章节数量", value: "\(formatted(guide.targetChapters)) 章")
+        projectionValue("平均每卷", value: averageChaptersPerVolume)
+        projectionValue("总字数", value: "\(formatted(synchronizedGuide.targetTotalWords)) 字")
+      }
+      .accessibilityElement(children: .combine)
+    }
+    .onChange(of: guide.targetChapters) { chapters in
+      guide.volumeCount = min(guide.volumeCount, max(1, min(100, chapters)))
+    }
+  }
+
+  @ViewBuilder
+  private var reviewAndSummary: some View {
+    if assistCompleted {
+      generatedPlanSummary
+    } else {
+      dialogSection("还有哪些要求是你已经决定的？") {
+        createTextArea(
+          "必须出现，或者一定不要出现的内容",
+          placeholder: "例如：感情线慢热；主角不无代价越级；不写系统流。没有额外要求可以留空。",
+          text: specialConstraintsText,
+          minHeight: 92
+        )
+        createTextArea(
+          "希望读起来是什么感觉？",
+          placeholder: "例如：轻松热血、悬疑压迫、群像成长。留空时由 LLM 根据题材决定。",
+          text: $guide.style,
+          minHeight: 72
+        )
+
+        HStack(spacing: 10) {
+          NativeActionButton(prominence: .prominent) {
+            assistCreation()
+          } label: {
+            Label(isAssisting ? "正在整理" : "让 LLM 整理小说方案", systemImage: "wand.and.stars")
+          }
+          .disabled(validationMessage != nil || isAssisting || isSubmitting || pendingCreationJobID != nil)
+          if isAssisting {
+            ProgressView().controlSize(.small)
+            Text("正在整理人物、世界、主线和分卷")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+          }
+        }
+      }
+    }
+  }
+
+  private var generatedPlanSummary: some View {
+    dialogSection("LLM 整理结果") {
+      Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 6) {
+        GridRow {
+          projectionValue("小说", value: request.title)
+          projectionValue("规模", value: "\(formatted(request.derivedTargetChapters)) 章 · \(request.volumeCount) 卷")
+        }
+        GridRow {
+          projectionValue("题材", value: genreLabel(request.genre))
+          projectionValue("预计总字数", value: "\(formatted(request.targetTotalWords)) 字")
+        }
+      }
+
+      Divider()
+      summarySection("故事简介", text: request.premise)
+      Divider()
+      summarySection("主要人物", text: request.characters)
+      Divider()
+      summarySection("故事主线", text: request.outline)
+      Divider()
+      summarySection("分卷安排", text: request.volumePlan)
+
+      DisclosureGroup("世界设定与写作风格") {
+        VStack(alignment: .leading, spacing: 12) {
+          summarySection("世界设定", text: request.worldbuilding)
+          summarySection("节奏", text: request.pacing)
+          summarySection("风格", text: request.style)
+        }
+        .padding(.top, 8)
+      }
+
+      HStack(spacing: 10) {
+        Button {
+          discardGeneratedPlan()
+          assistCompleted = false
+          guideStep = .idea
+        } label: {
+          Label("修改回答", systemImage: "pencil")
+        }
+        Button {
+          assistCreation()
+        } label: {
+          Label("重新整理", systemImage: "arrow.clockwise")
+        }
+        .disabled(isAssisting || isSubmitting)
+      }
+    }
+  }
+
+  private func summarySection(_ title: String, text: String) -> some View {
+    VStack(alignment: .leading, spacing: 5) {
+      Text(title)
+        .font(.callout.weight(.semibold))
+      Text(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .textSelection(.enabled)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+
+  private var averageChaptersPerVolume: String {
+    let volumes = max(guide.volumeCount, 1)
+    let lower = guide.targetChapters / volumes
+    let upper = (guide.targetChapters + volumes - 1) / volumes
+    return lower == upper ? "\(lower) 章" : "\(lower)–\(upper) 章"
+  }
+
+  private func genreLabel(_ genre: String) -> String {
+    switch genre {
+    case "xuanhuan": return "玄幻"
+    case "urban": return "都市"
+    case "fantasy": return "奇幻"
+    case "sci-fi": return "科幻"
+    case "fanfic": return "同人"
+    default: return "其他"
+    }
+  }
+
+  private func moveForward() {
+    guard currentStepValidationMessage == nil,
+      let next = GuideStep(rawValue: guideStep.rawValue + 1)
+    else { return }
+    guideStep = next
+  }
+
+  private func moveBackward() {
+    guard let previous = GuideStep(rawValue: guideStep.rawValue - 1) else { return }
+    guideStep = previous
+  }
+
+  private func discardGeneratedPlan() {
+    request.premise = ""
+    request.characters = ""
+    request.worldbuilding = ""
+    request.outline = ""
+    request.volumePlan = ""
+    request.pacing = ""
+    request.style = ""
+    request.constraints = ""
+  }
+
   private func submit() {
     guard canSubmit else { return }
+    request = projectedRequest
     request.title = request.title.trimmingCharacters(in: .whitespacesAndNewlines)
     request.synchronizeLongFormFields()
     persistDraftImmediately()
@@ -351,6 +593,7 @@ struct CreateBookSheet: View {
           draftPersistenceTask = nil
           pendingCreationJobID = nil
           request = .init()
+          guide = .init()
           requirements = ""
           assistCompleted = false
           CreateBookDraftPersistence.clear()
@@ -363,15 +606,16 @@ struct CreateBookSheet: View {
   }
 
   private func assistCreation() {
-    let trimmed = requirements.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty, !isAssisting else { return }
+    guard validationMessage == nil, !isAssisting else { return }
+    model.clearError()
     persistDraftImmediately()
     isAssisting = true
     assistCompleted = false
     Task {
-      if let generated = await model.assistCreateBook(requirements: trimmed) {
-        request = generated
+      if let generated = await model.assistCreateBook(guide: synchronizedGuide) {
+        request = generated.payload
         assistCompleted = true
+        guideStep = .review
         persistDraftImmediately()
       }
       isAssisting = false
@@ -380,7 +624,7 @@ struct CreateBookSheet: View {
 
   private func scheduleDraftPersistence() {
     draftPersistenceTask?.cancel()
-    let request = request
+    let request = projectedRequest
     let requirements = requirements
     draftPersistenceTask = Task { @MainActor in
       do {
@@ -396,7 +640,8 @@ struct CreateBookSheet: View {
   private func persistDraftImmediately() {
     draftPersistenceTask?.cancel()
     draftPersistenceTask = nil
-    if request == CreateBookRequest(), requirements.isEmpty, pendingCreationJobID == nil {
+    let request = projectedRequest
+    if request == CreateBookRequest(), guide == CreateBookGuide(), pendingCreationJobID == nil {
       CreateBookDraftPersistence.clear()
     } else {
       CreateBookDraftPersistence.saveDraft(request: request, requirements: requirements)
@@ -413,6 +658,7 @@ struct CreateBookSheet: View {
       draftPersistenceTask?.cancel()
       draftPersistenceTask = nil
       request = .init()
+      guide = .init()
       requirements = ""
       assistCompleted = false
     }
@@ -460,73 +706,6 @@ struct CreateBookSheet: View {
     }
   }
 
-  private var longFormProjection: some View {
-    let chapterRange = request.chapterWordRange
-    let chapterCount = request.derivedTargetChapters
-    let volumes = projectedVolumes
-    let lowerChapterBudget = volumes.map(\.chapterCount).min() ?? 0
-    let upperChapterBudget = volumes.map(\.chapterCount).max() ?? 0
-    let lowerWordBudget = volumes.map(\.targetWords).min() ?? 0
-    let upperWordBudget = volumes.map(\.targetWords).max() ?? 0
-
-    return AdaptiveGlassSurface(padding: 12, tint: .accentColor.opacity(0.08)) {
-      VStack(alignment: .leading, spacing: 10) {
-        Grid(alignment: .leading, horizontalSpacing: 22, verticalSpacing: 6) {
-          GridRow {
-            projectionValue("推导章节", value: "\(chapterCount) 章")
-            projectionValue(
-              "每卷章节",
-              value: lowerChapterBudget == upperChapterBudget
-                ? "\(lowerChapterBudget) 章"
-                : "\(lowerChapterBudget)–\(upperChapterBudget) 章"
-            )
-          }
-          GridRow {
-            projectionValue(
-              "单章范围",
-              value: "\(formatted(chapterRange.lowerBound))–\(formatted(chapterRange.upperBound)) 字"
-            )
-            projectionValue(
-              "每卷字数",
-              value: lowerWordBudget == upperWordBudget
-                ? "\(formatted(lowerWordBudget)) 字"
-                : "\(formatted(lowerWordBudget))–\(formatted(upperWordBudget)) 字"
-            )
-          }
-        }
-
-        Divider()
-
-        ScrollView {
-          LazyVStack(spacing: 5) {
-            ForEach(volumes) { volume in
-              HStack(spacing: 10) {
-                Text("第 \(volume.number) 卷")
-                  .frame(width: 58, alignment: .leading)
-                Text("\(volume.startChapter)–\(volume.endChapter) 章")
-                  .frame(width: 88, alignment: .leading)
-                Text("\(volume.chapterCount) 章")
-                  .frame(width: 58, alignment: .trailing)
-                Spacer(minLength: 8)
-                Text("\(formatted(volume.targetWords)) 字")
-                  .frame(minWidth: 88, alignment: .trailing)
-              }
-              .font(.caption.monospacedDigit())
-              .foregroundStyle(.secondary)
-              .accessibilityElement(children: .combine)
-            }
-          }
-        }
-        .frame(maxHeight: 140)
-      }
-      .frame(maxWidth: .infinity, alignment: .leading)
-    }
-    .accessibilityElement(children: .combine)
-    .accessibilityLabel(
-      "推导 \(chapterCount) 章，每卷 \(lowerChapterBudget) 至 \(upperChapterBudget) 章，单章 \(chapterRange.lowerBound) 至 \(chapterRange.upperBound) 字"
-    )
-  }
-
   private func projectionValue(_ title: String, value: String) -> some View {
     VStack(alignment: .leading, spacing: 2) {
       Text(title)
@@ -542,32 +721,6 @@ struct CreateBookSheet: View {
     value.formatted(.number.grouping(.automatic))
   }
 
-  private var projectedVolumes: [ProjectedVolume] {
-    let chapterCount = request.derivedTargetChapters
-    guard chapterCount > 0, request.targetTotalWords > 0 else { return [] }
-    let volumeCount = min(max(request.volumeCount, 1), chapterCount)
-    let chaptersPerVolume = chapterCount / volumeCount
-    let extraVolumeChapters = chapterCount % volumeCount
-    let wordsPerChapter = request.targetTotalWords / chapterCount
-    let extraChapterWords = request.targetTotalWords % chapterCount
-    var nextChapter = 1
-
-    return (0..<volumeCount).map { index in
-      let count = chaptersPerVolume + (index < extraVolumeChapters ? 1 : 0)
-      let start = nextChapter
-      let end = start + count - 1
-      let extraWords = max(0, min(end, extraChapterWords) - start + 1)
-      let words = count * wordsPerChapter + extraWords
-      nextChapter = end + 1
-      return ProjectedVolume(
-        number: index + 1,
-        startChapter: start,
-        endChapter: end,
-        chapterCount: count,
-        targetWords: words
-      )
-    }
-  }
 }
 
 struct ImportBookSheet: View {

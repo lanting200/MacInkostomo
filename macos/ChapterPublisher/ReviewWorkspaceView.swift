@@ -14,14 +14,22 @@ struct ReviewWorkspaceView: View {
     HSplitView {
       bookSidebar
         .frame(minWidth: 190, idealWidth: 220, maxWidth: 280)
+        .background(NativeTheme.cardGlass, in: .rect(cornerRadius: NativeLayout.cardCornerRadius))
+        .clipShape(.rect(cornerRadius: NativeLayout.cardCornerRadius))
+        .padding(EdgeInsets(top: 12, leading: 12, bottom: 12, trailing: 6))
 
       chapterSidebar
         .frame(minWidth: 230, idealWidth: 285, maxWidth: 360)
+        .background(NativeTheme.cardGlass, in: .rect(cornerRadius: NativeLayout.cardCornerRadius))
+        .clipShape(.rect(cornerRadius: NativeLayout.cardCornerRadius))
+        .padding(EdgeInsets(top: 12, leading: 6, bottom: 12, trailing: 6))
 
       chapterDetail
         .frame(minWidth: 400, maxWidth: .infinity, maxHeight: .infinity)
+        .background(NativeTheme.cardGlass, in: .rect(cornerRadius: NativeLayout.cardCornerRadius))
+        .clipShape(.rect(cornerRadius: NativeLayout.cardCornerRadius))
+        .padding(EdgeInsets(top: 12, leading: 6, bottom: 12, trailing: 12))
     }
-    .background(Color(nsColor: .underPageBackgroundColor))
     .sheet(isPresented: $showingCreateBook) {
       CreateBookSheet(model: model)
     }
@@ -114,9 +122,8 @@ struct ReviewWorkspaceView: View {
       }
       .padding(.horizontal, 14)
       .frame(height: NativeLayout.workspaceFooterHeight)
-      .background(.bar)
+      .background(NativeTheme.cardGlass)
     }
-    .background(Color(nsColor: .controlBackgroundColor).opacity(0.38))
   }
 
   private var chapterSidebar: some View {
@@ -150,6 +157,10 @@ struct ReviewWorkspaceView: View {
             detail: "从左侧书库选择一本小说查看章节。",
             systemImage: "rectangle.and.hand.point.up.left"
           )
+        } else if let job = currentGenerationJob, model.chapters.isEmpty {
+          ActiveChapterGenerationView(job: job) {
+            Task { await model.selectSection(.activity) }
+          }
         } else if model.chapters.isEmpty {
           NativeEmptyState(
             title: "还没有章节",
@@ -198,9 +209,8 @@ struct ReviewWorkspaceView: View {
       }
       .padding(.horizontal, 14)
       .frame(height: NativeLayout.workspaceFooterHeight)
-      .background(.bar)
+      .background(NativeTheme.cardGlass)
     }
-    .background(Color(nsColor: .controlBackgroundColor).opacity(0.22))
   }
 
   @ViewBuilder
@@ -209,10 +219,21 @@ struct ReviewWorkspaceView: View {
       ChapterReviewDetail(
         chapter: chapter,
         isMutating: model.isMutating,
+        generationJob: currentGenerationJob,
         approve: { Task { await model.approveCurrentChapter() } },
         reject: { showingReject = true },
-        generate: { showingGenerate = true }
+        generate: { showingGenerate = true },
+        showActivity: { Task { await model.selectSection(.activity) } }
       )
+    } else if let job = currentGenerationJob {
+      ReviewDetailPlaceholder(
+        title: "正在生成第 \(job.chapterNum) 章",
+        detail: job.message ?? "章节生成任务运行中"
+      ) {
+        ActiveChapterGenerationView(job: job) {
+          Task { await model.selectSection(.activity) }
+        }
+      }
     } else if model.isLoading, model.currentChapterNumber != nil {
       ReviewDetailPlaceholder(title: "章节审核", detail: "正在加载章节") {
         VStack(spacing: 12) {
@@ -265,7 +286,13 @@ struct ReviewWorkspaceView: View {
 
   private var chapterHeaderSubtitle: String {
     guard model.currentBookID != nil else { return "选择作品后显示" }
-    return "\(model.chapters.count) 章 · 待审 \(selectedBook?.pendingReview ?? 0)"
+    let base = "\(model.chapters.count) 章 · 待审 \(selectedBook?.pendingReview ?? 0)"
+    return currentGenerationJob == nil ? base : "\(base) · 正在生成"
+  }
+
+  private var currentGenerationJob: GenerationJob? {
+    guard let bookID = model.currentBookID else { return nil }
+    return model.activeGenerationJobs.first { $0.bookId == bookID }
   }
 
   private var bookSelection: Binding<String?> {
@@ -372,9 +399,11 @@ private struct ChapterSidebarRow: View {
 private struct ChapterReviewDetail: View {
   let chapter: ChapterDetail
   let isMutating: Bool
+  let generationJob: GenerationJob?
   let approve: () -> Void
   let reject: () -> Void
   let generate: () -> Void
+  let showActivity: () -> Void
 
   private var canApprove: Bool {
     ["ready-for-review", "audit-passed", "drafted", "pending_review"].contains(chapter.status)
@@ -401,12 +430,26 @@ private struct ChapterReviewDetail: View {
       Divider()
 
       HStack(spacing: 8) {
-        NativeActionButton(action: generate) {
-          Label("生成下一章", systemImage: "wand.and.stars")
+        if let generationJob {
+          ProgressView()
+            .controlSize(.small)
+          VStack(alignment: .leading, spacing: 1) {
+            Text("正在生成第 \(generationJob.chapterNum) 章")
+              .font(.callout.weight(.medium))
+            Text(generationJob.message ?? generationJob.phase)
+              .font(.caption)
+              .foregroundStyle(.secondary)
+              .lineLimit(1)
+          }
+          Button("查看任务", action: showActivity)
+        } else {
+          NativeActionButton(action: generate) {
+            Label("生成下一章", systemImage: "wand.and.stars")
+          }
+          .keyboardShortcut("g", modifiers: .command)
+          .disabled(isMutating)
+          .help("生成下一章（Command-G）")
         }
-        .keyboardShortcut("g", modifiers: .command)
-        .disabled(isMutating)
-        .help("生成下一章（Command-G）")
 
         Spacer(minLength: 8)
 
@@ -427,9 +470,34 @@ private struct ChapterReviewDetail: View {
       .controlSize(.regular)
       .padding(.horizontal, 14)
       .frame(height: NativeLayout.workspaceFooterHeight)
-      .background(.bar)
+      .background(NativeTheme.cardGlass)
     }
     .background(Color(nsColor: .textBackgroundColor))
+  }
+}
+
+private struct ActiveChapterGenerationView: View {
+  let job: GenerationJob
+  let showActivity: () -> Void
+
+  var body: some View {
+    VStack(spacing: 12) {
+      ProgressView()
+        .controlSize(.large)
+      Text("正在生成第 \(job.chapterNum) 章")
+        .font(.headline)
+      Text(job.message ?? job.phase)
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .multilineTextAlignment(.center)
+      Button(action: showActivity) {
+        Label("查看任务", systemImage: "list.bullet.rectangle")
+      }
+    }
+    .padding(20)
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+    .accessibilityElement(children: .combine)
+    .accessibilityLabel("正在生成第 \(job.chapterNum) 章，\(job.message ?? job.phase)")
   }
 }
 
@@ -481,7 +549,7 @@ private struct ReviewDetailPlaceholder<Content: View>: View {
 
       Color.clear
         .frame(height: NativeLayout.workspaceFooterHeight)
-        .background(.bar)
+        .background(NativeTheme.cardGlass)
     }
     .background(Color(nsColor: .textBackgroundColor))
   }
@@ -771,6 +839,26 @@ private struct ReviewStatusPopoverContent: View {
           }
         }
 
+        if !review.craftAdvisoryList.isEmpty {
+          Divider()
+          VStack(alignment: .leading, spacing: 7) {
+            Text("写法建议（不阻断交付）")
+              .font(.caption.weight(.semibold))
+              .foregroundStyle(.secondary)
+            ForEach(Array(review.craftAdvisoryList.enumerated()), id: \.offset) { index, advisory in
+              HStack(alignment: .top, spacing: 7) {
+                Text("\(index + 1).")
+                  .font(.caption.monospacedDigit())
+                  .foregroundStyle(.secondary)
+                Text(cleanIssue(advisory))
+                  .font(.callout)
+                  .fixedSize(horizontal: false, vertical: true)
+                  .textSelection(.enabled)
+              }
+            }
+          }
+        }
+
         if let guidance = review.revisionGuidance, !guidance.isEmpty {
           DisclosureGroup("修改建议") {
             Text(guidance)
@@ -789,7 +877,7 @@ private struct ReviewStatusPopoverContent: View {
 
   private func cleanIssue(_ issue: String) -> String {
     issue.replacingOccurrences(
-      of: #"^\s*\[(critical|warning|info|error)\]\s*"#,
+      of: #"^\s*\[(critical|warning|info|error|hard|soft|advisory|建议)\]\s*"#,
       with: "",
       options: [.regularExpression, .caseInsensitive]
     )
@@ -879,6 +967,8 @@ private struct RejectChapterSheet: View {
   @FocusState private var editorFocused: Bool
   @State private var note = ""
   @State private var isSubmitting = false
+  @State private var monitorBookID: String?
+  @State private var monitorChapterNumber: Int?
 
   var body: some View {
     VStack(spacing: 0) {
@@ -888,7 +978,7 @@ private struct RejectChapterSheet: View {
           .foregroundStyle(.orange)
           .accessibilityHidden(true)
         VStack(alignment: .leading, spacing: 2) {
-          Text("提交修改意见")
+          Text(isMonitoring ? "正在修改章节" : "提交修改意见")
             .font(.title3.weight(.semibold))
           if let chapter = model.currentChapter {
             Text("第\(chapter.number)章 \(chapter.title)")
@@ -907,49 +997,86 @@ private struct RejectChapterSheet: View {
         NativeErrorBanner(message: errorMessage, dismiss: model.clearError)
       }
 
-      VStack(alignment: .leading, spacing: 8) {
-        Text("明确说明需要修改的问题、预期结果以及必须保留的内容。")
-          .font(.callout)
-          .foregroundStyle(.secondary)
-        TextEditor(text: $note)
-          .font(.body)
-          .focused($editorFocused)
-          .scrollContentBackground(.hidden)
-          .padding(6)
-          .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 6))
-          .overlay { RoundedRectangle(cornerRadius: 6).stroke(.quaternary) }
-          .accessibilityLabel("章节修改意见")
+      if isMonitoring {
+        ChapterWorkflowMonitorView(
+          job: monitoredJob,
+          mode: .revision,
+          chapterNumber: monitorChapterNumber ?? model.currentChapterNumber ?? 0
+        )
+      } else {
+        VStack(alignment: .leading, spacing: 8) {
+          Text("明确说明需要修改的问题、预期结果以及必须保留的内容。")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+          TextEditor(text: $note)
+            .font(.body)
+            .focused($editorFocused)
+            .scrollContentBackground(.hidden)
+            .padding(6)
+            .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 6))
+            .overlay { RoundedRectangle(cornerRadius: 6).stroke(.quaternary) }
+            .accessibilityLabel("章节修改意见")
+        }
+        .padding(16)
+        .frame(minHeight: 210)
       }
-      .padding(16)
-      .frame(minHeight: 210)
 
       Divider()
 
       HStack(spacing: 10) {
-        Text("InkOS 将根据意见重写本章，并重新进入审核流程。")
-          .font(.caption)
-          .foregroundStyle(.secondary)
-        Spacer()
-        Button("取消") { dismiss() }
-          .keyboardShortcut(.cancelAction)
-          .disabled(isSubmitting)
-        NativeActionButton(prominence: .prominent) {
-          submit()
-        } label: {
-          Label(isSubmitting ? "正在提交" : "提交修改", systemImage: "paperplane")
+        if isMonitoring {
+          Text(monitoredJob?.isActive == false ? "修改流程已结束" : "关闭窗口后任务继续运行")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        } else {
+          Text("InkOS 将根据意见重写本章，并重新进入审核流程。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
-        .disabled(note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSubmitting)
-        .keyboardShortcut(.defaultAction)
+        Spacer()
+        if isMonitoring {
+          Button(monitoredJob?.isActive == false ? "关闭" : "后台运行") { dismiss() }
+            .keyboardShortcut(.defaultAction)
+        } else {
+          Button("取消") { dismiss() }
+            .keyboardShortcut(.cancelAction)
+            .disabled(isSubmitting)
+          NativeActionButton(prominence: .prominent) {
+            submit()
+          } label: {
+            Label(isSubmitting ? "正在提交" : "提交修改", systemImage: "paperplane")
+          }
+          .disabled(note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSubmitting)
+          .keyboardShortcut(.defaultAction)
+        }
       }
       .padding(14)
     }
-    .frame(minWidth: 560, minHeight: 340)
+    .frame(minWidth: isMonitoring ? 620 : 560, minHeight: isMonitoring ? 540 : 340)
     .onAppear {
       model.clearError()
       note = suggestedRevisionNote
       editorFocused = true
     }
     .interactiveDismissDisabled(isSubmitting)
+    .task(id: monitorID) {
+      guard isMonitoring else { return }
+      await monitorWorkflow()
+    }
+  }
+
+  private var isMonitoring: Bool { monitorBookID != nil && monitorChapterNumber != nil }
+
+  private var monitorID: String {
+    guard let monitorBookID, let monitorChapterNumber else { return "" }
+    return "\(monitorBookID)#\(monitorChapterNumber)"
+  }
+
+  private var monitoredJob: GenerationJob? {
+    guard let monitorBookID, let monitorChapterNumber else { return nil }
+    return model.workflowJobs?.generationJobs
+      .filter { $0.bookId == monitorBookID && $0.chapterNum == monitorChapterNumber }
+      .max { ($0.startedAt ?? "") < ($1.startedAt ?? "") }
   }
 
   private var suggestedRevisionNote: String {
@@ -970,14 +1097,38 @@ private struct RejectChapterSheet: View {
 
   private func submit() {
     let trimmed = note.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else { return }
+    guard !trimmed.isEmpty,
+      let bookID = model.currentBookID,
+      let chapterNumber = model.currentChapterNumber
+    else { return }
     isSubmitting = true
     Task {
       let response = await model.rejectCurrentChapter(note: trimmed, mode: "rewrite")
       isSubmitting = false
       if response != nil {
-        dismiss()
+        monitorBookID = bookID
+        monitorChapterNumber = chapterNumber
+        await model.refreshWorkflowJobs()
       }
+    }
+  }
+
+  private func monitorWorkflow() async {
+    var missingPolls = 0
+    while !Task.isCancelled {
+      await model.refreshWorkflowJobs()
+      if let monitoredJob {
+        missingPolls = 0
+        if !monitoredJob.isActive {
+          await model.refreshChapters()
+          return
+        }
+      } else {
+        missingPolls += 1
+        if missingPolls >= 20 { return }
+      }
+      do { try await Task.sleep(nanoseconds: 750_000_000) }
+      catch { return }
     }
   }
 }
@@ -988,6 +1139,8 @@ private struct GenerateChapterSheet: View {
   @FocusState private var editorFocused: Bool
   @State private var guidance = ""
   @State private var isSubmitting = false
+  @State private var monitorBookID: String?
+  @State private var monitorChapterNumber: Int?
 
   var body: some View {
     VStack(spacing: 0) {
@@ -997,7 +1150,7 @@ private struct GenerateChapterSheet: View {
           .foregroundStyle(.purple)
           .accessibilityHidden(true)
         VStack(alignment: .leading, spacing: 2) {
-          Text("生成新章节")
+          Text(isMonitoring ? "章节生成进度" : "生成新章节")
             .font(.title3.weight(.semibold))
           Text(nextChapterLabel)
             .font(.caption)
@@ -1013,56 +1166,87 @@ private struct GenerateChapterSheet: View {
         NativeErrorBanner(message: errorMessage, dismiss: model.clearError)
       }
 
-      VStack(alignment: .leading, spacing: 8) {
-        Text("本章方向（可选）")
-          .font(.callout.weight(.medium))
-        ZStack(alignment: .topLeading) {
-          if guidance.isEmpty {
-            Text("例如：推进当前冲突，引入关键线索，侧重人物对话")
-              .font(.callout)
-              .foregroundStyle(.tertiary)
-              .padding(10)
-              .allowsHitTesting(false)
+      if isMonitoring {
+        ChapterWorkflowMonitorView(
+          job: monitoredJob,
+          mode: .generation,
+          chapterNumber: monitorChapterNumber ?? model.chapterContext?.nextChapterNum ?? 0
+        )
+      } else {
+        VStack(alignment: .leading, spacing: 8) {
+          Text("本章方向（可选）")
+            .font(.callout.weight(.medium))
+          ZStack(alignment: .topLeading) {
+            if guidance.isEmpty {
+              Text("例如：推进当前冲突，引入关键线索，侧重人物对话")
+                .font(.callout)
+                .foregroundStyle(.tertiary)
+                .padding(10)
+                .allowsHitTesting(false)
+            }
+            TextEditor(text: $guidance)
+              .font(.body)
+              .focused($editorFocused)
+              .scrollContentBackground(.hidden)
+              .padding(6)
           }
-          TextEditor(text: $guidance)
-            .font(.body)
-            .focused($editorFocused)
-            .scrollContentBackground(.hidden)
-            .padding(6)
+          .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 6))
+          .overlay { RoundedRectangle(cornerRadius: 6).stroke(.quaternary) }
+          .accessibilityLabel("新章节生成方向")
+          Text("InkOS 会遵循作品设定、大纲、分卷和已有剧情。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
-        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 6))
-        .overlay { RoundedRectangle(cornerRadius: 6).stroke(.quaternary) }
-        .accessibilityLabel("新章节生成方向")
-        Text("InkOS 会遵循作品设定、大纲、分卷和已有剧情。")
-          .font(.caption)
-          .foregroundStyle(.secondary)
+        .padding(16)
+        .frame(minHeight: 190)
       }
-      .padding(16)
-      .frame(minHeight: 190)
 
       Divider()
 
       HStack(spacing: 10) {
         Spacer()
-        Button("取消") { dismiss() }
-          .keyboardShortcut(.cancelAction)
-          .disabled(isSubmitting)
-        NativeActionButton(prominence: .prominent) {
-          submit()
-        } label: {
-          Label(isSubmitting ? "正在启动" : "开始生成", systemImage: "play.fill")
+        if isMonitoring {
+          Button(monitoredJob?.isActive == false ? "关闭" : "后台运行") { dismiss() }
+            .keyboardShortcut(.defaultAction)
+        } else {
+          Button("取消") { dismiss() }
+            .keyboardShortcut(.cancelAction)
+            .disabled(isSubmitting)
+          NativeActionButton(prominence: .prominent) {
+            submit()
+          } label: {
+            Label(isSubmitting ? "正在启动" : "开始生成", systemImage: "play.fill")
+          }
+          .disabled(model.currentBookID == nil || isSubmitting)
+          .keyboardShortcut(.defaultAction)
         }
-        .disabled(model.currentBookID == nil || isSubmitting)
-        .keyboardShortcut(.defaultAction)
       }
       .padding(14)
     }
-    .frame(minWidth: 540, minHeight: 320)
+    .frame(minWidth: isMonitoring ? 620 : 540, minHeight: isMonitoring ? 540 : 320)
     .onAppear {
       model.clearError()
       editorFocused = true
     }
     .interactiveDismissDisabled(isSubmitting)
+    .task(id: monitorID) {
+      guard isMonitoring else { return }
+      await monitorWorkflow()
+    }
+  }
+
+  private var isMonitoring: Bool { monitorBookID != nil && monitorChapterNumber != nil }
+
+  private var monitorID: String {
+    guard let monitorBookID, let monitorChapterNumber else { return "" }
+    return "\(monitorBookID)#\(monitorChapterNumber)"
+  }
+
+  private var monitoredJob: GenerationJob? {
+    guard let monitorBookID, let monitorChapterNumber else { return nil }
+    return model.workflowJobs?.generationJobs
+      .filter { $0.bookId == monitorBookID && $0.chapterNum == monitorChapterNumber }
+      .max { ($0.startedAt ?? "") < ($1.startedAt ?? "") }
   }
 
   private var nextChapterLabel: String {
@@ -1073,15 +1257,178 @@ private struct GenerateChapterSheet: View {
   }
 
   private func submit() {
-    guard model.currentBookID != nil else { return }
+    guard let bookID = model.currentBookID else { return }
+    let chapterNumber = model.chapterContext?.nextChapterNum
+      ?? ((model.chapters.map(\.number).max() ?? 0) + 1)
     isSubmitting = true
     let trimmed = guidance.trimmingCharacters(in: .whitespacesAndNewlines)
     Task {
       let response = await model.generateNextChapter(guidance: trimmed)
       isSubmitting = false
       if response != nil {
-        dismiss()
+        monitorBookID = bookID
+        monitorChapterNumber = chapterNumber
+        await model.refreshWorkflowJobs()
       }
     }
+  }
+
+  private func monitorWorkflow() async {
+    var missingPolls = 0
+    while !Task.isCancelled {
+      await model.refreshWorkflowJobs()
+      if let monitoredJob {
+        missingPolls = 0
+        if !monitoredJob.isActive {
+          await model.refreshChapters()
+          return
+        }
+      } else {
+        missingPolls += 1
+        if missingPolls >= 20 { return }
+      }
+      do { try await Task.sleep(nanoseconds: 750_000_000) }
+      catch { return }
+    }
+  }
+}
+
+private struct ChapterWorkflowMonitorView: View {
+  enum Mode {
+    case generation
+    case revision
+
+    var stages: [String] {
+      switch self {
+      case .generation: return ["准备", "写作", "一致性初审", "完成"]
+      case .revision: return ["准备", "修改", "一致性初审", "完成"]
+      }
+    }
+  }
+
+  let job: GenerationJob?
+  let mode: Mode
+  let chapterNumber: Int
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 14) {
+      HStack(alignment: .firstTextBaseline, spacing: 10) {
+        VStack(alignment: .leading, spacing: 2) {
+          Text("第 \(chapterNumber) 章")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+          Text(job?.message ?? "正在建立任务")
+            .font(.headline)
+        }
+        Spacer()
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+          Text(elapsedText(at: context.date))
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
+        }
+      }
+
+      HStack(spacing: 8) {
+        ForEach(Array(mode.stages.enumerated()), id: \.offset) { index, label in
+          VStack(spacing: 5) {
+            stageMarker(index)
+              .frame(width: 22, height: 22)
+            Text(label)
+              .font(.caption2)
+              .foregroundStyle(index <= activeStage ? .primary : .secondary)
+              .lineLimit(1)
+          }
+          .frame(maxWidth: .infinity)
+          if index < mode.stages.count - 1 {
+            Rectangle()
+              .fill(index < activeStage ? Color.green : Color.secondary.opacity(0.25))
+              .frame(maxWidth: 54, maxHeight: 1)
+              .offset(y: -9)
+          }
+        }
+      }
+      .frame(height: 46)
+
+      Divider()
+
+      HStack {
+        Text("LLM 实时输出")
+          .font(.callout.weight(.semibold))
+        Spacer()
+        Text(job?.liveTextTruncated == true ? "显示最新片段" : "生成内容尚未审核")
+          .font(.caption2)
+          .foregroundStyle(.secondary)
+      }
+
+      ScrollViewReader { proxy in
+        ScrollView {
+          Text(liveText)
+            .font(.body)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .fixedSize(horizontal: false, vertical: true)
+          Color.clear.frame(height: 1).id("stream-end")
+        }
+        .onChange(of: job?.liveText) { _ in
+          proxy.scrollTo("stream-end", anchor: .bottom)
+        }
+      }
+      .padding(10)
+      .background(Color(nsColor: .textBackgroundColor))
+      .overlay { RoundedRectangle(cornerRadius: 6).stroke(.quaternary) }
+
+      if let error = job?.error, !error.isEmpty {
+        Label(error, systemImage: "exclamationmark.triangle.fill")
+          .font(.caption)
+          .foregroundStyle(.red)
+          .textSelection(.enabled)
+      }
+    }
+    .padding(16)
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+  }
+
+  private var liveText: String {
+    if let text = job?.liveText, !text.isEmpty { return text }
+    if job?.phase == "reviewing" { return "正文生成完成，正在执行一致性初审。" }
+    if job?.isActive == false { return job?.error ?? "任务已完成。" }
+    return "正在等待模型返回正文片段…"
+  }
+
+  private var activeStage: Int {
+    guard let job else { return 0 }
+    if !job.isActive { return 3 }
+    switch job.phase {
+    case "writing", "revising": return 1
+    case "reviewing", "llm_reviewing", "llm_fixing": return 2
+    case "ready-for-review", "revision_failed": return 3
+    default: return 0
+    }
+  }
+
+  @ViewBuilder
+  private func stageMarker(_ index: Int) -> some View {
+    if isFailed, index == activeStage {
+      Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.red)
+    } else if index < activeStage || (job?.isActive == false && !isFailed) {
+      Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+    } else if index == activeStage, job?.isActive != false {
+      ProgressView().controlSize(.small)
+    } else {
+      Image(systemName: "\(index + 1).circle").foregroundStyle(.secondary)
+    }
+  }
+
+  private var isFailed: Bool {
+    guard let job else { return false }
+    return job.error != nil || ["error", "failed", "revision_failed"].contains(job.phase)
+  }
+
+  private func elapsedText(at date: Date) -> String {
+    guard let startedAt = job?.startedAt,
+      let started = ISO8601DateFormatter().date(from: startedAt)
+    else { return "00:00" }
+    let elapsed = max(0, Int(date.timeIntervalSince(started)))
+    return String(format: "%02d:%02d", elapsed / 60, elapsed % 60)
   }
 }

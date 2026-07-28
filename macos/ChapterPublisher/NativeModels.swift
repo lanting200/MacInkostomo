@@ -149,6 +149,8 @@ struct LLMReview: Codable, Hashable, Sendable {
   let model: String?
   let summary: String?
   let issues: [String]?
+  /// Craft findings that did not block delivery to manual review.
+  let craftAdvisories: [String]?
   let revisionGuidance: String?
   let reviewedAt: String?
   let autoFixed: Bool?
@@ -156,6 +158,7 @@ struct LLMReview: Codable, Hashable, Sendable {
   let attempts: [ReviewAttempt]?
 
   var issueList: [String] { issues ?? [] }
+  var craftAdvisoryList: [String] { craftAdvisories ?? [] }
   var isPassed: Bool { status == "passed" }
   var isBusy: Bool {
     ["inkos_writing", "inkos_revising", "reviewing", "fixing"].contains(status)
@@ -794,7 +797,7 @@ struct LongFormContinuityPolicy: Codable, Equatable, Sendable {
   init(
     requireContinuousVolumes: Bool = true,
     allowUnplannedEntities: Bool = true,
-    requireConsistencyDelta: Bool = false,
+    requireConsistencyDelta: Bool = true,
     checkpointAtVolumeEnd: Bool = true
   ) {
     self.requireContinuousVolumes = requireContinuousVolumes
@@ -815,7 +818,7 @@ struct LongFormContinuityPolicy: Codable, Equatable, Sendable {
     allowUnplannedEntities = try values.decodeIfPresent(
       Bool.self, forKey: .allowUnplannedEntities) ?? true
     requireConsistencyDelta = try values.decodeIfPresent(
-      Bool.self, forKey: .requireConsistencyDelta) ?? false
+      Bool.self, forKey: .requireConsistencyDelta) ?? true
     checkpointAtVolumeEnd = try values.decodeIfPresent(
       Bool.self, forKey: .checkpointAtVolumeEnd) ?? true
   }
@@ -830,6 +833,20 @@ struct LongFormImmutableCanon: Codable, Equatable, Sendable {
 
   private enum CodingKeys: String, CodingKey {
     case id, category, statement, value, aliases
+  }
+
+  init(
+    id: String,
+    category: String = "other",
+    statement: String,
+    value: String? = nil,
+    aliases: [String] = []
+  ) {
+    self.id = id
+    self.category = category
+    self.statement = statement
+    self.value = value
+    self.aliases = aliases
   }
 
   init(from decoder: Decoder) throws {
@@ -849,6 +866,12 @@ struct LongFormWorldRule: Codable, Equatable, Sendable {
 
   private enum CodingKeys: String, CodingKey {
     case id, statement, immutable
+  }
+
+  init(id: String, statement: String, immutable: Bool = true) {
+    self.id = id
+    self.statement = statement
+    self.immutable = immutable
   }
 
   init(from decoder: Decoder) throws {
@@ -873,6 +896,28 @@ struct LongFormEntity: Codable, Equatable, Sendable {
   private enum CodingKeys: String, CodingKey {
     case id, name, type, owner, location, attributes
     case immutableOwner, immutableLocation, immutableAttributes
+  }
+
+  init(
+    id: String,
+    name: String,
+    type: String,
+    owner: String? = nil,
+    location: String? = nil,
+    attributes: [String: String] = [:],
+    immutableOwner: Bool = false,
+    immutableLocation: Bool = false,
+    immutableAttributes: [String] = []
+  ) {
+    self.id = id
+    self.name = name
+    self.type = type
+    self.owner = owner
+    self.location = location
+    self.attributes = attributes
+    self.immutableOwner = immutableOwner
+    self.immutableLocation = immutableLocation
+    self.immutableAttributes = immutableAttributes
   }
 
   init(from decoder: Decoder) throws {
@@ -904,6 +949,24 @@ struct LongFormKnowledgeBoundary: Codable, Equatable, Sendable {
     case availableFromChapter, revealByChapter, markers
   }
 
+  init(
+    factId: String,
+    statement: String,
+    allowedKnowers: [String] = [],
+    forbiddenKnowers: [String] = [],
+    availableFromChapter: Int = 1,
+    revealByChapter: Int? = nil,
+    markers: [String] = []
+  ) {
+    self.factId = factId
+    self.statement = statement
+    self.allowedKnowers = allowedKnowers
+    self.forbiddenKnowers = forbiddenKnowers
+    self.availableFromChapter = availableFromChapter
+    self.revealByChapter = revealByChapter
+    self.markers = markers
+  }
+
   init(from decoder: Decoder) throws {
     let values = try decoder.container(keyedBy: CodingKeys.self)
     factId = try values.decode(String.self, forKey: .factId)
@@ -929,6 +992,22 @@ struct LongFormTimelineMilestone: Codable, Equatable, Sendable {
     case id, order, label, earliestChapter, latestChapter, immutable
   }
 
+  init(
+    id: String,
+    order: Int,
+    label: String,
+    earliestChapter: Int,
+    latestChapter: Int,
+    immutable: Bool = true
+  ) {
+    self.id = id
+    self.order = order
+    self.label = label
+    self.earliestChapter = earliestChapter
+    self.latestChapter = latestChapter
+    self.immutable = immutable
+  }
+
   init(from decoder: Decoder) throws {
     let values = try decoder.container(keyedBy: CodingKeys.self)
     id = try values.decode(String.self, forKey: .id)
@@ -946,6 +1025,20 @@ struct LongFormHookPlan: Codable, Equatable, Sendable {
   let openFromChapter: Int
   let resolveByChapter: Int?
   let requiredVolumeNumber: Int?
+
+  init(
+    hookId: String,
+    description: String,
+    openFromChapter: Int,
+    resolveByChapter: Int? = nil,
+    requiredVolumeNumber: Int? = nil
+  ) {
+    self.hookId = hookId
+    self.description = description
+    self.openFromChapter = openFromChapter
+    self.resolveByChapter = resolveByChapter
+    self.requiredVolumeNumber = requiredVolumeNumber
+  }
 }
 
 struct LongFormContinuity: Codable, Equatable, Sendable {
@@ -999,6 +1092,185 @@ struct LongFormContinuityValidationError: LocalizedError, Equatable, Sendable {
   let message: String
 
   var errorDescription: String? { message }
+}
+
+// MARK: - Chapter beat plan
+
+/// Narrative brief for a single chapter. This is the missing layer between the
+/// volume-level goals and the generation prompt: without it the writing model
+/// only sees "volume 1 covers chapters 1-234" and compresses dozens of chapters
+/// of planned material into one.
+struct ChapterBeat: Codable, Identifiable, Equatable, Sendable {
+  /// Chapter this brief belongs to.
+  var number: Int
+  /// Volume the chapter sits in, mirrored from the derived plan.
+  var volumeNumber: Int
+  /// The single concrete problem the chapter advances.
+  var goal: String
+  /// Concrete moment or action the chapter opens on, not a background summary.
+  var openingHook: String
+  /// One to three dramatized scenes, each with place, cast and on-page conflict.
+  var scenes: [String]
+  /// Events that must be visibly dramatized in the prose.
+  var requiredEvents: [String]
+  /// Material explicitly reserved for later chapters. This is the field that
+  /// stops chapter 1 from consuming the first eighty chapters of the plan.
+  var forbiddenElements: [String]
+  /// Closing hook, reversal, countdown or new information.
+  var endingHook: String
+  /// Characters who appear and matter in this chapter.
+  var focusCharacters: [String]
+  /// Upper bound on newly introduced named characters.
+  var newNamedCharacters: Int?
+  /// Story time the chapter is allowed to cover.
+  var timeSpan: String
+  /// Setback, cost or failure the chapter must contain.
+  var setback: String
+  /// Free-form reminders for the writing model.
+  var notes: String
+
+  var id: Int { number }
+
+  init(
+    number: Int,
+    volumeNumber: Int = 1,
+    goal: String = "",
+    openingHook: String = "",
+    scenes: [String] = [],
+    requiredEvents: [String] = [],
+    forbiddenElements: [String] = [],
+    endingHook: String = "",
+    focusCharacters: [String] = [],
+    newNamedCharacters: Int? = nil,
+    timeSpan: String = "",
+    setback: String = "",
+    notes: String = ""
+  ) {
+    self.number = number
+    self.volumeNumber = volumeNumber
+    self.goal = goal
+    self.openingHook = openingHook
+    self.scenes = scenes
+    self.requiredEvents = requiredEvents
+    self.forbiddenElements = forbiddenElements
+    self.endingHook = endingHook
+    self.focusCharacters = focusCharacters
+    self.newNamedCharacters = newNamedCharacters
+    self.timeSpan = timeSpan
+    self.setback = setback
+    self.notes = notes
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case number, volumeNumber, goal, openingHook, scenes, requiredEvents
+    case forbiddenElements, endingHook, focusCharacters, newNamedCharacters
+    case timeSpan, setback, notes
+  }
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    number = values.lossyInt(forKey: .number)
+    volumeNumber = values.lossyInt(forKey: .volumeNumber, default: 1)
+    goal = values.lossyString(forKey: .goal)
+    openingHook = values.lossyString(forKey: .openingHook)
+    scenes = (try? values.decodeIfPresent([String].self, forKey: .scenes)) ?? []
+    requiredEvents = (try? values.decodeIfPresent([String].self, forKey: .requiredEvents)) ?? []
+    forbiddenElements = (try? values.decodeIfPresent(
+      [String].self, forKey: .forbiddenElements)) ?? []
+    endingHook = values.lossyString(forKey: .endingHook)
+    focusCharacters = (try? values.decodeIfPresent([String].self, forKey: .focusCharacters)) ?? []
+    newNamedCharacters = try? values.decodeIfPresent(Int.self, forKey: .newNamedCharacters)
+    timeSpan = values.lossyString(forKey: .timeSpan)
+    setback = values.lossyString(forKey: .setback)
+    notes = values.lossyString(forKey: .notes)
+  }
+
+  /// A beat only replaces volume-level guidance when it names both a goal and at
+  /// least one scene.
+  var isUsable: Bool {
+    !goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !scenes.isEmpty
+  }
+}
+
+/// Provenance for one lazily generated window of beats.
+struct ChapterBeatBatch: Codable, Equatable, Sendable {
+  var startChapter: Int
+  var endChapter: Int
+  var volumeNumber: Int
+  var planRevision: Int
+  var generatedAt: String
+  var model: String
+
+  init(
+    startChapter: Int,
+    endChapter: Int,
+    volumeNumber: Int,
+    planRevision: Int,
+    generatedAt: String,
+    model: String
+  ) {
+    self.startChapter = startChapter
+    self.endChapter = endChapter
+    self.volumeNumber = volumeNumber
+    self.planRevision = planRevision
+    self.generatedAt = generatedAt
+    self.model = model
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case startChapter, endChapter, volumeNumber, planRevision, generatedAt, model
+  }
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    startChapter = values.lossyInt(forKey: .startChapter)
+    endChapter = values.lossyInt(forKey: .endChapter)
+    volumeNumber = values.lossyInt(forKey: .volumeNumber, default: 1)
+    planRevision = values.lossyInt(forKey: .planRevision)
+    generatedAt = values.lossyString(forKey: .generatedAt)
+    model = values.lossyString(forKey: .model)
+  }
+}
+
+/// Persisted chapter beats. Beats are generated lazily in windows so a
+/// 700-chapter book never needs a single planning call.
+struct ChapterBeatPlan: Codable, Equatable, Sendable {
+  var version: Int
+  var bookId: String
+  var beats: [ChapterBeat]
+  var batches: [ChapterBeatBatch]
+  var updatedAt: String
+
+  init(
+    version: Int = 1,
+    bookId: String,
+    beats: [ChapterBeat] = [],
+    batches: [ChapterBeatBatch] = [],
+    updatedAt: String = ""
+  ) {
+    self.version = version
+    self.bookId = bookId
+    self.beats = beats
+    self.batches = batches
+    self.updatedAt = updatedAt
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case version, bookId, beats, batches, updatedAt
+  }
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    version = values.lossyInt(forKey: .version, default: 1)
+    bookId = values.lossyString(forKey: .bookId)
+    beats = (try? values.decodeIfPresent([ChapterBeat].self, forKey: .beats)) ?? []
+    batches = (try? values.decodeIfPresent([ChapterBeatBatch].self, forKey: .batches)) ?? []
+    updatedAt = values.lossyString(forKey: .updatedAt)
+  }
+
+  func beat(for number: Int) -> ChapterBeat? {
+    beats.first { $0.number == number }
+  }
 }
 
 extension LongFormContinuity {
@@ -1265,7 +1537,17 @@ struct LongFormPlanUpdateRequest: Encodable, Sendable {
   let continuity: LongFormContinuity?
 }
 
-// MARK: - Fanqie read-only data
+// MARK: - Fanqie publishing
+
+struct FanqieCookie: Codable, Hashable, Sendable {
+  let name: String
+  let value: String
+  let domain: String
+  let path: String
+  let expiresAt: Date?
+  let isSecure: Bool
+  let isHTTPOnly: Bool
+}
 
 struct FanqieLoginState: Codable, Equatable, Sendable {
   let loggedIn: Bool
@@ -1371,6 +1653,13 @@ struct FanqieChapterContent: Codable, Equatable, Sendable {
     case content, title, chapterId, number
   }
 
+  init(content: String, title: String?, chapterId: String?, number: Int?) {
+    self.content = content
+    self.title = title
+    self.chapterId = chapterId
+    self.number = number
+  }
+
   init(from decoder: Decoder) throws {
     let values = try decoder.container(keyedBy: CodingKeys.self)
     content = try values.decodeIfPresent(String.self, forKey: .content) ?? ""
@@ -1397,6 +1686,37 @@ struct FanqieLogoutResponse: Codable, Sendable {
 struct FanqieLoginURLResponse: Codable, Sendable {
   let url: String
   let instructions: String
+}
+
+struct FanqieCategory: Codable, Identifiable, Hashable, Sendable {
+  let categoryId: String
+  let name: String
+  let group: String
+
+  var id: String { categoryId }
+}
+
+struct FanqieCreateBookInput: Codable, Equatable, Sendable {
+  var title: String
+  var gender: Int
+  var categoryIDs: [String]
+  var protagonistNames: [String]
+  var abstract: String
+  var coverURI: String?
+}
+
+struct FanqieChapterTransferInput: Codable, Equatable, Sendable {
+  let localBookId: String
+  let localChapterNumber: Int
+  let remoteBookId: String
+  let remoteChapterId: String?
+}
+
+struct FanqieMutationResponse: Codable, Equatable, Sendable {
+  let ok: Bool
+  let message: String
+  let bookId: String?
+  let chapterId: String?
 }
 
 // MARK: - Mutation requests and responses
@@ -1444,6 +1764,54 @@ struct DeleteBookResponse: Codable, Sendable {
   let trashedTo: String
 }
 
+struct CreateBookGuide: Codable, Equatable, Sendable {
+  var title: String = ""
+  var language: String = "zh"
+  var genre: String = "xuanhuan"
+  var platform: String = "tomato"
+  var storyPremise: String = ""
+  var protagonistName: String = ""
+  var protagonistProfile: String = ""
+  var worldRules: String = ""
+  var pacing: String = ""
+  var style: String = ""
+  var targetChapters: Int = 200
+  var targetChapterWords: Int = 3000
+  var targetTotalWords: Int = 600_000
+  var volumeCount: Int = 6
+  var chapterWordTolerance: Int = 15
+  var specialConstraints: [String] = []
+
+  init() {}
+
+  init(request: CreateBookRequest) {
+    title = request.title
+    language = request.language
+    genre = request.genre
+    platform = request.platform
+    storyPremise = request.premise
+    protagonistName = ""
+    protagonistProfile = ""
+    worldRules = request.worldbuilding
+    pacing = request.pacing
+    style = request.style
+    targetChapters = request.derivedTargetChapters
+    targetChapterWords = request.chapterWords
+    targetTotalWords = request.targetTotalWords
+    volumeCount = request.volumeCount
+    chapterWordTolerance = request.chapterWordTolerance
+    specialConstraints = LongFormConstraints.lines(from: request.constraints)
+  }
+
+  var exactTargetTotalWords: Int {
+    targetChapters * targetChapterWords
+  }
+
+  mutating func synchronizeBudget() {
+    targetTotalWords = exactTargetTotalWords
+  }
+}
+
 struct CreateBookRequest: Codable, Equatable, Sendable {
   var title: String
   var language: String
@@ -1463,6 +1831,7 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
   var pacing: String
   var style: String
   var constraints: String
+  var creationGuide: CreateBookGuide?
 
   init(
     title: String = "",
@@ -1482,7 +1851,8 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
     volumePlan: String = "",
     pacing: String = "",
     style: String = "",
-    constraints: String = ""
+    constraints: String = "",
+    creationGuide: CreateBookGuide? = nil
   ) {
     self.title = title
     self.language = language
@@ -1502,6 +1872,7 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
     self.pacing = pacing
     self.style = style
     self.constraints = constraints
+    self.creationGuide = creationGuide
   }
 
   var derivedTargetChapters: Int {
@@ -1530,6 +1901,7 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
     case chapterWordTolerance, chapterWordTolerancePercent
     case premise, characters, worldbuilding, outline, volumePlan, pacing, style
     case constraints, specialConstraints
+    case creationGuide
   }
 
   init(from decoder: Decoder) throws {
@@ -1574,6 +1946,7 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
     } else if constraints.isEmpty {
       constraints = values.lossyString(forKey: .specialConstraints)
     }
+    creationGuide = try? values.decode(CreateBookGuide.self, forKey: .creationGuide)
     synchronizeLongFormFields()
   }
 
@@ -1601,6 +1974,7 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
     try values.encode(style, forKey: .style)
     try values.encode(constraints, forKey: .constraints)
     try values.encode(LongFormConstraints.lines(from: constraints), forKey: .specialConstraints)
+    try values.encodeIfPresent(creationGuide, forKey: .creationGuide)
   }
 
   private static func lossyPositiveInt(
@@ -1746,12 +2120,13 @@ struct CreateBookResponse: Codable, Sendable {
 }
 
 struct CreateBookAssistRequest: Encodable, Sendable {
-  let requirements: String
+  let guide: CreateBookGuide
 }
 
 struct CreateBookAssistResponse: Codable, Sendable {
   let ok: Bool
   let model: String
   let baseUrl: String
+  let guide: CreateBookGuide?
   let payload: CreateBookRequest
 }
