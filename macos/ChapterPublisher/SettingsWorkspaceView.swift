@@ -490,9 +490,25 @@ struct SettingsWorkspaceView: View {
             ForEach(groupedSettingFiles, id: \.0) { group, files in
               Section(group) {
                 ForEach(files) { file in
-                  Label(file.title, systemImage: "doc.text")
-                    .tag(Optional(file.path))
-                    .help(file.path)
+                  Label {
+                    HStack(spacing: 6) {
+                      Text(file.title)
+                        .lineLimit(1)
+                      if file.managed {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                          .font(.caption2)
+                          .foregroundStyle(.secondary)
+                          .accessibilityHidden(true)
+                      }
+                    }
+                  } icon: {
+                    Image(systemName: "doc.text")
+                  }
+                  .tag(Optional(file.path))
+                  .help(file.managed ? "\(file.path)（由系统自动重写）" : file.path)
+                  .accessibilityLabel(
+                    file.managed ? "\(file.title)，由系统自动重写" : file.title
+                  )
                 }
               }
             }
@@ -536,6 +552,10 @@ struct SettingsWorkspaceView: View {
               .padding(.horizontal, 12)
               .padding(.bottom, 8)
           }
+
+          if file.managed {
+            managedSettingNotice(for: file.path)
+          }
           Divider()
 
           TextEditor(text: $editorDraft)
@@ -553,6 +573,29 @@ struct SettingsWorkspaceView: View {
       }
       .frame(minWidth: 480)
     }
+  }
+
+  /// Managed runtime files are rewritten after each chapter approval, so an edit
+  /// saved here survives only until the next approval. Point the author at the
+  /// input that actually persists: the continuity overlay for state and hooks,
+  /// the beat plan for the next-chapter focus.
+  private func managedSettingNotice(for path: String) -> some View {
+    let detail = path == "current_focus.md"
+      ? "此文件由系统按下一章节拍卡自动重写，手工修改会被覆盖。要改变下一章的写作目标，请调整该章节拍卡。"
+      : "此文件由系统在章节审核通过后自动重写，手工修改会被覆盖。要长期改变连续性事实，请在“长篇计划 · 连续性”中编辑覆盖层。"
+    return HStack(alignment: .top, spacing: 8) {
+      Image(systemName: "arrow.triangle.2.circlepath")
+        .foregroundStyle(.orange)
+        .accessibilityHidden(true)
+      Text(detail)
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+      Spacer(minLength: 0)
+    }
+    .padding(.horizontal, 12)
+    .padding(.bottom, 8)
+    .accessibilityElement(children: .combine)
   }
 
   @ViewBuilder

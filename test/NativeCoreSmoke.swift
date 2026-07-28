@@ -78,6 +78,13 @@ struct NativeCoreSmoke {
 
     let settings = try await core.fetchBookSettings(bookID: books[0].id)
     precondition(settings.files.contains { $0.path == "book_rules.md" })
+    // Files the core rewrites from the approved-chapter projection must be
+    // flagged managed so the settings page can warn before an edit is lost;
+    // files it only reads must not be, or the warning becomes noise.
+    let managedPaths = Set(settings.files.filter(\.managed).map(\.path))
+    precondition(managedPaths == ["current_state.md", "pending_hooks.md", "current_focus.md"])
+    precondition(!managedPaths.contains("object_ledger.md"))
+    precondition(!managedPaths.contains("chapter_summaries.md"))
     let original = try await core.fetchBookSetting(bookID: books[0].id, path: "book_rules.md")
     let save = try await core.saveBookSetting(
       bookID: books[0].id,
