@@ -49,7 +49,7 @@ SwiftUI View
 - `story/craft_rules.md` 是本书可编辑的写法约束，在设置页“世界与卷纲”分组中紧随文风指南维护，只能叠加在内核之上。
 - 篇幅按 `long-form-plan.json` 的每章 `minWords`/`maxWords` 校验，低于下限或明显超出上限的稿件不予落盘。
 - 审核区分严重级别：`[hard]` 连续性、排期与篇幅问题阻断章节；`[soft]` 写法问题记入 `llmReview.craftAdvisories` 并进入人工审核，不会把每章都打成 `revision_failed`。
-- 章节通过人工审核后，`current_state.md`、`pending_hooks.md` 和 `current_focus.md` 由核心按已审核进度自动回写，不再停留在创建时的占位内容；这三个文件的人工修改会在下次审核后被覆盖，连续性事实的人工调整仍走设置页的覆盖层。
+- 章节通过人工审核后，`current_state.md`、`pending_hooks.md` 和 `current_focus.md` 由核心按已审核进度自动回写，不再停留在创建时的占位内容；这三个文件在设置页标记为自动重写并给出覆盖提示，人工修改会在下次审核后失效，连续性事实的人工调整走「长篇计划 · 连续性」覆盖层，单章内容调整走节拍卡。
 - 章节重新修订时，其后续章节的节拍卡自动失效并在下次生成时重新规划。
 
 人工审核通过后，章节 `consistencyDelta` 会自动投影到 `long-form-plan.json.continuity`。章节重新修订时旧贡献自动退出，重新审核后由新 Delta 替换；设置页的人工修改以覆盖层保存。投影记录位于 `story/runtime/continuity-projection.json`，可供调试面板和自动化 Agent 直接解析与重放。

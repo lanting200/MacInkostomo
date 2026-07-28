@@ -109,22 +109,22 @@ extension InkOSCore {
     let known: [String: (String, Int, String, String, Bool)] = [
       "author_intent.md": ("direction", 10, "创作简报", "题材、主角定位、核心卖点与长期写作要求。", false),
       "brief.md": ("direction", 20, "项目简介", "创建时的基础需求。", false),
-      "current_focus.md": ("direction", 30, "当前聚焦", "接下来章节的优先目标。", false),
+      "current_focus.md": ("direction", 30, "当前聚焦", "下一章的节拍卡摘要；由已审核进度自动重写。", true),
       "book_rules.md": ("canon", 10, "硬规则", "人物、能力、世界和叙事边界。", false),
       "story_bible.md": ("canon", 20, "故事圣经", "世界观、力量体系与长期一致性依据。", false),
       "outline/story_frame.md": ("canon", 30, "故事基石", "核心冲突和终局方向。", false),
       "outline/volume_map.md": ("canon", 40, "分卷地图", "每卷范围、目标与回收安排。", false),
       "style_guide.md": ("canon", 50, "文风指南", "叙事视角、语言密度与表达边界。", false),
       "craft_rules.md": ("canon", 55, "写法约束", "场景纪律、信息节奏与禁止写法；系统写法内核始终额外生效。", false),
-      "current_state.md": ("runtime", 10, "当前状态", "角色位置、伤势、资源与下一步目标。", false),
-      "pending_hooks.md": ("runtime", 20, "伏笔池", "伏笔进展与回收方向。", false),
-      "chapter_summaries.md": ("runtime", 30, "章节摘要", "已写章节的关键变化。", false),
+      "current_state.md": ("runtime", 10, "当前状态", "角色位置、伤势、资源与下一步目标；由已审核进度自动重写。", true),
+      "pending_hooks.md": ("runtime", 20, "伏笔池", "伏笔进展与回收方向；由已审核进度自动重写。", true),
+      "chapter_summaries.md": ("runtime", 30, "章节摘要", "已写章节的关键变化；每章提交后由系统追加。", false),
       "particle_ledger.md": ("runtime", 40, "资源账本", "资源、证物、伤势与消耗。", false),
-      "object_ledger.md": ("runtime", 45, "持久对象账本", "跨章物品的稳定身份与状态。", true),
+      "object_ledger.md": ("runtime", 45, "持久对象账本", "跨章物品的稳定身份与状态。", false),
       "character_matrix.md": ("runtime", 50, "人物关系", "人物关系、立场与知情范围。", false),
       "emotional_arcs.md": ("runtime", 60, "情感弧线", "人物关系和情绪节奏。", false),
       "subplot_board.md": ("runtime", 70, "支线进度", "支线当前阶段和回收安排。", false),
-      "audit_drift.md": ("runtime", 80, "审计纠偏", "最近审核对后续章节的提醒。", true),
+      "audit_drift.md": ("runtime", 80, "审计纠偏", "最近审核对后续章节的提醒。", false),
     ]
     if let item = known[path] { return item }
     if path.hasPrefix("roles/") {
