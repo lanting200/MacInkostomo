@@ -26,6 +26,7 @@
     "build:client": "vite build",
     "build:server": "tsc -p tsconfig.server.json",
     "preview": "vite preview",
+    "lint": "pnpm run typecheck",
     "test": "vitest run",
     "test:e2e": "playwright test",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit"

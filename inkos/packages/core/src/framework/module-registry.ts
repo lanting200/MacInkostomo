@@ -197,6 +197,13 @@ export class FrameworkModuleRegistry {
           cancellationGraceMs,
         );
         if (!observed) {
+          // Hosts may own resources whose lifetime must extend through an
+          // uncertain mutation. Notify them before returning to the caller.
+          try {
+            options.onOutcomeUnknown?.(settlementPromise.then(() => undefined));
+          } catch {
+            // An observer must not replace the framework's outcome-unknown fault.
+          }
           throw new FrameworkFault(
             `Framework module mutation ${id}.${operation} did not settle within ${cancellationGraceMs}ms after cancellation`,
             {

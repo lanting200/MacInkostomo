@@ -1,0 +1,935 @@
+import Foundation
+
+struct ContinuityDeltaItems: Codable, Equatable, Sendable {
+  var immutableCanon: [LongFormImmutableCanon] = []
+  var worldRules: [LongFormWorldRule] = []
+  var entities: [LongFormEntity] = []
+  var knowledgeBoundaries: [LongFormKnowledgeBoundary] = []
+  var timeline: [LongFormTimelineMilestone] = []
+  var hooks: [LongFormHookPlan] = []
+}
+
+struct ContinuityDeltaRemovals: Codable, Equatable, Sendable {
+  var immutableCanon: [String] = []
+  var worldRules: [String] = []
+  var entities: [String] = []
+  var knowledgeBoundaries: [String] = []
+  var timeline: [String] = []
+  var hooks: [String] = []
+}
+
+struct ContinuityDelta: Codable, Equatable, Sendable {
+  var upsert = ContinuityDeltaItems()
+  var remove = ContinuityDeltaRemovals()
+  var policy: LongFormContinuityPolicy?
+}
+
+struct ContinuityChapterProjection: Codable, Equatable, Sendable {
+  let chapterNumber: Int
+  let fingerprint: String
+  let delta: ContinuityDelta
+}
+
+struct ContinuityProjection: Codable, Equatable, Sendable {
+  let version: Int
+  var baseContinuity: LongFormContinuity
+  var chapters: [ContinuityChapterProjection]
+  var manualOverlay: ContinuityDelta
+  var continuity: LongFormContinuity
+  var updatedAt: String
+}
+
+struct ContinuityCheckpointChapter: Codable, Equatable, Sendable {
+  let chapterNumber: Int
+  let fingerprint: String
+}
+
+struct ContinuityVolumeCheckpoint: Codable, Equatable, Sendable {
+  let version: Int
+  let bookId: String
+  let volumeNumber: Int
+  let startChapter: Int
+  let endChapter: Int
+  let planRevision: Int
+  let fingerprint: String
+  let chapters: [ContinuityCheckpointChapter]
+  let continuity: LongFormContinuity
+  let createdAt: String
+  let updatedAt: String
+}
+
+extension InkOSCore {
+  static let continuityProjectionVersion = 1
+
+  func synchronizeContinuityProjection(bookID: String) throws -> LongFormPlanResponse {
+    let planURL = try existingBookURL(bookID).appendingPathComponent("long-form-plan.json")
+    let current = try readLongFormPlan(at: planURL)
+    let projectionURL = try continuityProjectionURL(bookID: bookID)
+    let existing = try loadContinuityProjection(at: projectionURL)
+    var base = existing?.baseContinuity ?? current.continuity
+    base.policy.requireConsistencyDelta = true
+    let chapters = try approvedContinuityDeltas(bookID: bookID)
+    var projected = base
+    for chapter in chapters {
+      try applyContinuityDelta(
+        chapter.delta,
+        to: &projected,
+        source: "第\(chapter.chapterNumber)章"
+      )
+    }
+    let overlay = existing?.manualOverlay ?? ContinuityDelta()
+    try applyContinuityDelta(overlay, to: &projected, source: "人工连续性覆盖", allowImmutableChanges: true)
+    projected.policy.requireConsistencyDelta = true
+    projected = try projected.validated(
+      targetChapters: current.plan.targetChapters,
+      volumeCount: current.constraints.volumeCount
+    )
+
+    var response = current
+    let planChanged = current.continuity != projected
+    if planChanged {
+      response = try makeLongFormPlan(
+        bookID: bookID,
+        constraints: current.constraints,
+        continuity: projected,
+        revision: current.revision + 1,
+        createdAt: current.createdAt
+      )
+      try atomicWrite(encoder.encode(response), to: planURL)
+    }
+
+    let projectionChanged = existing?.baseContinuity != base
+      || existing?.chapters != chapters
+      || existing?.manualOverlay != overlay
+      || existing?.continuity != projected
+    if existing == nil || projectionChanged {
+      let projection = ContinuityProjection(
+        version: Self.continuityProjectionVersion,
+        baseContinuity: base,
+        chapters: chapters,
+        manualOverlay: overlay,
+        continuity: projected,
+        updatedAt: isoTimestamp()
+      )
+      try atomicWrite(encoder.encode(projection), to: projectionURL)
+    }
+
+    if planChanged || existing == nil || projectionChanged {
+      recordDebug(scope: "continuity", message: "continuity.projection.synchronized", data: [
+        "bookId": bookID,
+        "revision": response.revision,
+        "approvedChapterDeltas": chapters.count,
+        "planChanged": planChanged,
+        "immutableCanon": projected.immutableCanon.count,
+        "worldRules": projected.worldRules.count,
+        "entities": projected.entities.count,
+        "knowledgeBoundaries": projected.knowledgeBoundaries.count,
+        "timeline": projected.timeline.count,
+        "hooks": projected.hooks.count,
+      ])
+    }
+    try synchronizeVolumeCheckpoints(
+      bookID: bookID,
+      plan: response,
+      base: base,
+      chapters: chapters,
+      overlay: overlay
+    )
+    return response
+  }
+
+  func continuityProjectionForManualEdit(
+    bookID: String,
+    current: LongFormPlanResponse,
+    requested rawRequested: LongFormContinuity,
+    targetChapters: Int,
+    volumeCount: Int
+  ) throws -> ContinuityProjection {
+    let projectionURL = try continuityProjectionURL(bookID: bookID)
+    let existing = try loadContinuityProjection(at: projectionURL)
+    var base = existing?.baseContinuity ?? current.continuity
+    base.policy.requireConsistencyDelta = true
+    let chapters = try approvedContinuityDeltas(bookID: bookID)
+    var automatic = base
+    for chapter in chapters {
+      try applyContinuityDelta(
+        chapter.delta,
+        to: &automatic,
+        source: "第\(chapter.chapterNumber)章"
+      )
+    }
+    var requested = rawRequested
+    requested.policy.requireConsistencyDelta = true
+    requested = try requested.validated(targetChapters: targetChapters, volumeCount: volumeCount)
+    let overlay = makeContinuityOverlay(from: automatic, to: requested)
+    var verification = automatic
+    try applyContinuityDelta(
+      overlay,
+      to: &verification,
+      source: "人工连续性覆盖",
+      allowImmutableChanges: true
+    )
+    verification.policy.requireConsistencyDelta = true
+    verification = try verification.validated(
+      targetChapters: targetChapters,
+      volumeCount: volumeCount
+    )
+    return ContinuityProjection(
+      version: Self.continuityProjectionVersion,
+      baseContinuity: base,
+      chapters: chapters,
+      manualOverlay: overlay,
+      continuity: verification,
+      updatedAt: isoTimestamp()
+    )
+  }
+
+  func normalizedConsistencyDelta(
+    _ raw: [String: Any],
+    chapterNumber: Int
+  ) throws -> ContinuityDelta {
+    let upsertSource = raw["upsert"] as? [String: Any] ?? raw
+    let removeSource = raw["remove"] as? [String: Any] ?? [:]
+    var delta = ContinuityDelta()
+
+    delta.upsert.immutableCanon = try anyArray(upsertSource["immutableCanon"]).enumerated().map {
+      try normalizedCanon($0.element, chapterNumber: chapterNumber, index: $0.offset)
+    }
+    delta.upsert.worldRules = try anyArray(upsertSource["worldRules"]).enumerated().map {
+      try normalizedWorldRule($0.element, chapterNumber: chapterNumber, index: $0.offset)
+    }
+    delta.upsert.entities = try anyArray(upsertSource["entities"]).enumerated().map {
+      try normalizedEntity($0.element, chapterNumber: chapterNumber, index: $0.offset, defaultType: "character")
+    }
+    let legacyObjects = try anyArray(upsertSource["objects"]).enumerated().map {
+      try normalizedEntity($0.element, chapterNumber: chapterNumber, index: $0.offset, defaultType: "object")
+    }
+    delta.upsert.entities.append(contentsOf: legacyObjects)
+
+    let knowledgeValues = anyArray(upsertSource["knowledgeBoundaries"]).isEmpty
+      ? anyArray(upsertSource["knowledge"])
+      : anyArray(upsertSource["knowledgeBoundaries"])
+    delta.upsert.knowledgeBoundaries = try knowledgeValues.enumerated().map {
+      try normalizedKnowledge($0.element, chapterNumber: chapterNumber, index: $0.offset)
+    }
+    delta.upsert.timeline = try anyArray(upsertSource["timeline"]).enumerated().map {
+      try normalizedTimeline($0.element, chapterNumber: chapterNumber, index: $0.offset)
+    }
+    delta.upsert.hooks = try anyArray(upsertSource["hooks"]).enumerated().map {
+      try normalizedHook($0.element, chapterNumber: chapterNumber, index: $0.offset)
+    }
+
+    delta.remove.immutableCanon = removalIDs(removeSource["immutableCanon"], kind: "canon")
+    delta.remove.worldRules = removalIDs(removeSource["worldRules"], kind: "rule")
+    delta.remove.entities = removalIDs(removeSource["entities"], kind: "entity")
+    delta.remove.knowledgeBoundaries = removalIDs(removeSource["knowledgeBoundaries"], kind: "knowledge")
+    delta.remove.timeline = removalIDs(removeSource["timeline"], kind: "timeline")
+    delta.remove.hooks = removalIDs(removeSource["hooks"], kind: "hook")
+    return delta
+  }
+
+  func chapterConsistencyDelta(bookID: String, chapterNumber: Int) throws -> ContinuityDelta {
+    let url = try existingBookURL(bookID).appendingPathComponent(
+      String(format: "story/runtime/chapter-%04d.consistency.json", chapterNumber)
+    )
+    guard fileManager.fileExists(atPath: url.path) else {
+      throw InkOSCoreError("本章缺少 consistencyDelta，请先重新生成或修订后再审核", statusCode: 409)
+    }
+    let object = try readObject(url)
+    guard let rawDelta = object["delta"] as? [String: Any] else {
+      throw InkOSCoreError("本章 consistencyDelta 格式错误", statusCode: 422)
+    }
+    return try normalizedConsistencyDelta(rawDelta, chapterNumber: chapterNumber)
+  }
+
+  func validateChapterSequence(
+    bookID: String,
+    chapterNumber: Int,
+    plan: LongFormPlanResponse,
+    operation: String
+  ) throws {
+    guard plan.plan.chapters.contains(where: { $0.number == chapterNumber }) else {
+      throw InkOSCoreError("第 \(chapterNumber) 章超出长篇计划范围", statusCode: 409)
+    }
+    guard plan.continuity.policy.requireContinuousVolumes, chapterNumber > 1 else { return }
+    let stateBook = try stateBookObject(bookID: bookID, allowMissing: true)
+    let records = try readChapterRecords(bookID: bookID, stateBook: stateBook)
+    var byNumber: [Int: String] = [:]
+    for record in records {
+      guard let number = integer(record["number"]) else { continue }
+      byNumber[number] = string(record["status"])
+    }
+    for required in 1..<chapterNumber {
+      guard let status = byNumber[required] else {
+        throw InkOSCoreError("连续写作策略已开启：第 \(required) 章缺失，不能\(operation)第 \(chapterNumber) 章", statusCode: 409)
+      }
+      guard ["approved", "published"].contains(status) else {
+        throw InkOSCoreError(
+          "连续写作策略已开启：第 \(required) 章尚未通过审核，不能\(operation)第 \(chapterNumber) 章",
+          statusCode: 409
+        )
+      }
+    }
+  }
+
+  func validateCandidateContinuity(
+    bookID: String,
+    chapterNumber: Int,
+    delta: ContinuityDelta,
+    excludingChapter: Int? = nil
+  ) throws -> LongFormContinuity {
+    let current = try synchronizeContinuityProjection(bookID: bookID)
+    let projectionURL = try continuityProjectionURL(bookID: bookID)
+    let projection = try loadContinuityProjection(at: projectionURL)
+    var before = projection?.baseContinuity ?? current.continuity
+    let approved = try approvedContinuityDeltas(bookID: bookID)
+      .filter { $0.chapterNumber != excludingChapter }
+    for chapter in approved {
+      try applyContinuityDelta(
+        chapter.delta,
+        to: &before,
+        source: "第\(chapter.chapterNumber)章"
+      )
+    }
+    try applyContinuityDelta(
+      projection?.manualOverlay ?? ContinuityDelta(),
+      to: &before,
+      source: "人工连续性覆盖",
+      allowImmutableChanges: true
+    )
+    before.policy.requireConsistencyDelta = true
+
+    if !before.policy.allowUnplannedEntities {
+      for entity in delta.upsert.entities {
+        let known = current.continuity.entities.contains {
+          $0.id == entity.id
+            || normalizedContinuityName($0.name) == normalizedContinuityName(entity.name)
+        }
+        if !known {
+          throw continuityConflict(
+            "第\(chapterNumber)章候选差量",
+            "未规划实体 \(entity.name) 被策略禁止；请先在连续性设置中登记"
+          )
+        }
+      }
+    }
+    try validateRemovalTargets(delta.remove, in: before, chapterNumber: chapterNumber)
+    var after = before
+    try applyContinuityDelta(
+      delta,
+      to: &after,
+      source: "第\(chapterNumber)章候选差量"
+    )
+    after.policy.requireConsistencyDelta = true
+    return try after.validated(
+      targetChapters: current.plan.targetChapters,
+      volumeCount: current.constraints.volumeCount
+    )
+  }
+
+  func latestVolumeCheckpointText(bookID: String) throws -> String? {
+    let directory = try volumeCheckpointDirectory(bookID: bookID)
+    let checkpoints = try directoryContents(directory).compactMap { url -> ContinuityVolumeCheckpoint? in
+      guard url.lastPathComponent.hasPrefix("volume-"), url.pathExtension == "json" else { return nil }
+      return try? decoder.decode(ContinuityVolumeCheckpoint.self, from: Data(contentsOf: url))
+    }
+    guard let latest = checkpoints.max(by: { $0.volumeNumber < $1.volumeNumber }) else { return nil }
+    return String(data: try encoder.encode(latest), encoding: .utf8)
+  }
+
+  func applyContinuityDelta(
+    _ delta: ContinuityDelta,
+    to continuity: inout LongFormContinuity,
+    source: String,
+    allowImmutableChanges: Bool = false
+  ) throws {
+    for id in delta.remove.immutableCanon {
+      if continuity.immutableCanon.contains(where: { $0.id == id }), !allowImmutableChanges {
+        throw continuityConflict(source, "不可变事实 \(id) 不能由章节删除")
+      }
+      continuity.immutableCanon.removeAll { $0.id == id }
+    }
+    for id in delta.remove.worldRules {
+      if let item = continuity.worldRules.first(where: { $0.id == id }), item.immutable, !allowImmutableChanges {
+        throw continuityConflict(source, "不可变世界规则 \(id) 不能由章节删除")
+      }
+      continuity.worldRules.removeAll { $0.id == id }
+    }
+    for id in delta.remove.entities {
+      if let item = continuity.entities.first(where: { $0.id == id }),
+        (item.immutableOwner || item.immutableLocation || !item.immutableAttributes.isEmpty),
+        !allowImmutableChanges
+      {
+        throw continuityConflict(source, "含锁定属性的实体 \(id) 不能由章节删除")
+      }
+      continuity.entities.removeAll { $0.id == id }
+    }
+    for id in delta.remove.knowledgeBoundaries {
+      continuity.knowledgeBoundaries.removeAll { $0.factId == id }
+    }
+    for id in delta.remove.timeline {
+      if let item = continuity.timeline.first(where: { $0.id == id }), item.immutable, !allowImmutableChanges {
+        throw continuityConflict(source, "不可变时间线 \(id) 不能由章节删除")
+      }
+      continuity.timeline.removeAll { $0.id == id }
+    }
+    for id in delta.remove.hooks {
+      continuity.hooks.removeAll { $0.hookId == id }
+    }
+
+    for item in delta.upsert.immutableCanon {
+      if let index = continuity.immutableCanon.firstIndex(where: { $0.id == item.id }) {
+        if continuity.immutableCanon[index] != item, !allowImmutableChanges {
+          throw continuityConflict(source, "不可变事实 \(item.id) 与既有记录冲突")
+        }
+        continuity.immutableCanon[index] = item
+      } else {
+        continuity.immutableCanon.append(item)
+      }
+    }
+    for item in delta.upsert.worldRules {
+      if let index = continuity.worldRules.firstIndex(where: { $0.id == item.id }) {
+        let previous = continuity.worldRules[index]
+        if previous != item, previous.immutable, !allowImmutableChanges {
+          throw continuityConflict(source, "不可变世界规则 \(item.id) 与既有记录冲突")
+        }
+        continuity.worldRules[index] = item
+      } else {
+        continuity.worldRules.append(item)
+      }
+    }
+    for item in delta.upsert.entities {
+      let normalizedName = normalizedContinuityName(item.name)
+      if let index = continuity.entities.firstIndex(where: {
+        $0.id == item.id || normalizedContinuityName($0.name) == normalizedName
+      }) {
+        let previous = continuity.entities[index]
+        if previous.type != item.type, !allowImmutableChanges {
+          throw continuityConflict(source, "实体 \(previous.name) 的类型不能从 \(previous.type) 改为 \(item.type)")
+        }
+        if previous.immutableOwner, let owner = item.owner, owner != previous.owner, !allowImmutableChanges {
+          throw continuityConflict(source, "实体 \(previous.name) 的归属已锁定")
+        }
+        if previous.immutableLocation, let location = item.location, location != previous.location,
+          !allowImmutableChanges
+        {
+          throw continuityConflict(source, "实体 \(previous.name) 的位置已锁定")
+        }
+        for key in previous.immutableAttributes {
+          if let value = item.attributes[key], value != previous.attributes[key], !allowImmutableChanges {
+            throw continuityConflict(source, "实体 \(previous.name) 的属性 \(key) 已锁定")
+          }
+        }
+        var attributes = previous.attributes
+        attributes.merge(item.attributes) { _, new in new }
+        continuity.entities[index] = LongFormEntity(
+          id: previous.id,
+          name: item.name,
+          type: allowImmutableChanges ? item.type : previous.type,
+          owner: item.owner ?? previous.owner,
+          location: item.location ?? previous.location,
+          attributes: attributes,
+          immutableOwner: previous.immutableOwner || item.immutableOwner,
+          immutableLocation: previous.immutableLocation || item.immutableLocation,
+          immutableAttributes: Array(Set(previous.immutableAttributes + item.immutableAttributes)).sorted()
+        )
+      } else {
+        continuity.entities.append(item)
+      }
+    }
+    for item in delta.upsert.knowledgeBoundaries {
+      if let index = continuity.knowledgeBoundaries.firstIndex(where: { $0.factId == item.factId }) {
+        continuity.knowledgeBoundaries[index] = item
+      } else {
+        continuity.knowledgeBoundaries.append(item)
+      }
+    }
+    for item in delta.upsert.timeline {
+      if let index = continuity.timeline.firstIndex(where: { $0.id == item.id }) {
+        let previous = continuity.timeline[index]
+        if previous != item, previous.immutable, !allowImmutableChanges {
+          throw continuityConflict(source, "不可变时间线 \(item.id) 与既有记录冲突")
+        }
+        continuity.timeline[index] = item
+      } else {
+        continuity.timeline.append(item)
+      }
+    }
+    for item in delta.upsert.hooks {
+      if let index = continuity.hooks.firstIndex(where: { $0.hookId == item.hookId }) {
+        continuity.hooks[index] = item
+      } else {
+        continuity.hooks.append(item)
+      }
+    }
+    if let policy = delta.policy { continuity.policy = policy }
+  }
+
+  func restoreFile(_ url: URL, snapshot: Data?) {
+    if let snapshot {
+      try? atomicWrite(snapshot, to: url)
+    } else {
+      try? fileManager.removeItem(at: url)
+    }
+  }
+
+  func snapshotVolumeCheckpoints(bookID: String) throws -> [String: Data] {
+    let directory = try volumeCheckpointDirectory(bookID: bookID)
+    var snapshots: [String: Data] = [:]
+    for url in try directoryContents(directory) where
+      url.lastPathComponent.hasPrefix("volume-")
+        && url.lastPathComponent.hasSuffix(".canon.json")
+    {
+      snapshots[url.lastPathComponent] = try Data(contentsOf: url)
+    }
+    return snapshots
+  }
+
+  func restoreVolumeCheckpoints(bookID: String, snapshots: [String: Data]) {
+    guard let directory = try? volumeCheckpointDirectory(bookID: bookID) else { return }
+    try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+    if let current = try? directoryContents(directory) {
+      for url in current where
+        url.lastPathComponent.hasPrefix("volume-")
+          && url.lastPathComponent.hasSuffix(".canon.json")
+      {
+        try? fileManager.removeItem(at: url)
+      }
+    }
+    for (name, data) in snapshots {
+      try? atomicWrite(data, to: directory.appendingPathComponent(name))
+    }
+  }
+
+  private func validateRemovalTargets(
+    _ removals: ContinuityDeltaRemovals,
+    in continuity: LongFormContinuity,
+    chapterNumber: Int
+  ) throws {
+    let missingCanon = removals.immutableCanon.filter { id in
+      !continuity.immutableCanon.contains(where: { $0.id == id })
+    }
+    let missingRules = removals.worldRules.filter { id in
+      !continuity.worldRules.contains(where: { $0.id == id })
+    }
+    let missingEntities = removals.entities.filter { id in
+      !continuity.entities.contains(where: { $0.id == id })
+    }
+    let missingKnowledge = removals.knowledgeBoundaries.filter { id in
+      !continuity.knowledgeBoundaries.contains(where: { $0.factId == id })
+    }
+    let missingTimeline = removals.timeline.filter { id in
+      !continuity.timeline.contains(where: { $0.id == id })
+    }
+    let missingHooks = removals.hooks.filter { id in
+      !continuity.hooks.contains(where: { $0.hookId == id })
+    }
+    let missing = missingCanon + missingRules + missingEntities + missingKnowledge + missingTimeline + missingHooks
+    if let first = missing.first {
+      throw continuityConflict("第\(chapterNumber)章候选差量", "删除目标 \(first) 不存在")
+    }
+  }
+
+  private func synchronizeVolumeCheckpoints(
+    bookID: String,
+    plan: LongFormPlanResponse,
+    base: LongFormContinuity,
+    chapters: [ContinuityChapterProjection],
+    overlay: ContinuityDelta
+  ) throws {
+    let directory = try volumeCheckpointDirectory(bookID: bookID)
+    try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+    let managedFiles = try directoryContents(directory).filter {
+      $0.lastPathComponent.hasPrefix("volume-") && $0.lastPathComponent.hasSuffix(".canon.json")
+    }
+    guard plan.continuity.policy.checkpointAtVolumeEnd else {
+      for url in managedFiles { try? fileManager.removeItem(at: url) }
+      if !managedFiles.isEmpty {
+        recordDebug(scope: "continuity", message: "continuity.checkpoints.disabled", data: [
+          "bookId": bookID, "removed": managedFiles.count,
+        ])
+      }
+      return
+    }
+
+    let committedNumbers = Set(chapters.map(\.chapterNumber))
+    var expectedFiles = Set<String>()
+    for volume in plan.plan.volumes {
+      let required = Set(volume.startChapter...volume.endChapter)
+      guard required.isSubset(of: committedNumbers) else { continue }
+      let checkpointURL = directory.appendingPathComponent(
+        String(format: "volume-%04d.canon.json", volume.number)
+      )
+      expectedFiles.insert(checkpointURL.lastPathComponent)
+      let included = chapters.filter { $0.chapterNumber <= volume.endChapter }
+      var snapshot = base
+      for chapter in included {
+        try applyContinuityDelta(
+          chapter.delta,
+          to: &snapshot,
+          source: "第\(chapter.chapterNumber)章"
+        )
+      }
+      try applyContinuityDelta(
+        overlay,
+        to: &snapshot,
+        source: "人工连续性覆盖",
+        allowImmutableChanges: true
+      )
+      snapshot.policy = plan.continuity.policy
+      snapshot = try snapshot.validated(
+        targetChapters: plan.plan.targetChapters,
+        volumeCount: plan.constraints.volumeCount
+      )
+      let checkpointChapters = included.map {
+        ContinuityCheckpointChapter(chapterNumber: $0.chapterNumber, fingerprint: $0.fingerprint)
+      }
+      let semantic: [String: Any] = [
+        "bookId": bookID,
+        "planRevision": plan.revision,
+        "volumeNumber": volume.number,
+        "startChapter": volume.startChapter,
+        "endChapter": volume.endChapter,
+        "chapters": checkpointChapters.map {
+          ["chapterNumber": $0.chapterNumber, "fingerprint": $0.fingerprint]
+        },
+        "continuity": try encodedObject(snapshot),
+      ]
+      let semanticData = try JSONSerialization.data(
+        withJSONObject: semantic,
+        options: [.sortedKeys, .withoutEscapingSlashes]
+      )
+      let fingerprint = fnv1aHex(semanticData)
+      let existing = try? decoder.decode(
+        ContinuityVolumeCheckpoint.self,
+        from: Data(contentsOf: checkpointURL)
+      )
+      guard existing?.fingerprint != fingerprint else { continue }
+      let now = isoTimestamp()
+      let checkpoint = ContinuityVolumeCheckpoint(
+        version: 1,
+        bookId: bookID,
+        volumeNumber: volume.number,
+        startChapter: volume.startChapter,
+        endChapter: volume.endChapter,
+        planRevision: plan.revision,
+        fingerprint: fingerprint,
+        chapters: checkpointChapters,
+        continuity: snapshot,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now
+      )
+      try atomicWrite(encoder.encode(checkpoint), to: checkpointURL)
+      recordDebug(scope: "continuity", message: "continuity.checkpoint.updated", data: [
+        "bookId": bookID,
+        "volumeNumber": volume.number,
+        "endChapter": volume.endChapter,
+        "fingerprint": fingerprint,
+      ])
+    }
+
+    for url in managedFiles where !expectedFiles.contains(url.lastPathComponent) {
+      try? fileManager.removeItem(at: url)
+      recordDebug(scope: "continuity", message: "continuity.checkpoint.invalidated", data: [
+        "bookId": bookID, "file": url.lastPathComponent,
+      ])
+    }
+  }
+
+  private func volumeCheckpointDirectory(bookID: String) throws -> URL {
+    try existingBookURL(bookID)
+      .appendingPathComponent("story/runtime/checkpoints", isDirectory: true)
+  }
+
+  private func readLongFormPlan(at url: URL) throws -> LongFormPlanResponse {
+    guard fileManager.fileExists(atPath: url.path) else {
+      throw InkOSCoreError("长篇规划不存在", statusCode: 404)
+    }
+    do { return try decoder.decode(LongFormPlanResponse.self, from: Data(contentsOf: url)) }
+    catch { throw InkOSCoreError("长篇规划格式错误：\(error.localizedDescription)", statusCode: 503) }
+  }
+
+  func continuityProjectionURL(bookID: String) throws -> URL {
+    try existingBookURL(bookID)
+      .appendingPathComponent("story/runtime/continuity-projection.json")
+  }
+
+  private func loadContinuityProjection(at url: URL) throws -> ContinuityProjection? {
+    guard fileManager.fileExists(atPath: url.path) else { return nil }
+    do {
+      let projection = try decoder.decode(ContinuityProjection.self, from: Data(contentsOf: url))
+      guard projection.version == Self.continuityProjectionVersion else {
+        throw InkOSCoreError("连续性投影版本不受支持", statusCode: 503)
+      }
+      return projection
+    } catch let error as InkOSCoreError {
+      throw error
+    } catch {
+      throw InkOSCoreError("连续性投影格式错误：\(error.localizedDescription)", statusCode: 503)
+    }
+  }
+
+  private func approvedContinuityDeltas(bookID: String) throws -> [ContinuityChapterProjection] {
+    let stateBook = try stateBookObject(bookID: bookID, allowMissing: true)
+    let records = try readChapterRecords(bookID: bookID, stateBook: stateBook)
+    let runtime = try existingBookURL(bookID).appendingPathComponent("story/runtime", isDirectory: true)
+    var result: [ContinuityChapterProjection] = []
+    for record in records {
+      guard let number = integer(record["number"]),
+        ["approved", "published"].contains(string(record["status"]))
+      else { continue }
+      let url = runtime.appendingPathComponent(String(format: "chapter-%04d.consistency.json", number))
+      guard fileManager.fileExists(atPath: url.path) else {
+        recordDebug(scope: "continuity", message: "continuity.approved_delta.missing", level: "warning", data: [
+          "bookId": bookID, "chapterNumber": number,
+        ])
+        continue
+      }
+      let data = try Data(contentsOf: url)
+      let object = try readObject(url)
+      let rawDelta = object["delta"] as? [String: Any] ?? [:]
+      result.append(ContinuityChapterProjection(
+        chapterNumber: number,
+        fingerprint: fnv1aHex(data),
+        delta: try normalizedConsistencyDelta(rawDelta, chapterNumber: number)
+      ))
+    }
+    return result.sorted { $0.chapterNumber < $1.chapterNumber }
+  }
+
+  private func makeContinuityOverlay(
+    from automatic: LongFormContinuity,
+    to requested: LongFormContinuity
+  ) -> ContinuityDelta {
+    var overlay = ContinuityDelta()
+    overlay.upsert.immutableCanon = requested.immutableCanon.filter { item in
+      automatic.immutableCanon.first(where: { $0.id == item.id }) != item
+    }
+    overlay.remove.immutableCanon = automatic.immutableCanon
+      .filter { item in !requested.immutableCanon.contains(where: { $0.id == item.id }) }
+      .map(\.id)
+    overlay.upsert.worldRules = requested.worldRules.filter { item in
+      automatic.worldRules.first(where: { $0.id == item.id }) != item
+    }
+    overlay.remove.worldRules = automatic.worldRules
+      .filter { item in !requested.worldRules.contains(where: { $0.id == item.id }) }
+      .map(\.id)
+    overlay.upsert.entities = requested.entities.filter { item in
+      automatic.entities.first(where: { $0.id == item.id }) != item
+    }
+    overlay.remove.entities = automatic.entities
+      .filter { item in !requested.entities.contains(where: { $0.id == item.id }) }
+      .map(\.id)
+    overlay.upsert.knowledgeBoundaries = requested.knowledgeBoundaries.filter { item in
+      automatic.knowledgeBoundaries.first(where: { $0.factId == item.factId }) != item
+    }
+    overlay.remove.knowledgeBoundaries = automatic.knowledgeBoundaries
+      .filter { item in !requested.knowledgeBoundaries.contains(where: { $0.factId == item.factId }) }
+      .map(\.factId)
+    overlay.upsert.timeline = requested.timeline.filter { item in
+      automatic.timeline.first(where: { $0.id == item.id }) != item
+    }
+    overlay.remove.timeline = automatic.timeline
+      .filter { item in !requested.timeline.contains(where: { $0.id == item.id }) }
+      .map(\.id)
+    overlay.upsert.hooks = requested.hooks.filter { item in
+      automatic.hooks.first(where: { $0.hookId == item.hookId }) != item
+    }
+    overlay.remove.hooks = automatic.hooks
+      .filter { item in !requested.hooks.contains(where: { $0.hookId == item.hookId }) }
+      .map(\.hookId)
+    overlay.policy = requested.policy
+    return overlay
+  }
+
+  private func normalizedCanon(_ value: Any, chapterNumber: Int, index: Int) throws -> LongFormImmutableCanon {
+    let object = value as? [String: Any] ?? [:]
+    let statement = normalizedText(object["statement"] ?? object["value"] ?? value)
+    guard !statement.isEmpty else { throw malformedDelta("不可变事实", index) }
+    let id = normalizedText(object["id"]).continuityNonEmpty ?? stableContinuityID("canon", statement)
+    let allowed = Set(["character", "world", "timeline", "entity", "object", "knowledge", "other"])
+    let category = normalizedText(object["category"])
+    return LongFormImmutableCanon(
+      id: id,
+      category: allowed.contains(category) ? category : "other",
+      statement: statement,
+      value: normalizedText(object["value"]).continuityNonEmpty,
+      aliases: stringList(object["aliases"])
+    )
+  }
+
+  private func normalizedWorldRule(_ value: Any, chapterNumber: Int, index: Int) throws -> LongFormWorldRule {
+    let object = value as? [String: Any] ?? [:]
+    let statement = normalizedText(object["statement"] ?? value)
+    guard !statement.isEmpty else { throw malformedDelta("世界规则", index) }
+    return LongFormWorldRule(
+      id: normalizedText(object["id"]).continuityNonEmpty ?? stableContinuityID("rule", statement),
+      statement: statement,
+      immutable: (object["immutable"] as? Bool) ?? true
+    )
+  }
+
+  private func normalizedEntity(
+    _ value: Any,
+    chapterNumber: Int,
+    index: Int,
+    defaultType: String
+  ) throws -> LongFormEntity {
+    let object = value as? [String: Any] ?? [:]
+    let name = normalizedText(object["name"] ?? value)
+    guard !name.isEmpty else { throw malformedDelta("实体", index) }
+    let knownTypes = Set(["character", "object", "location", "faction", "concept"])
+    let suppliedType = normalizedText(object["type"])
+    let type = knownTypes.contains(suppliedType) ? suppliedType : defaultType
+    var attributes: [String: String] = [:]
+    if let supplied = object["attributes"] as? [String: Any] {
+      for (key, raw) in supplied {
+        let text = normalizedText(raw)
+        if !text.isEmpty { attributes[key] = text }
+      }
+    } else if let supplied = object["attributes"] as? [String: String] {
+      attributes = supplied
+    }
+    let reserved = Set([
+      "id", "name", "type", "owner", "location", "attributes", "immutableOwner",
+      "immutableLocation", "immutableAttributes", "保管",
+    ])
+    for (key, raw) in object where !reserved.contains(key) {
+      let text = normalizedText(raw)
+      if !text.isEmpty { attributes[key] = text }
+    }
+    return LongFormEntity(
+      id: normalizedText(object["id"]).continuityNonEmpty ?? stableContinuityID("entity", name),
+      name: name,
+      type: type,
+      owner: normalizedText(object["owner"]).continuityNonEmpty,
+      location: normalizedText(object["location"] ?? object["保管"]).continuityNonEmpty,
+      attributes: attributes,
+      immutableOwner: (object["immutableOwner"] as? Bool) ?? false,
+      immutableLocation: (object["immutableLocation"] as? Bool) ?? false,
+      immutableAttributes: stringList(object["immutableAttributes"])
+    )
+  }
+
+  private func normalizedKnowledge(_ value: Any, chapterNumber: Int, index: Int) throws -> LongFormKnowledgeBoundary {
+    let object = value as? [String: Any] ?? [:]
+    let statement = normalizedText(object["statement"] ?? value)
+    guard !statement.isEmpty else { throw malformedDelta("知识边界", index) }
+    var allowed = stringList(object["allowedKnowers"])
+    if allowed.isEmpty, object.isEmpty, let separator = statement.firstIndex(of: "：") {
+      let prefix = String(statement[..<separator])
+      allowed = prefix.replacingOccurrences(of: "及", with: "、")
+        .split(separator: "、")
+        .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+    }
+    return LongFormKnowledgeBoundary(
+      factId: normalizedText(object["factId"] ?? object["id"]).continuityNonEmpty
+        ?? stableContinuityID("knowledge", statement),
+      statement: statement,
+      allowedKnowers: allowed,
+      forbiddenKnowers: stringList(object["forbiddenKnowers"]),
+      availableFromChapter: integer(object["availableFromChapter"]) ?? chapterNumber,
+      revealByChapter: integer(object["revealByChapter"]),
+      markers: stringList(object["markers"]).isEmpty ? ["chapter-\(chapterNumber)"] : stringList(object["markers"])
+    )
+  }
+
+  private func normalizedTimeline(_ value: Any, chapterNumber: Int, index: Int) throws -> LongFormTimelineMilestone {
+    let object = value as? [String: Any] ?? [:]
+    let label = normalizedText(object["label"] ?? object["statement"] ?? value)
+    guard !label.isEmpty else { throw malformedDelta("时间线", index) }
+    return LongFormTimelineMilestone(
+      id: normalizedText(object["id"]).continuityNonEmpty ?? stableContinuityID("timeline", label),
+      order: integer(object["order"]) ?? chapterNumber * 10_000 + index,
+      label: label,
+      earliestChapter: integer(object["earliestChapter"]) ?? chapterNumber,
+      latestChapter: integer(object["latestChapter"]) ?? chapterNumber,
+      immutable: (object["immutable"] as? Bool) ?? true
+    )
+  }
+
+  private func normalizedHook(_ value: Any, chapterNumber: Int, index: Int) throws -> LongFormHookPlan {
+    let object = value as? [String: Any] ?? [:]
+    let description = normalizedText(object["description"] ?? object["statement"] ?? value)
+    guard !description.isEmpty else { throw malformedDelta("伏笔", index) }
+    return LongFormHookPlan(
+      hookId: normalizedText(object["hookId"] ?? object["id"]).continuityNonEmpty
+        ?? stableContinuityID("hook", description),
+      description: description,
+      openFromChapter: integer(object["openFromChapter"]) ?? chapterNumber,
+      resolveByChapter: integer(object["resolveByChapter"]),
+      requiredVolumeNumber: integer(object["requiredVolumeNumber"])
+    )
+  }
+
+  private func removalIDs(_ value: Any?, kind: String) -> [String] {
+    anyArray(value).compactMap { raw in
+      if let text = raw as? String {
+        return text.trimmingCharacters(in: .whitespacesAndNewlines).continuityNonEmpty
+      }
+      guard let object = raw as? [String: Any] else { return nil }
+      let exact = normalizedText(
+        object["id"] ?? object["factId"] ?? object["hookId"]
+      ).continuityNonEmpty
+      if let exact { return exact }
+      let identity = normalizedText(
+        object["name"] ?? object["statement"] ?? object["label"] ?? object["description"]
+      )
+      return identity.isEmpty ? nil : stableContinuityID(kind, identity)
+    }
+  }
+
+  private func anyArray(_ value: Any?) -> [Any] {
+    if let array = value as? [Any] { return array }
+    if let value, !(value is NSNull) { return [value] }
+    return []
+  }
+
+  private func stringList(_ value: Any?) -> [String] {
+    anyArray(value).compactMap { normalizedText($0).continuityNonEmpty }
+  }
+
+  private func normalizedText(_ value: Any?) -> String {
+    if let text = value as? String {
+      return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    if let number = value as? NSNumber { return number.stringValue }
+    guard let value, JSONSerialization.isValidJSONObject(["value": value]),
+      let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+      let text = String(data: data, encoding: .utf8)
+    else { return "" }
+    return text
+  }
+
+  private func normalizedContinuityName(_ value: String) -> String {
+    value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+      .components(separatedBy: .whitespacesAndNewlines)
+      .joined()
+  }
+
+  private func stableContinuityID(_ kind: String, _ identity: String) -> String {
+    "auto-\(kind)-\(fnv1aHex(Data(normalizedContinuityName(identity).utf8)))"
+  }
+
+  private func fnv1aHex(_ data: Data) -> String {
+    var hash: UInt64 = 14_695_981_039_346_656_037
+    for byte in data {
+      hash ^= UInt64(byte)
+      hash = hash &* 1_099_511_628_211
+    }
+    return String(format: "%016llx", hash)
+  }
+
+  private func malformedDelta(_ label: String, _ index: Int) -> InkOSCoreError {
+    InkOSCoreError("consistencyDelta 的\(label)第 \(index + 1) 项缺少有效内容", statusCode: 422)
+  }
+
+  private func continuityConflict(_ source: String, _ detail: String) -> InkOSCoreError {
+    InkOSCoreError("连续性冲突（\(source)）：\(detail)", statusCode: 409)
+  }
+}
+
+private extension String {
+  var continuityNonEmpty: String? { isEmpty ? nil : self }
+}

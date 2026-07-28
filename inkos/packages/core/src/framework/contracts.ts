@@ -130,5 +130,11 @@ export interface FrameworkModuleCallOptions extends FrameworkExecutionScope {
   readonly cancellationGraceMs?: number;
   /** Read calls may fail fast; mutations must first establish their final outcome. */
   readonly operationKind?: "read" | "mutation";
+  /**
+   * Called only when a mutation outlives its cancellation grace period. The
+   * promise settles when the underlying work has actually finished, regardless
+   * of whether it committed or failed.
+   */
+  readonly onOutcomeUnknown?: (settlement: Promise<void>) => void;
   readonly signal?: AbortSignal;
 }

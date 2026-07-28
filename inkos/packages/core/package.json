@@ -51,6 +51,7 @@
     "prepublishOnly": "node ../../scripts/verify-no-workspace-protocol.mjs .",
     "build": "tsc",
     "dev": "tsc --watch",
+    "lint": "pnpm run typecheck",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },

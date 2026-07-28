@@ -9,10 +9,9 @@
 /* Begin PBXBuildFile section */
 		A10000000000000000000001 /* ChapterPublisherApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* ChapterPublisherApp.swift */; };
 		A10000000000000000000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* ContentView.swift */; };
-		A10000000000000000000003 /* ServerManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* ServerManager.swift */; };
 		A10000000000000000000006 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000008 /* Assets.xcassets */; };
 		A10000000000000000000007 /* NativeModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000009 /* NativeModels.swift */; };
-		A10000000000000000000008 /* APIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000A /* APIClient.swift */; };
+		A10000000000000000000008 /* InkOSLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000A /* InkOSLibrary.swift */; };
 		A10000000000000000000009 /* WorkspaceModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000B /* WorkspaceModel.swift */; };
 		A1000000000000000000000A /* NativeComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000C /* NativeComponents.swift */; };
 		A1000000000000000000000B /* NativeWorkspaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000D /* NativeWorkspaceView.swift */; };
@@ -21,17 +20,23 @@
 		A1000000000000000000000E /* SettingsWorkspaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000010 /* SettingsWorkspaceView.swift */; };
 		A1000000000000000000000F /* FanqieWorkspaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000011 /* FanqieWorkspaceView.swift */; };
 		A10000000000000000000010 /* ActivityWorkspaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000012 /* ActivityWorkspaceView.swift */; };
+		A10000000000000000000011 /* InkOSCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000013 /* InkOSCore.swift */; };
+		A10000000000000000000012 /* InkOSCorePlanning.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000014 /* InkOSCorePlanning.swift */; };
+		A10000000000000000000013 /* InkOSCoreLLM.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000015 /* InkOSCoreLLM.swift */; };
+		A10000000000000000000014 /* InkOSCoreSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000016 /* InkOSCoreSettings.swift */; };
+		A10000000000000000000015 /* InkOSCoreFanqie.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000017 /* InkOSCoreFanqie.swift */; };
+		A10000000000000000000016 /* InkOSCoreContinuity.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000018 /* InkOSCoreContinuity.swift */; };
+		A10000000000000000000017 /* InkOSCoreCraft.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000019 /* InkOSCoreCraft.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		A20000000000000000000001 /* ChapterPublisherApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChapterPublisherApp.swift; sourceTree = "<group>"; };
 		A20000000000000000000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
-		A20000000000000000000003 /* ServerManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerManager.swift; sourceTree = "<group>"; };
 		A20000000000000000000005 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A20000000000000000000007 /* MacInkostomo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MacInkostomo.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A20000000000000000000008 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A20000000000000000000009 /* NativeModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeModels.swift; sourceTree = "<group>"; };
-		A2000000000000000000000A /* APIClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIClient.swift; sourceTree = "<group>"; };
+		A2000000000000000000000A /* InkOSLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkOSLibrary.swift; sourceTree = "<group>"; };
 		A2000000000000000000000B /* WorkspaceModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceModel.swift; sourceTree = "<group>"; };
 		A2000000000000000000000C /* NativeComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeComponents.swift; sourceTree = "<group>"; };
 		A2000000000000000000000D /* NativeWorkspaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeWorkspaceView.swift; sourceTree = "<group>"; };
@@ -40,6 +45,13 @@
 		A20000000000000000000010 /* SettingsWorkspaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsWorkspaceView.swift; sourceTree = "<group>"; };
 		A20000000000000000000011 /* FanqieWorkspaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FanqieWorkspaceView.swift; sourceTree = "<group>"; };
 		A20000000000000000000012 /* ActivityWorkspaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityWorkspaceView.swift; sourceTree = "<group>"; };
+		A20000000000000000000013 /* InkOSCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkOSCore.swift; sourceTree = "<group>"; };
+		A20000000000000000000014 /* InkOSCorePlanning.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkOSCorePlanning.swift; sourceTree = "<group>"; };
+		A20000000000000000000015 /* InkOSCoreLLM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkOSCoreLLM.swift; sourceTree = "<group>"; };
+		A20000000000000000000016 /* InkOSCoreSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkOSCoreSettings.swift; sourceTree = "<group>"; };
+		A20000000000000000000017 /* InkOSCoreFanqie.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkOSCoreFanqie.swift; sourceTree = "<group>"; };
+		A20000000000000000000018 /* InkOSCoreContinuity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkOSCoreContinuity.swift; sourceTree = "<group>"; };
+		A20000000000000000000019 /* InkOSCoreCraft.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkOSCoreCraft.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -75,9 +87,15 @@
 			children = (
 				A20000000000000000000001 /* ChapterPublisherApp.swift */,
 				A20000000000000000000002 /* ContentView.swift */,
-				A20000000000000000000003 /* ServerManager.swift */,
 				A20000000000000000000009 /* NativeModels.swift */,
-				A2000000000000000000000A /* APIClient.swift */,
+				A2000000000000000000000A /* InkOSLibrary.swift */,
+				A20000000000000000000013 /* InkOSCore.swift */,
+				A20000000000000000000014 /* InkOSCorePlanning.swift */,
+				A20000000000000000000018 /* InkOSCoreContinuity.swift */,
+				A20000000000000000000019 /* InkOSCoreCraft.swift */,
+				A20000000000000000000015 /* InkOSCoreLLM.swift */,
+				A20000000000000000000016 /* InkOSCoreSettings.swift */,
+				A20000000000000000000017 /* InkOSCoreFanqie.swift */,
 				A2000000000000000000000B /* WorkspaceModel.swift */,
 				A2000000000000000000000C /* NativeComponents.swift */,
 				A2000000000000000000000D /* NativeWorkspaceView.swift */,
@@ -179,9 +197,15 @@
 			files = (
 				A10000000000000000000001 /* ChapterPublisherApp.swift in Sources */,
 				A10000000000000000000002 /* ContentView.swift in Sources */,
-				A10000000000000000000003 /* ServerManager.swift in Sources */,
 				A10000000000000000000007 /* NativeModels.swift in Sources */,
-				A10000000000000000000008 /* APIClient.swift in Sources */,
+				A10000000000000000000008 /* InkOSLibrary.swift in Sources */,
+				A10000000000000000000011 /* InkOSCore.swift in Sources */,
+				A10000000000000000000012 /* InkOSCorePlanning.swift in Sources */,
+				A10000000000000000000016 /* InkOSCoreContinuity.swift in Sources */,
+				A10000000000000000000017 /* InkOSCoreCraft.swift in Sources */,
+				A10000000000000000000013 /* InkOSCoreLLM.swift in Sources */,
+				A10000000000000000000014 /* InkOSCoreSettings.swift in Sources */,
+				A10000000000000000000015 /* InkOSCoreFanqie.swift in Sources */,
 				A10000000000000000000009 /* WorkspaceModel.swift in Sources */,
 				A1000000000000000000000A /* NativeComponents.swift in Sources */,
 				A1000000000000000000000B /* NativeWorkspaceView.swift in Sources */,

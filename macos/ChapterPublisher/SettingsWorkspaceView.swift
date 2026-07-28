@@ -1725,6 +1725,7 @@ private struct LongFormContinuityEditor: View {
         policyToggle(
           "要求一致性差量",
           detail: "每章结算必须返回时间线、实体、知识与设定变化",
+          locked: true,
           keyPath: \.requireConsistencyDelta
         )
         Divider()
@@ -1743,6 +1744,7 @@ private struct LongFormContinuityEditor: View {
   private func policyToggle(
     _ title: String,
     detail: String,
+    locked: Bool = false,
     keyPath: WritableKeyPath<LongFormContinuityPolicy, Bool>
   ) -> some View {
     HStack(alignment: .center, spacing: 20) {
@@ -1754,11 +1756,19 @@ private struct LongFormContinuityEditor: View {
           .foregroundStyle(.secondary)
       }
       Spacer(minLength: 16)
+      if locked {
+        Image(systemName: "lock.fill")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .help("内置连续性投影需要章节差量")
+          .accessibilityLabel("系统必需")
+      }
       Toggle("", isOn: policyBinding(keyPath))
         .labelsHidden()
         .toggleStyle(.switch)
         .accessibilityLabel(title)
         .frame(width: 52, alignment: .trailing)
+        .disabled(locked)
     }
     .frame(maxWidth: .infinity, alignment: .leading)
     .padding(.vertical, 14)
