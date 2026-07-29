@@ -321,6 +321,73 @@ struct NativeCoreSmoke {
       label: "正文"
     )
 
+    // A chapter at the plan floor but padded with punctuation must fail the
+    // Chinese-character density check even though proseCount passes.
+    var paddedRejected = false
+    do {
+      let padded = String(repeating: "字，", count: (chapterRange!.minWords + 1) / 2)
+      try await core.validateChapterLength(
+        padded,
+        chapterNumber: 3,
+        minWords: chapterRange!.minWords,
+        maxWords: chapterRange!.maxWords,
+        label: "正文"
+      )
+    } catch {
+      paddedRejected = true
+    }
+    precondition(paddedRejected, "punctuation-padded chapter must fail the density floor")
+
+    // Deterministic craft checks reject ledger blocks, fade-out endings and
+    // ability-free openings before the review pass.
+    var ledgerRejected = false
+    do {
+      try await core.validateChapterCraft(
+        String(repeating: "字", count: 200)
+          + "\n存水：十二升\n存粮：五天\n燃料：两罐\n"
+          + String(repeating: "字", count: 200),
+        chapterNumber: 4,
+        label: "正文"
+      )
+    } catch {
+      ledgerRejected = true
+    }
+    precondition(ledgerRejected, "ledger enumeration blocks must be rejected")
+
+    var fadeOutRejected = false
+    do {
+      try await core.validateChapterCraft(
+        String(repeating: "字", count: 400) + "\n他锁好门，躺在行军床上沉沉睡去。",
+        chapterNumber: 4,
+        label: "正文"
+      )
+    } catch {
+      fadeOutRejected = true
+    }
+    precondition(fadeOutRejected, "fade-out endings must be rejected")
+
+    var anchorRejected = false
+    do {
+      try await core.validateChapterCraft(
+        String(repeating: "字", count: 400),
+        chapterNumber: 1,
+        label: "正文"
+      )
+    } catch {
+      anchorRejected = true
+    }
+    precondition(anchorRejected, "opening chapters without an anomaly anchor must be rejected")
+
+    // Dialogue attribution shares the label-colon shape but is prose, so a
+    // quoted exchange must not trip the ledger check.
+    try await core.validateChapterCraft(
+      String(repeating: "字", count: 200)
+        + "\n他问：“你听见了？”\n她答：“听见了。”\n他问：“在哪里？”\n"
+        + String(repeating: "字", count: 200),
+      chapterNumber: 4,
+      label: "正文"
+    )
+
     // Runtime state files must reflect approved progress, not the creation-time
     // placeholders.
     await core.refreshRuntimeStateFiles(bookID: books[0].id, plan: replayedPlan)

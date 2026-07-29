@@ -6,6 +6,9 @@ extension InkOSCore {
     let model: String
     let baseURL: String
     let latencyMilliseconds: Int
+    /// Last finish_reason seen on the response ("stop", "length", …). A
+    /// truncated stream is otherwise indistinguishable from a complete one.
+    let finishReason: String?
   }
 
   enum LLMRole: Sendable {
@@ -230,20 +233,19 @@ extension InkOSCore {
         guidance: guidance,
         beat: beat
       )
-      let result = try await requestLLM(
+      let currentPlan = try synchronizeContinuityProjection(bookID: bookID)
+      let (parsed, result) = try await requestChapterPayload(
         prompt: prompt,
-        role: .primary,
-        json: true,
+        chapterNumber: chapterNumber,
+        requireDelta: currentPlan.continuity.policy.requireConsistencyDelta,
         timeout: 600,
         onPartialContent: { [weak self] partial in
           await self?.updateGenerationLiveText(key: key, rawText: partial)
         }
       )
-      let parsed = parseJSONObject(result.content) ?? [:]
-      let currentPlan = try synchronizeContinuityProjection(bookID: bookID)
       let suppliedDelta = parsed["consistencyDelta"] as? [String: Any]
       if currentPlan.continuity.policy.requireConsistencyDelta, suppliedDelta == nil {
-        throw InkOSCoreError("模型未返回 consistencyDelta", statusCode: 422)
+        throw InkOSCoreError("模型未返回 consistencyDelta（自动补登后仍缺失）", statusCode: 422)
       }
       let rawDelta = suppliedDelta ?? [:]
       let candidateDelta = try normalizedConsistencyDelta(rawDelta, chapterNumber: chapterNumber)
@@ -261,6 +263,11 @@ extension InkOSCore {
           ?? plan.constraints.targetChapterWords,
         maxWords: plan.plan.chapters.first { $0.number == chapterNumber }?.maxWords
           ?? plan.constraints.targetChapterWords,
+        label: "章节正文"
+      )
+      try validateChapterCraft(
+        content,
+        chapterNumber: chapterNumber,
         label: "章节正文"
       )
 
@@ -377,20 +384,19 @@ extension InkOSCore {
         第\(chapter.number)章 \(chapter.title)
         \(chapter.content)
         """
-      let result = try await requestLLM(
+      let refreshedPlan = try synchronizeContinuityProjection(bookID: bookID)
+      let (parsed, result) = try await requestChapterPayload(
         prompt: prompt,
-        role: .primary,
-        json: true,
+        chapterNumber: chapter.number,
+        requireDelta: refreshedPlan.continuity.policy.requireConsistencyDelta,
         timeout: 600,
         onPartialContent: { [weak self] partial in
           await self?.updateGenerationLiveText(key: key, rawText: partial)
         }
       )
-      let parsed = parseJSONObject(result.content) ?? [:]
-      let refreshedPlan = try synchronizeContinuityProjection(bookID: bookID)
       let suppliedDelta = parsed["consistencyDelta"] as? [String: Any]
       if refreshedPlan.continuity.policy.requireConsistencyDelta, suppliedDelta == nil {
-        throw InkOSCoreError("模型未返回 consistencyDelta", statusCode: 422)
+        throw InkOSCoreError("模型未返回 consistencyDelta（自动补登后仍缺失）", statusCode: 422)
       }
       let rawDelta = suppliedDelta ?? [:]
       let candidateDelta = try normalizedConsistencyDelta(rawDelta, chapterNumber: chapter.number)
@@ -404,6 +410,11 @@ extension InkOSCore {
         chapterNumber: chapter.number,
         minWords: minWords,
         maxWords: maxWords,
+        label: "修订正文"
+      )
+      try validateChapterCraft(
+        content,
+        chapterNumber: chapter.number,
         label: "修订正文"
       )
       generationJobs[key] = try makeGenerationJob(
@@ -568,10 +579,13 @@ extension InkOSCore {
       当 allowUnplannedEntities=false 时，正文不得引入审核前索引中不存在的人物、物品、地点、组织或概念。
       节拍卡的禁止清单等同硬约束：正文若出现被本章明令推迟的剧情、人物、物品、能力或结局，记为 hard。
       正文字数必须在 \(minWords) 至 \(maxWords) 字之间，超出记为 hard。
+      章末必须停在节拍卡声明的选择、反转、倒计时或新信息上。若以总结、氛围淡出、格言独白或"安心睡去"式收尾收束全章，记为 hard。
+      正文不得用清单、备忘录、条目化盘点或资料登记块承担叙事。主角本人的账本记录也只能以动作与判断混合的方式呈现，不能以并列条目铺陈，出现记为 hard。
+      开篇章（第 1 至 3 章）必须给出主角核心能力或金手指的明确锚点：异常征兆、首次显现或章末触发均可，但不得以任何理由整章回避。若开篇章完全未触及核心能力，记为 hard。
       以上任一问题输出前缀 [hard]。
 
       第二类：写法质量（不阻断）。依据下方写法内核与本书写法约束检查：
-      是否有用总结代替关键场景，是否跳过了本该写出的冲突过程；开场是否为背景综述或履历介绍；是否用清单、备忘录、条目化盘点承担叙事；对话是否承载了关键分歧和转折；本章必需事件和挫折是否真的在场景里发生；视角是否统一；章末是否落在钩子上而非总结。
+      是否有用总结代替关键场景，是否跳过了本该写出的冲突过程；开场是否为背景综述或履历介绍；对话是否承载了关键分歧和转折；本章必需事件和挫折是否真的在场景里发生；视角是否统一；配角语言是否符合其身份、能否相互区分；承诺的冷幽默是否落地。
       这些问题输出前缀 [soft]，并在 revisionGuidance 中给出具体可执行的改法。
 
       pass 只取决于 [hard]：没有 [hard] 问题时 pass=true，即使存在 [soft] 问题。
@@ -691,7 +705,10 @@ extension InkOSCore {
       \(checkpointPolicy)
       本章的写作范围由下面的节拍卡界定：只写节拍卡安排的内容，节拍卡列为禁止提前出现的内容一律不得发生。宁可把一个问题写透，也不要多推进剧情。
       consistencyDelta 必须记录本章新增、更新或删除的事实；新增随机设定必须登记，并与既有事实兼容。
-      只输出 JSON：{"title":"章节标题","content":"完整正文","summary":"章节摘要","consistencyDelta":{"upsert":{"immutableCanon":[],"worldRules":[],"entities":[],"knowledgeBoundaries":[],"timeline":[],"hooks":[]},"remove":{"immutableCanon":[],"worldRules":[],"entities":[],"knowledgeBoundaries":[],"timeline":[],"hooks":[]}}}。
+      entities 每一项的 type 只能取五个值之一，必须按对象性质如实归类，禁止一律填 character：
+      character 有意识的人物或生物；location 楼层、房间、区域、建筑等场所；object 物品、设备、资源、储备等实体物；faction 组织、势力、团体；concept 能力、规则、现象等抽象概念。例如“201公寓”“储物间”是 location，“电热水器存水”“界务门”这类物件或装置是 object，只有真正的人才是 character。
+      正文里改变生存账本或后续决策的关键资源（存水量、存粮、燃料、电量等）必须在 entities 或 hooks 中登记，且 Delta 中的每个数字与结论都要与正文严格一致，不得出现正文一个数、Delta 另一个数的矛盾。
+      只输出 JSON：{"title":"章节标题","content":"完整正文","summary":"章节摘要","consistencyDelta":{"upsert":{"immutableCanon":[],"worldRules":[],"entities":[{"id":"","name":"","type":"character|location|object|faction|concept"}],"knowledgeBoundaries":[],"timeline":[],"hooks":[]},"remove":{"immutableCanon":[],"worldRules":[],"entities":[],"knowledgeBoundaries":[],"timeline":[],"hooks":[]}}}。
       \(guidance.map { "本章额外要求：\($0)" } ?? "")
 
       \(craft)
@@ -847,19 +864,20 @@ extension InkOSCore {
     request.httpBody = try JSONSerialization.data(withJSONObject: body)
     let started = Date()
     if let onPartialContent {
-      let content = try await performLLMStreamingRequest(
+      let streamed = try await performLLMStreamingRequest(
         request,
         operation: "chat.completions.stream",
         onPartialContent: onPartialContent
       )
-      guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      guard !streamed.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
         throw InkOSCoreError("模型返回了空内容", statusCode: 502)
       }
       return LLMResult(
-        content: content,
+        content: streamed.content,
         model: model,
         baseURL: baseURL,
-        latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1000)
+        latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1000),
+        finishReason: streamed.finishReason
       )
     }
     let (data, response) = try await performLLMRequest(request, operation: "chat.completions")
@@ -878,7 +896,8 @@ extension InkOSCore {
       content: content,
       model: model,
       baseURL: baseURL,
-      latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1000)
+      latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1000),
+      finishReason: (choices.first?["finish_reason"] as? String)?.nonEmpty
     )
   }
 
@@ -971,7 +990,7 @@ extension InkOSCore {
     _ request: URLRequest,
     operation: String,
     onPartialContent: @Sendable (String) async -> Void
-  ) async throws -> String {
+  ) async throws -> (content: String, finishReason: String?) {
     do {
       let (bytes, response) = try await URLSession.shared.bytes(for: request)
       if let requestedURL = request.url?.absoluteString,
@@ -997,6 +1016,7 @@ extension InkOSCore {
 
       var content = ""
       var nonStreamData = Data()
+      var finishReason: String? = nil
       var lastEmittedCount = 0
       var lastEmittedAt = Date.distantPast
       for try await line in bytes.lines {
@@ -1014,6 +1034,9 @@ extension InkOSCore {
         let choices = object["choices"] as? [[String: Any]] ?? []
         let delta = choices.first?["delta"] as? [String: Any]
         let message = choices.first?["message"] as? [String: Any]
+        if let reason = choices.first?["finish_reason"] as? String, !reason.isEmpty {
+          finishReason = reason
+        }
         let piece = extractMessageContent(delta?["content"])
           .nonEmpty ?? extractMessageContent(message?["content"])
         if !piece.isEmpty { content += piece }
@@ -1033,9 +1056,12 @@ extension InkOSCore {
         let choices = object["choices"] as? [[String: Any]] ?? []
         let message = choices.first?["message"] as? [String: Any]
         content = extractMessageContent(message?["content"])
+        if let reason = choices.first?["finish_reason"] as? String, !reason.isEmpty {
+          finishReason = reason
+        }
       }
       if !content.isEmpty { await onPartialContent(content) }
-      return content
+      return (content, finishReason)
     } catch is CancellationError {
       throw CancellationError()
     } catch let error as InkOSCoreError {
@@ -1126,6 +1152,89 @@ extension InkOSCore {
       }
     }
     return output
+  }
+
+  /// Structured chapter payload with two resilience layers. Previously a
+  /// single malformed model output — truncated stream, unescaped control
+  /// characters, or a missing consistencyDelta — discarded a full chapter
+  /// write with the opaque "模型未返回 consistencyDelta" error and preserved
+  /// no evidence of what the model actually emitted.
+  ///
+  /// Layer 1: unparseable output is logged (finishReason, length, head/tail)
+  /// and retried once with a strict-format suffix. Layer 2: a payload that
+  /// parses but omits a required delta gets one cheap delta-only completion
+  /// instead of a full rewrite. The chapter text is never salvaged from
+  /// broken JSON — a retry is cheap compared to trusting a torn response.
+  func requestChapterPayload(
+    prompt: String,
+    chapterNumber: Int,
+    requireDelta: Bool,
+    timeout: TimeInterval,
+    onPartialContent: (@Sendable (String) async -> Void)? = nil
+  ) async throws -> (object: [String: Any], result: LLMResult) {
+    var result = try await requestLLM(
+      prompt: prompt,
+      role: .primary,
+      json: true,
+      timeout: timeout,
+      onPartialContent: onPartialContent
+    )
+    var parsed = parseJSONObject(result.content)
+    if parsed == nil {
+      recordDebug(scope: "generation", message: "chapter.invalidJson", level: "error", data: [
+        "chapterNumber": chapterNumber,
+        "finishReason": result.finishReason ?? "unknown",
+        "contentLength": result.content.count,
+        "head": String(result.content.prefix(200)),
+        "tail": String(result.content.suffix(200)),
+      ])
+      result = try await requestLLM(
+        prompt: prompt + """
+
+
+          严格要求：上次输出不是合法 JSON。本次必须输出严格合法的 JSON：字符串内的换行一律写成 \\n 转义，不得出现未转义的引号或控制字符，整个对象必须以 } 闭合结束。
+          """,
+        role: .primary,
+        json: true,
+        timeout: timeout,
+        onPartialContent: onPartialContent
+      )
+      parsed = parseJSONObject(result.content)
+    }
+    guard var object = parsed else {
+      throw InkOSCoreError(
+        "模型连续两次未返回合法 JSON（finishReason=\(result.finishReason ?? "未知")，输出 \(result.content.count) 字符）。末尾片段：\(String(result.content.suffix(120)))",
+        statusCode: 422
+      )
+    }
+    if requireDelta, object["consistencyDelta"] as? [String: Any] == nil {
+      recordDebug(scope: "generation", message: "chapter.deltaRepair.started", data: [
+        "chapterNumber": chapterNumber,
+      ])
+      let repairPrompt = """
+        你是 InkOS 一致性登记员。下面是一章已定稿的小说正文，请只为它输出 consistencyDelta 的 JSON：{"upsert":{"immutableCanon":[],"worldRules":[],"entities":[],"knowledgeBoundaries":[],"timeline":[],"hooks":[]},"remove":{"immutableCanon":[],"worldRules":[],"entities":[],"knowledgeBoundaries":[],"timeline":[],"hooks":[]}}。
+        entities 每一项的 type 只能取五个值之一：character 人物或生物；location 场所；object 物品；faction 组织；concept 能力、规则、现象等抽象概念。每个数字与结论都要与正文严格一致。不要输出正文，不要输出解释。
+        【章节正文】
+        第\(chapterNumber)章
+        \(string(object["content"]))
+        """
+      if let repaired = try? await requestLLM(
+        prompt: repairPrompt,
+        role: .primary,
+        json: true,
+        timeout: 300
+      ), let repairedObject = parseJSONObject(repaired.content) {
+        let delta = (repairedObject["consistencyDelta"] as? [String: Any])
+          ?? (repairedObject["upsert"] != nil ? repairedObject : nil)
+        if let delta {
+          object["consistencyDelta"] = delta
+          recordDebug(scope: "generation", message: "chapter.deltaRepair.completed", data: [
+            "chapterNumber": chapterNumber,
+          ])
+        }
+      }
+    }
+    return (object, result)
   }
 
   func parseJSONObject(_ text: String) -> [String: Any]? {

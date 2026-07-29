@@ -702,6 +702,22 @@ func proseCount(_ text: String) -> Int {
   }
 }
 
+/// Chinese-character body density, used for the minimum-length check. The
+/// platform word counter includes punctuation, so proseCount matches what the
+/// reader sees on the shelf; bodyWordCount matches what "4000 字一章" actually
+/// means in prose. A chapter can hit 3400 on proseCount with under 3000
+/// Chinese characters of actual prose, which is how the first chapter of
+/// 渊雨浩劫 passed while feeling thin.
+func bodyWordCount(_ text: String) -> Int {
+  text.unicodeScalars.reduce(into: 0) { count, scalar in
+    if (0x4E00...0x9FFF).contains(scalar.value)
+      || (0x3400...0x4DBF).contains(scalar.value)
+      || (0x20000...0x2A6DF).contains(scalar.value) {
+      count += 1
+    }
+  }
+}
+
 func stripChapterHeading(_ text: String) -> String {
   var lines = text.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
   if let first = lines.first, first.trimmingCharacters(in: .whitespaces).hasPrefix("# 第") {

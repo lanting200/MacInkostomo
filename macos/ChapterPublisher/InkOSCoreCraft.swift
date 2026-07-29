@@ -245,6 +245,11 @@ extension InkOSCore {
       3. 本批次结束时故事的推进量必须与 \(progressEnd)% 的卷内进度相称，不得提前完成本卷阶段目标。
       4. 已在既有章节发生的事不要重复安排；未登记的新人物和新物品要少量、必要且可追溯。
 
+      同样有约束力的是开篇与钩子的排期纪律：
+      1. 若本批次覆盖第 1 章，第一章必须给出主角核心能力或金手指的明确锚点——异常征兆、首次显现或章末触发均可，但不得整章回避。核心能力的完整使用循环可以推迟，其存在本身不能推迟到第 4 章之后。
+      2. 每章的 endingHook 必须是读者能立刻预期"下一章会发生什么"的具体事件：一个待做的选择、一个刚揭露的反转、一个正在走动的倒计时、一条刚到手的新线索。禁止用氛围描写、情绪总结或主角安心收尾作为 endingHook。
+      3. 主角的 setback 必须让他在本章结束时处于比开场更被动或更紧迫的位置，而不是"清点完家底后安心等待"。
+
       字段含义：
       number 章号；volumeNumber 卷号；goal 本章要解决或推进的一个具体问题；openingHook 开场的具体时刻或动作，不是背景介绍；scenes 本章 1 至 3 个场景，每项写清地点、在场人物和现场冲突；requiredEvents 本章必须在正文里被看见发生的事，2 至 4 条，写成可验证的具体事件；forbiddenElements 本章禁止提前出现或提前解决的内容，3 至 6 条，逐条点名具体剧情、人物、物品或能力；endingHook 章末停留的选择、反转、倒计时或新信息；focusCharacters 本章出场并有作用的人物，含新引入者；newNamedCharacters 本章新引入的具名人物数量；timeSpan 本章覆盖的故事时间跨度；setback 本章必须出现的挫折、代价或失败；notes 给写作模型的补充提醒。
 
@@ -497,9 +502,13 @@ extension InkOSCore {
 
   // MARK: - Length enforcement
 
-  /// Enforces the per-chapter word window from the long-form plan. Previously
-  /// only a flat 500-character floor was checked, so the planned 3400-4600
-  /// window was advisory and a chapter could summarize its way to any length.
+  /// Enforces the per-chapter word window from the long-form plan. The window
+  /// itself stays on proseCount, which is the number the plan was budgeted in
+  /// and the number the reader sees on the shelf. A second, lower floor checks
+  /// Chinese-character density so a chapter cannot reach the window on
+  /// punctuation and whitespace: a dialogue-heavy chapter legitimately spends
+  /// well under 100% of its count on characters, but under 85% means the prose
+  /// is padded rather than written.
   func validateChapterLength(
     _ content: String,
     chapterNumber: Int,
@@ -508,6 +517,7 @@ extension InkOSCore {
     label: String
   ) throws {
     let count = proseCount(content)
+    let bodyCount = bodyWordCount(content)
     guard count >= 500 else {
       throw InkOSCoreError("模型返回的\(label)过短（\(count) 字）", statusCode: 422)
     }
@@ -520,9 +530,129 @@ extension InkOSCore {
         statusCode: 422
       )
     }
+    let bodyFloor = minWords * 85 / 100
+    guard bodyCount >= bodyFloor else {
+      throw InkOSCoreError(
+        "第\(chapterNumber)章\(label)共 \(count) 字，但其中只有 \(bodyCount) 个中文字符，低于正文密度下限 \(bodyFloor) 字。本章靠标点、空行或符号凑到了计划字数，需要把场景真正展开。",
+        statusCode: 422
+      )
+    }
     guard count <= ceiling else {
       throw InkOSCoreError(
         "第\(chapterNumber)章\(label)达到 \(count) 字，超过计划上限 \(maxWords) 字。本章承载的剧情量超出排期，应把多余内容留给后续章节。",
+        statusCode: 422
+      )
+    }
+  }
+
+  // MARK: - Deterministic craft checks
+
+  /// Local, non-LLM backstop for rules the review model tends to let through as
+  /// soft advisories. These checks reject content before it ever reaches the
+  /// review pass, so a chapter cannot "pass" while violating its own craft
+  /// constraints. Anything semantic (is the ending actually a hook) stays with
+  /// the review model's hard rules.
+  func validateChapterCraft(
+    _ content: String,
+    chapterNumber: Int,
+    label: String
+  ) throws {
+    try rejectLedgerBlocks(content, chapterNumber: chapterNumber, label: label)
+    try rejectAphoristicEnding(content, chapterNumber: chapterNumber, label: label)
+    if chapterNumber <= 3 {
+      try requireOpeningAbilityAnchor(content, chapterNumber: chapterNumber, label: label)
+    }
+  }
+
+  /// Ledger-style narration: three or more consecutive lines that each open
+  /// with a `标签：` enumeration. This is the shape the craft rules forbid —
+  /// inventory, memo and registration blocks doing narrative work — regardless
+  /// of whether the review model flags it.
+  private func rejectLedgerBlocks(
+    _ content: String,
+    chapterNumber: Int,
+    label: String
+  ) throws {
+    var run = 0
+    var worst = 0
+    for rawLine in content.components(separatedBy: "\n") {
+      let line = rawLine.trimmingCharacters(in: .whitespaces)
+      var isLedgerLine = false
+      if line.count <= 80,
+        let colonMatch = line.range(of: "^[^：:，。\\s]{1,8}[：:]", options: .regularExpression) {
+        let content = line[colonMatch.upperBound...].drop(while: { $0 == " " })
+        // Dialogue attribution (他说："…") shares the label-colon shape; only
+        // unquoted enumeration is a ledger entry.
+        let quoteOpeners: Set<Character> = ["\"", "'", "\u{201C}", "\u{2018}", "「", "『"]
+        if let first = content.first, !quoteOpeners.contains(first) {
+          isLedgerLine = true
+        }
+      }
+      if isLedgerLine {
+        run += 1
+        worst = max(worst, run)
+      } else if !line.isEmpty {
+        run = 0
+      }
+    }
+    guard worst < 3 else {
+      throw InkOSCoreError(
+        "第\(chapterNumber)章\(label)出现 \(worst) 条连续的清单式条目（“标签：内容”）。写法约束禁止用清单、备忘录和条目化盘点承担叙事，请把账本信息改写为动作与判断混合的叙述。",
+        statusCode: 422
+      )
+    }
+  }
+
+  /// Aphoristic or fade-out endings: the final line is a summary, a maxim, or
+  /// the protagonist settling in to wait, instead of landing on a choice,
+  /// reversal, countdown or new information.
+  private func rejectAphoristicEnding(
+    _ content: String,
+    chapterNumber: Int,
+    label: String
+  ) throws {
+    let tail = content.components(separatedBy: "\n")
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+      .suffix(3)
+      .joined()
+    // Markers must be long enough to be unambiguous: a bare "熬" or "伴着"
+    // appears in perfectly hooked endings, so only settled, completed-action
+    // fade-outs are listed here. Borderline endings fall through to the
+    // review model's hard rule, which is the cheaper failure.
+    let fadeOutMarkers = [
+      "陪着他入睡", "沉沉睡去", "进入梦乡", "一夜无话", "安然入睡",
+      "渐渐平静", "恢复了平静", "一切又归于", "的第一夜", "熬过了这一夜",
+      "度过了这一夜"
+    ]
+    let summaryMarkers = ["这就是", "他终于明白", "从这一天起", "无论如何，生活还要继续"]
+    let tailText = String(tail.suffix(80))
+    if fadeOutMarkers.contains(where: tailText.contains) || summaryMarkers.contains(where: tailText.contains) {
+      throw InkOSCoreError(
+        "第\(chapterNumber)章\(label)以总结、氛围淡出或格言式收尾收束全章。章末必须停在选择、反转、倒计时或新信息上，请重写结尾。",
+        statusCode: 422
+      )
+    }
+  }
+
+  /// Opening chapters must not dodge the protagonist's core ability entirely.
+  /// The review prompt states the rule; this check enforces the cheap part of
+  /// it — the text must at least gesture at the abnormal. The word list is
+  /// deliberately generic (no book-specific proper nouns) so it only rejects
+  /// chapters that contain no anomaly vocabulary at all; the review model
+  /// still judges whether the anchor is meaningful.
+  private func requireOpeningAbilityAnchor(
+    _ content: String,
+    chapterNumber: Int,
+    label: String
+  ) throws {
+    let anchors = [
+      "异常", "不对", "不该", "不属于",
+      "凭空", "多出来", "原本没有", "不在这里", "消失", "出现了", "没有道理"
+    ]
+    guard anchors.contains(where: content.contains) else {
+      throw InkOSCoreError(
+        "第\(chapterNumber)章是开篇章，但正文完全没有触及主角核心能力或金手指的任何征兆。开篇章必须以异常征兆、首次显现或章末触发的形式给出能力锚点。",
         statusCode: 422
       )
     }
