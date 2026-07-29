@@ -105,11 +105,19 @@ and deletion inside a temporary directory; it must not touch real `book/` or `da
 ## Data Directories
 
 - Debug builds use the existing `book/` and `data/` next to the Xcode project.
+  These are live user novels, not fixtures.
 - Release builds use `~/Library/Application Support/MacInkostomo/`; first launch
   copies existing books and configuration from the legacy workspace.
 - `MACINKOSTOMO_WORKSPACE` explicitly selects a data workspace; use it for tests
   and controlled migrations. All persistence tests must run against a temporary
   workspace.
+- Workspace resolution order (`InkOSCore.swift`): `MACINKOSTOMO_WORKSPACE`, then
+  in DEBUG only `CHAPTER_PUBLISHER_ROOT`, the `ChapterPublisherRoot` Info.plist
+  key, and the current directory. A Debug build launched without an explicit
+  workspace therefore resolves the real `book/` and `data/`.
+- `MACINKOSTOMO_WORKSPACE` must be exported into the app's own process. `open -a`
+  goes through LaunchServices, which does not inherit shell environment
+  variables, so a shell-set variable does not reach the app.
 
 ## Coding Style
 
@@ -124,6 +132,26 @@ and deletion inside a temporary directory; it must not touch real `book/` or `da
 - Validate book IDs and story relative paths before any file access.
 - Preserve Chinese UI strings and novel content unless the task explicitly requests
   copy changes. Code comments and identifiers are in English.
+
+## Documentation
+
+`README.md`, this file, and `INKOS_COMPATIBILITY_AUDIT.md` describe behavior that
+ships, not behavior that is planned. During the native migration these documents
+were written as the intended spec and ran ahead of the Swift wiring, which made
+half-built features read as done.
+
+- Before trusting a documented behavior, grep for callers of the named symbol. A
+  core function with no caller is not a shipped feature: `craftAdvisoryList` had
+  no UI consumer and `invalidateChapterBeats` had no caller while both were
+  documented as active.
+- Before writing a documented behavior, confirm the whole path exists — typed
+  `InkOSLibrary` entry point, core implementation, and the UI or core caller that
+  actually reaches it. Describe partial wiring as partial.
+- When code and docs disagree on a detail (settings grouping, file path, group
+  title), check which placement the code chose deliberately and fix the doc
+  instead of moving the code.
+- Update these three files in the same change as the behavior they describe.
+  Doc-only corrections need no rebuild; state that they were not built.
 
 ## Long-Form Governance
 
@@ -154,12 +182,30 @@ and deletion inside a temporary directory; it must not touch real `book/` or `da
 
 - Build both Debug and Release for native changes.
 - Run the native smoke test for storage or planning changes.
-- For app-level verification, launch the built `.app`, inspect its accessibility
-  tree and process tree, and confirm there is no child runtime process and no
-  listening socket — `MacInkostomo.app` must not spawn an internal service or
-  listen on any local port.
 - Persistence tests must use a temporary workspace and leave `data/` and `book/`
   untouched.
+
+App-level verification (no child runtime process, no listening socket) launches a
+real app that writes to a real workspace. Never point it at `book/` or `data/`:
+
+```bash
+MACINKOSTOMO_WORKSPACE=$(mktemp -d) \
+  /path/to/MacInkostomo.app/Contents/MacOS/MacInkostomo
+```
+
+- Exec the binary inside the bundle directly. Do not use `open -a` — it drops the
+  workspace variable and the app falls back to the real Debug workspace.
+- Confirm the isolation actually took effect by checking the temporary directory
+  is non-empty afterward. Do not assume the variable applied.
+- Scope `lsof` to the app's PID with `-a`; without it the selection filters are
+  ORed and unrelated processes' listeners appear in the result.
+- `MacInkostomo.app` must not spawn an internal service or listen on any local
+  port. Verify against the app's own process subtree.
+- If a launch does reach the real workspace, books are recoverable: `deleteBook`
+  moves the directory to `data/deleted-books/<epoch>-<id>/` instead of deleting,
+  and `fetchBooks` unions `state.json` keys with the on-disk `book/books/`
+  listing, so moving the directory back restores the book with no `state.json`
+  edit. Snapshot `data/state.json` before any launch that could write.
 
 ## Security
 

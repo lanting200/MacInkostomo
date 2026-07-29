@@ -6,6 +6,17 @@ MacInkostomo is a native SwiftUI app with an in-process Swift `InkOSCore`. The a
 
 Never commit `data/`, `book/`, credentials, user state, backups, or build output.
 
+## Two failure modes with dedicated rules in AGENTS.md
+
+- `book/` and `data/` in this repository are live user novels. A Debug build
+  launched without `MACINKOSTOMO_WORKSPACE` writes to them. Read the Testing
+  section of [AGENTS.md](AGENTS.md) before launching the built app for any
+  verification.
+- These documents were written as the intended spec during the native migration
+  and once ran ahead of the Swift wiring. Grep for callers before reporting a
+  documented behavior as shipped, and read the Documentation section of
+  [AGENTS.md](AGENTS.md) before adding a claim to them.
+
 ## Turn discipline
 
 - Do not end your turn while the current task is unfinished. If you wrote that
