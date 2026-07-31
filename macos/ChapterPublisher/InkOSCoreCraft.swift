@@ -22,6 +22,7 @@ extension InkOSCore {
     8 结尾：章末停在选择、反转、倒计时或新信息上。不做本章总结，不预告下一章，不用格言式独白收尾。
     9 篇幅：正文字数必须落在本章计划区间内。靠场景展开、对话和细节达到字数，禁止靠编号清单、条目化盘点、备忘录正文和资料登记堆字数；此类内容单章合计不超过 200 字。
     10 排期：只写本章节拍卡列出的内容。节拍卡未列出的后续剧情、副本、任务、地点、人物、物品和能力，不得提前出现、提前获得或提前解决。
+    11 主角情感显影：主角每章至少要有一个与推进剧情无关的情绪泄底时刻——恐惧、疲惫、犹豫、馋、疼、想念、自嘲或没来由的恼火，篇幅可以很小但不能没有。情绪只用三种载体呈现：生理反应（胃部收紧、后颈出汗、手指发抖）、动作泄底（反复检查、把东西摆了又摆、话到嘴边改口）、对话失态（音量变化、说半句停住、开不合时宜的玩笑）。禁止用“他很害怕”“他很难过”这类情绪标签直接命名。主角不能全程最优解：每章至少一次让情绪压过理性判断半步，代价可以很小，但必须是他“忍不住”。冷幽默是主角的防御机制，不是情感的替代品——玩笑落地时，要让读者看见他在防什么。
     """
 
   /// Extra constraints for the first chapters, where the failure mode is
@@ -140,6 +141,43 @@ extension InkOSCore {
     return beat
   }
 
+  /// Plans the next beat batch in the background once the current batch is
+  /// nearly consumed. Batch planning is by far the slowest call in the
+  /// chapter pipeline (measured 850s+ on a loaded relay) yet is only needed
+  /// every ten chapters, so overlapping it with human review time removes
+  /// the stall from the user's path entirely. Failures are swallowed: the
+  /// lazy path in ensureChapterBeat re-plans on demand.
+  func prefetchUpcomingBeatBatch(
+    bookID: String,
+    currentChapter: Int,
+    plan: LongFormPlanResponse
+  ) {
+    let current = beatBatchRange(chapterNumber: currentChapter, plan: plan)
+    guard currentChapter >= current.end - 2 else { return }
+    let nextStart = current.end + 1
+    guard nextStart <= plan.plan.targetChapters else { return }
+    guard !beatPrefetchInFlight.contains(nextStart) else { return }
+    guard (try? chapterBeat(bookID: bookID, chapterNumber: nextStart)) == nil else { return }
+    beatPrefetchInFlight.insert(nextStart)
+    recordDebug(scope: "craft", message: "chapter_beats.prefetch.started", data: [
+      "bookId": bookID, "fromChapter": nextStart,
+    ])
+    Task {
+      defer { beatPrefetchInFlight.remove(nextStart) }
+      do {
+        let freshPlan = try synchronizeContinuityProjection(bookID: bookID)
+        _ = try await ensureChapterBeat(bookID: bookID, chapterNumber: nextStart, plan: freshPlan)
+        recordDebug(scope: "craft", message: "chapter_beats.prefetch.completed", data: [
+          "bookId": bookID, "fromChapter": nextStart,
+        ])
+      } catch {
+        recordDebug(scope: "craft", message: "chapter_beats.prefetch.failed", level: "warning", data: [
+          "bookId": bookID, "fromChapter": nextStart, "error": error.localizedDescription,
+        ])
+      }
+    }
+  }
+
   private func beatBatchRange(
     chapterNumber: Int,
     plan: LongFormPlanResponse
@@ -162,9 +200,29 @@ extension InkOSCore {
     plan: LongFormPlanResponse
   ) async throws -> ChapterBeatPlan {
     let prompt = try chapterBeatPrompt(bookID: bookID, range: range, plan: plan)
-    let result = try await requestLLM(prompt: prompt, role: .review, json: true, timeout: 300)
-    let parsed = parseJSONObject(result.content) ?? [:]
-    let rawBeats = parsed["beats"] as? [Any] ?? []
+    // Streamed, and not for a live preview — the transport itself is the fix.
+    // `k3` is a reasoning model: on a non-streaming request the relay sends
+    // nothing until the whole reasoning pass finishes, and `timeoutInterval`
+    // measures inactivity, so a 300s ceiling aborted this call whenever the
+    // model thought for longer. Measured on the same prompt: non-streaming
+    // first byte 113.9s, streaming 2.4s then ~800 reads. Chapter 11 of
+    // 《渊雨浩劫》 failed six straight attempts at 300/305/313s — every one on
+    // the ceiling, none on the relay being down. Streaming keeps bytes
+    // arriving so the inactivity timer never expires; the raised ceiling
+    // matches the chapter write and covers the slowest observed batch (899s).
+    let result = try await requestLLM(
+      prompt: prompt,
+      role: .review,
+      json: true,
+      timeout: 900,
+      onPartialContent: { _ in }
+    )
+    // Keep a parse failure distinct from "the model returned no beats". This
+    // used to be `?? [:]`, which collapsed a response truncated at the token
+    // ceiling into an empty object and reported it as ten missing chapters —
+    // the model had in fact written the whole time and been cut off mid-scene.
+    let parsed = parseJSONObject(result.content)
+    let rawBeats = parsed?["beats"] as? [Any] ?? []
     var beats: [ChapterBeat] = []
     for raw in rawBeats {
       guard let object = raw as? [String: Any], let number = integer(object["number"]),
@@ -174,9 +232,55 @@ extension InkOSCore {
     }
     let expected = Set(range.start...range.end)
     let produced = Set(beats.map(\.number))
-    guard expected.subtracting(produced).isEmpty else {
-      let missing = expected.subtracting(produced).sorted().map(String.init).joined(separator: "、")
-      throw InkOSCoreError("节拍卡生成不完整，缺少第 \(missing) 章", statusCode: 502)
+    if !expected.subtracting(produced).isEmpty {
+      let missing = expected.subtracting(produced).sorted()
+      let truncated = result.finishReason == "length"
+      recordDebug(scope: "craft", message: "chapter_beats.incomplete", level: "error", data: [
+        "bookId": bookID,
+        "startChapter": range.start,
+        "endChapter": range.end,
+        "missing": missing.map(String.init).joined(separator: "、"),
+        "parsedBeats": beats.count,
+        "parseFailed": parsed == nil,
+        "truncated": truncated,
+        "finishReason": result.finishReason ?? "unknown",
+        "contentLength": result.content.count,
+        "head": String(result.content.prefix(200)),
+        "tail": String(result.content.suffix(200)),
+      ])
+      // A batch cut off at the ceiling is an output-budget problem, not a model
+      // refusal: ten beats with three array fields each overran maxTokens while
+      // five fit. Halving the range and planning the halves in order keeps the
+      // whole span covered — the second half receives the first half through
+      // previousBeatsText, so ordering matters. Splitting only helps while the
+      // range is still divisible; a single chapter that still truncates is a
+      // real failure and throws.
+      if truncated, range.end > range.start {
+        let firstHalfEnd = range.start + (range.end - range.start) / 2
+        recordDebug(scope: "craft", message: "chapter_beats.splitRetry", level: "warning", data: [
+          "bookId": bookID,
+          "startChapter": range.start,
+          "endChapter": range.end,
+          "firstHalfEnd": firstHalfEnd,
+        ])
+        _ = try await generateChapterBeatBatch(
+          bookID: bookID,
+          range: (start: range.start, end: firstHalfEnd, volume: range.volume),
+          plan: plan
+        )
+        return try await generateChapterBeatBatch(
+          bookID: bookID,
+          range: (start: firstHalfEnd + 1, end: range.end, volume: range.volume),
+          plan: plan
+        )
+      }
+      let detail = truncated
+        ? "模型输出在 maxTokens 处被截断（已写 \(result.content.count) 字符）"
+        : "模型未返回这些章节（finishReason=\(result.finishReason ?? "未知")）"
+      throw InkOSCoreError(
+        "节拍卡生成不完整，缺少第 \(missing.map(String.init).joined(separator: "、")) 章。\(detail)",
+        statusCode: 502
+      )
     }
 
     var stored = try loadChapterBeatPlan(bookID: bookID)
@@ -555,13 +659,24 @@ extension InkOSCore {
   func validateChapterCraft(
     _ content: String,
     chapterNumber: Int,
-    label: String
+    label: String,
+    openingContext: String = ""
   ) throws {
     try rejectLedgerBlocks(content, chapterNumber: chapterNumber, label: label)
     try rejectAphoristicEnding(content, chapterNumber: chapterNumber, label: label)
     if chapterNumber <= 3 {
-      try requireOpeningAbilityAnchor(content, chapterNumber: chapterNumber, label: label)
+      let openingArc = [openingContext, content]
+        .filter { !$0.isEmpty }
+        .joined(separator: "\n")
+      try requireOpeningAbilityAnchor(openingArc, chapterNumber: chapterNumber, label: label)
     }
+  }
+
+  func openingAbilityAnchorContext(bookID: String, before chapterNumber: Int) throws -> String {
+    guard chapterNumber > 1, chapterNumber <= 3 else { return "" }
+    return (1..<chapterNumber).compactMap { number in
+      try? readChapterText(bookID: bookID, number: number)
+    }.joined(separator: "\n")
   }
 
   /// Ledger-style narration: three or more consecutive lines that each open
@@ -635,9 +750,9 @@ extension InkOSCore {
     }
   }
 
-  /// Opening chapters must not dodge the protagonist's core ability entirely.
-  /// The review prompt states the rule; this check enforces the cheap part of
-  /// it — the text must at least gesture at the abnormal. The word list is
+  /// The opening arc must establish the protagonist's core ability at least
+  /// once. Previous opening chapters are included so chapters two and three do
+  /// not repeat an anchor that is already established. The word list is
   /// deliberately generic (no book-specific proper nouns) so it only rejects
   /// chapters that contain no anomaly vocabulary at all; the review model
   /// still judges whether the anchor is meaningful.
@@ -648,11 +763,12 @@ extension InkOSCore {
   ) throws {
     let anchors = [
       "异常", "不对", "不该", "不属于",
-      "凭空", "多出来", "原本没有", "不在这里", "消失", "出现了", "没有道理"
+      "凭空", "多出来", "原本没有", "不在这里", "消失", "出现了", "没有道理",
+      "乱码", "倒计时", "屏幕花", "闪出", "翻页声", "后颈发麻"
     ]
     guard anchors.contains(where: content.contains) else {
       throw InkOSCoreError(
-        "第\(chapterNumber)章是开篇章，但正文完全没有触及主角核心能力或金手指的任何征兆。开篇章必须以异常征兆、首次显现或章末触发的形式给出能力锚点。",
+        "截至第\(chapterNumber)章，开篇段仍未触及主角核心能力或金手指的任何征兆。前三章整体必须至少以异常征兆、首次显现或章末触发的形式建立一次能力锚点；前章已经建立后，本章无需重复。",
         statusCode: 422
       )
     }
