@@ -450,9 +450,15 @@ extension InkOSCore {
         if previous != item, previous.immutable, !allowImmutableChanges {
           throw continuityConflict(source, "不可变时间线 \(item.id) 与既有记录冲突")
         }
-        continuity.timeline[index] = item
+        continuity.timeline[index] = resolvingTimelineOrderCollision(
+          item,
+          in: continuity.timeline,
+          ignoringIndex: index
+        )
       } else {
-        continuity.timeline.append(item)
+        continuity.timeline.append(
+          resolvingTimelineOrderCollision(item, in: continuity.timeline, ignoringIndex: nil)
+        )
       }
     }
     for item in delta.upsert.hooks {
@@ -778,9 +784,30 @@ extension InkOSCore {
     let object = value as? [String: Any] ?? [:]
     let name = normalizedText(object["name"] ?? value)
     guard !name.isEmpty else { throw malformedDelta("实体", index) }
-    let knownTypes = Set(["character", "object", "location", "faction", "concept"])
-    let suppliedType = normalizedText(object["type"])
-    let type = knownTypes.contains(suppliedType) ? suppliedType : defaultType
+    let suppliedType = normalizedText(object["type"]).lowercased()
+    let typeAliases = [
+      "character": "character", "person": "character", "role": "character",
+      "人物": "character", "角色": "character", "生物": "character",
+      "object": "object", "item": "object", "resource": "object",
+      "物品": "object", "物件": "object", "设备": "object", "资源": "object", "储备": "object",
+      "location": "location", "place": "location", "scene": "location",
+      "地点": "location", "场所": "location", "区域": "location", "建筑": "location",
+      "faction": "faction", "organization": "faction", "group": "faction",
+      "组织": "faction", "势力": "faction", "团体": "faction",
+      "concept": "concept", "ability": "concept", "phenomenon": "concept", "rule": "concept",
+      "概念": "concept", "能力": "concept", "现象": "concept", "规则": "concept",
+    ]
+    let type: String
+    if suppliedType.isEmpty {
+      type = defaultType
+    } else if let normalized = typeAliases[suppliedType] {
+      type = normalized
+    } else {
+      throw InkOSCoreError(
+        "第\(chapterNumber)章 consistencyDelta 第\(index + 1) 个实体“\(name)”的 type=\(suppliedType) 无效，只能使用 character、object、location、faction 或 concept",
+        statusCode: 422
+      )
+    }
     var attributes: [String: String] = [:]
     if let supplied = object["attributes"] as? [String: Any] {
       for (key, raw) in supplied {
@@ -832,6 +859,32 @@ extension InkOSCore {
       availableFromChapter: integer(object["availableFromChapter"]) ?? chapterNumber,
       revealByChapter: integer(object["revealByChapter"]),
       markers: stringList(object["markers"]).isEmpty ? ["chapter-\(chapterNumber)"] : stringList(object["markers"])
+    )
+  }
+
+  /// `timeline.order` must be globally unique (see `LongFormContinuity.validated`),
+  /// but the model has no view of which orders are already taken, so a collision
+  /// used to fail the whole revision round. `order` only carries sort position, so
+  /// nudge the incoming milestone to the next free slot instead of rejecting it.
+  private func resolvingTimelineOrderCollision(
+    _ item: LongFormTimelineMilestone,
+    in timeline: [LongFormTimelineMilestone],
+    ignoringIndex: Int?
+  ) -> LongFormTimelineMilestone {
+    var taken = Set<Int>()
+    for (index, existing) in timeline.enumerated() where index != ignoringIndex {
+      taken.insert(existing.order)
+    }
+    guard taken.contains(item.order) else { return item }
+    var candidate = item.order
+    while taken.contains(candidate) { candidate += 1 }
+    return LongFormTimelineMilestone(
+      id: item.id,
+      order: candidate,
+      label: item.label,
+      earliestChapter: item.earliestChapter,
+      latestChapter: item.latestChapter,
+      immutable: item.immutable
     )
   }
 

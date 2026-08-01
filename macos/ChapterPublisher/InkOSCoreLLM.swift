@@ -1074,6 +1074,14 @@ extension InkOSCore {
       } else {
         wordGapInstruction = "字数已在目标区间，修订以质量为主，保持字数基本不变。"
       }
+      // validateChapterLength 还要求中文字符数 >= minWords * 85%。此前 prompt 从不提这条，
+      // 模型多次因差几个字的密度不足而整轮报废，必须显式给出当前值和下限。
+      let currentBodyCount = bodyWordCount(baseChapter.content)
+      let bodyFloor = minWords * 85 / 100
+      let densityInstruction = currentBodyCount < bodyFloor
+        ? "当前中文字符仅 \(currentBodyCount) 个，低于密度下限 \(bodyFloor) 个（还差 \(bodyFloor - currentBodyCount) 个），"
+          + "必须用真实的场景、动作与对话补足，不能靠标点、空行或符号堆砌。"
+        : "另需保证中文字符不少于 \(bodyFloor) 个（当前 \(currentBodyCount) 个），标点与空行不计入密度。"
       let craft = try craftDirectives(bookID: bookID, chapterNumber: baseChapter.number)
       let context = try storyContext(bookID: bookID, maxCharacters: 60_000)
       let beatSection = beat.map(beatBriefText)
@@ -1082,6 +1090,7 @@ extension InkOSCore {
         你是 InkOS 章节修订器。请依据修改意见修订完整正文，保持既有设定、人物知识边界、持久物品和前后章因果。
         此前章节与本章既有正文确立的中断、不可用或耗尽状态（断信号、断电、断水、资源耗尽等）有约束力：修订稿使用通信、电力、设施或消耗品之前必须确认其可用；改变状态可用性时必须在正文写出发生的时刻与原因；同章之内不得自相矛盾。
         当前正文 \(currentCount) 字；目标区间 \(minWords)–\(maxWords) 字（参考目标 \(targetWords) 字，验收上限 \(ceiling) 字）。\(wordGapInstruction)
+        \(densityInstruction)
         修订只在本章节拍卡范围内进行：不得引入节拍卡禁止清单中的内容，不得把后续章节的剧情提前到本章。
         consistencyDelta 必须完整描述修订后本章的新贡献；旧版本仅由本章产生的记录会自动退出。新增或更新写入 upsert；remove 只用于正文事件明确终止的既有跨章记录。
         修订稿的 Delta 必须覆盖修订后正文的全部事实：原版本已登记且仍然成立的实体与伏笔必须保留，修订不是从零登记；正文出现的每个具名人物、地点、持久物品都必须登记；本章兑现或推翻的既有伏笔必须在 remove.hooks 中按 ID 关闭；不得静默丢弃索引中的既有实体。
