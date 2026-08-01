@@ -1,5 +1,10 @@
 import Foundation
 
+/// Maximum number of automatic "rewrite + re-review" rounds after an initial
+/// review (or local validation) failure before a chapter is left for manual
+/// revision. Each round is a full model rewrite plus an independent re-review.
+private let maxAutoRevisionRounds = 2
+
 extension InkOSCore {
   struct LLMResult: Sendable {
     let content: String
@@ -217,6 +222,7 @@ extension InkOSCore {
         chapterNumber: chapterNumber,
         plan: plan
       )
+      prefetchUpcomingBeatBatch(bookID: bookID, currentChapter: chapterNumber, plan: plan)
       generationJobs[key] = try makeGenerationJob(
         bookID: bookID,
         chapterNumber: chapterNumber,
@@ -243,12 +249,6 @@ extension InkOSCore {
           await self?.updateGenerationLiveText(key: key, rawText: partial)
         }
       )
-      let suppliedDelta = parsed["consistencyDelta"] as? [String: Any]
-      if currentPlan.continuity.policy.requireConsistencyDelta, suppliedDelta == nil {
-        throw InkOSCoreError("模型未返回 consistencyDelta（自动补登后仍缺失）", statusCode: 422)
-      }
-      let rawDelta = suppliedDelta ?? [:]
-      let candidateDelta = try normalizedConsistencyDelta(rawDelta, chapterNumber: chapterNumber)
       let title = normalizedChapterTitle(
         string(parsed["title"], fallback: "第\(chapterNumber)章"),
         chapterNumber: chapterNumber
@@ -256,20 +256,51 @@ extension InkOSCore {
       var content = string(parsed["content"])
       if content.isEmpty { content = result.content }
       content = stripChapterHeading(content)
-      try validateChapterLength(
-        content,
-        chapterNumber: chapterNumber,
-        minWords: plan.plan.chapters.first { $0.number == chapterNumber }?.minWords
-          ?? plan.constraints.targetChapterWords,
-        maxWords: plan.plan.chapters.first { $0.number == chapterNumber }?.maxWords
-          ?? plan.constraints.targetChapterWords,
-        label: "章节正文"
-      )
-      try validateChapterCraft(
-        content,
-        chapterNumber: chapterNumber,
-        label: "章节正文"
-      )
+      let suppliedDelta = parsed["consistencyDelta"] as? [String: Any]
+      let rawDelta = suppliedDelta ?? [:]
+      let candidateDelta: ContinuityDelta
+      do {
+        if currentPlan.continuity.policy.requireConsistencyDelta, suppliedDelta == nil {
+          throw InkOSCoreError("模型未返回 consistencyDelta（自动补登后仍缺失）", statusCode: 422)
+        }
+        candidateDelta = try normalizedConsistencyDelta(rawDelta, chapterNumber: chapterNumber)
+        try validateChapterLength(
+          content,
+          chapterNumber: chapterNumber,
+          minWords: plan.plan.chapters.first { $0.number == chapterNumber }?.minWords
+            ?? plan.constraints.targetChapterWords,
+          maxWords: plan.plan.chapters.first { $0.number == chapterNumber }?.maxWords
+            ?? plan.constraints.targetChapterWords,
+          label: "章节正文"
+        )
+        try validateChapterCraft(
+          content,
+          chapterNumber: chapterNumber,
+          label: "章节正文",
+          openingContext: try openingAbilityAnchorContext(
+            bookID: bookID,
+            before: chapterNumber
+          )
+        )
+      } catch {
+        guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw error }
+        // A local length/craft violation is a deterministic rule failure: an
+        // immediate same-context rewrite rarely fixes it and burns tokens. Retain
+        // the full draft and stop for manual review — a human rejection then joins
+        // the auto-revision loop (see performRevision). The LLM `[hard]` review
+        // failure below is what enters the loop automatically.
+        try persistGeneratedDraftForRevision(
+          bookID: bookID,
+          chapterNumber: chapterNumber,
+          title: title,
+          content: content,
+          summary: string(parsed["summary"], fallback: "草稿未通过本地章节规则"),
+          rawDelta: suppliedDelta,
+          validationError: error,
+          startedAt: startedAt
+        )
+        return
+      }
 
       generationJobs[key] = try makeGenerationJob(
         bookID: bookID,
@@ -291,17 +322,62 @@ extension InkOSCore {
         candidateDelta: candidateDelta,
         beat: beat
       )
-      let reviewObject: [String: Any] = [
-        "status": review.pass ? "passed" : "failed",
-        "model": review.model,
-        "summary": review.summary,
-        "issues": review.issues,
-        "craftAdvisories": review.advisories,
-        "revisionGuidance": review.revisionGuidance,
-        "reviewedAt": isoTimestamp(),
-      ]
-      let status = review.pass ? "pending_review" : "revision_failed"
-      try writeChapter(bookID: bookID, number: chapterNumber, title: title, content: content, status: status, llmReview: reviewObject)
+      let initialAttempt = reviewAttemptRecord(review, attempt: 1)
+      if review.pass {
+        let reviewObject = reviewRecord(
+          review,
+          status: "passed",
+          attempts: [initialAttempt]
+        )
+        try writeChapter(
+          bookID: bookID,
+          number: chapterNumber,
+          title: title,
+          content: content,
+          status: "pending_review",
+          llmReview: reviewObject
+        )
+        try persistConsistencyDelta(
+          bookID: bookID,
+          chapterNumber: chapterNumber,
+          title: title,
+          summary: string(parsed["summary"], fallback: review.summary),
+          delta: rawDelta
+        )
+        let finished = isoTimestamp()
+        generationJobs[key] = try makeGenerationJob(
+          bookID: bookID,
+          chapterNumber: chapterNumber,
+          title: title,
+          phase: "ready-for-review",
+          message: "章节已交付人工审核",
+          startedAt: startedAt,
+          finishedAt: finished,
+          liveText: generationJobs[key]?.liveText
+        )
+        recordDebug(scope: "generation", message: "chapter.completed", data: [
+          "bookId": bookID,
+          "chapterNumber": chapterNumber,
+          "status": "pending_review",
+          "model": result.model,
+        ])
+        return
+      }
+
+      let reviewObject = reviewRecord(
+        review,
+        status: "fixing",
+        autoFixed: false,
+        attempts: [initialAttempt]
+      )
+      try writeChapter(
+        bookID: bookID,
+        number: chapterNumber,
+        title: title,
+        content: content,
+        status: "revision_failed",
+        llmReview: reviewObject
+      )
       try persistConsistencyDelta(
         bookID: bookID,
         chapterNumber: chapterNumber,
@@ -309,24 +385,29 @@ extension InkOSCore {
         summary: string(parsed["summary"], fallback: review.summary),
         delta: rawDelta
       )
-      let finished = isoTimestamp()
       generationJobs[key] = try makeGenerationJob(
         bookID: bookID,
         chapterNumber: chapterNumber,
         title: title,
-        phase: review.pass ? "ready-for-review" : "revision_failed",
-        message: review.pass ? "章节已交付人工审核" : "一致性审核发现问题",
+        phase: "llm_fixing",
+        message: "初审发现硬问题，正在自动修改并复审",
         startedAt: startedAt,
-        finishedAt: finished,
-        error: review.pass ? nil : review.issues.joined(separator: "；"),
         liveText: generationJobs[key]?.liveText
       )
-      recordDebug(scope: "generation", message: "chapter.completed", data: [
+      recordDebug(scope: "review", message: "chapter.auto_revision.started", data: [
         "bookId": bookID,
         "chapterNumber": chapterNumber,
-        "status": status,
-        "model": result.model,
+        "issues": review.issues,
       ])
+      let failedChapter = try await fetchChapter(bookID: bookID, number: chapterNumber)
+      await performRevision(
+        bookID: bookID,
+        chapter: failedChapter,
+        note: automaticRevisionNote(for: review),
+        mode: "auto_rewrite",
+        startedAt: startedAt,
+        initialReview: review
+      )
     } catch {
       let finished = isoTimestamp()
       generationJobs[key] = try? makeGenerationJob(
@@ -345,30 +426,667 @@ extension InkOSCore {
     }
   }
 
+  /// Result of a single rewrite+re-review round. `review` is nil when the round
+  /// threw before producing a reviewable draft (network/JSON/validation error).
+  private struct RevisionRoundOutcome {
+    let review: NativeReview?
+    let title: String
+    let content: String
+    let error: Error?
+    let persisted: Bool
+  }
+
+  private func storedNativeReview(_ review: LLMReview?) -> NativeReview? {
+    guard let review, !review.isPassed, !review.issueList.isEmpty else { return nil }
+    return NativeReview(
+      pass: false,
+      model: review.model ?? "stored-review",
+      summary: review.summary ?? "上一轮审核未通过",
+      issues: review.issueList,
+      revisionGuidance: review.revisionGuidance ?? "",
+      advisories: review.craftAdvisoryList
+    )
+  }
+
+  func shouldAttemptDeltaOnlyRepair(_ review: NativeReview) -> Bool {
+    guard !review.issues.isEmpty else { return false }
+    let deltaMarkers = ["delta", "consistencydelta", "差量", "登记", "type字段", "实体分类", "索引分类"]
+    let repairMarkers = ["缺少", "遗漏", "未登记", "需要在", "应在", "补充", "补全", "登记", "记录", "类型", "type字段", "分类", "字段", " id", "id ", "统一"]
+    let proseOrConflictMarkers = [
+      "正文", "剧情", "叙事", "字数", "文风", "节拍", "因果", "行为", "自相矛盾",
+      "冲突", "不可变", "违反", "不允许新增", "越界", "时间线错误",
+    ]
+    return review.issues.allSatisfy { issue in
+      let lowered = issue.lowercased()
+      return deltaMarkers.contains(where: lowered.contains)
+        && repairMarkers.contains(where: lowered.contains)
+        && !proseOrConflictMarkers.contains(where: lowered.contains)
+    }
+  }
+
+  /// Drives up to `maxAutoRevisionRounds` rewrite+re-review rounds. The first
+  /// round uses the caller's note (a human rejection note, or the note derived
+  /// from `initialReview` for an automatic fix). Each failed round feeds its own
+  /// review findings into the next round's note. Any round that passes finalizes
+  /// to `pending_review` and returns; exhausting the rounds finalizes to
+  /// `revision_failed` with the full attempt history.
   private func performRevision(
     bookID: String,
     chapter: ChapterDetail,
     note: String,
     mode: String,
-    startedAt: String
+    startedAt: String,
+    initialReview: NativeReview? = nil
   ) async {
     let key = generationKey(bookID, chapter.number)
+    let triggerReview = initialReview ?? storedNativeReview(chapter.llmReview)
+    var attempts: [[String: Any]] = initialReview.map {
+      [reviewAttemptRecord($0, attempt: 1)]
+    } ?? (chapter.llmReview?.attempts ?? []).enumerated().map {
+      reviewAttemptRecord($0.element, attempt: $0.offset + 1)
+    }
+    if initialReview == nil, attempts.isEmpty, let triggerReview {
+      attempts = [reviewAttemptRecord(triggerReview, attempt: 1)]
+    }
+    // Each round rewrites the latest draft, not the original, so successive
+    // rounds accumulate improvements instead of restarting from scratch.
+    var baseChapter = chapter
+    var currentNote = note
+    var currentMode = mode
+    var lastError: Error?
+    var lastReview: NativeReview?
+    var automaticLeadIn = false
+    var anyRoundPersisted = false
+    var stopBeforeRewrite = false
+    var completedRewriteRounds = 0
+
+    if let triggerReview, shouldRevalidateStoredDraft(note: note, review: triggerReview) {
+      automaticLeadIn = true
+      let outcome = await performStoredDraftRevalidation(
+        bookID: bookID,
+        chapter: chapter,
+        note: note,
+        startedAt: startedAt,
+        priorAttempts: attempts
+      )
+      anyRoundPersisted = outcome.persisted
+      let attemptNumber = attempts.count + 1
+      if let review = outcome.review {
+        attempts.append(reviewAttemptRecord(review, attempt: attemptNumber))
+        lastReview = review
+        if review.pass {
+          generationJobs[key] = try? makeGenerationJob(
+            bookID: bookID,
+            chapterNumber: chapter.number,
+            title: chapter.title,
+            phase: "ready-for-review",
+            message: "原正文重新校验通过，未执行重写",
+            startedAt: startedAt,
+            finishedAt: isoTimestamp(),
+            attempts: attempts
+          )
+          recordDebug(scope: "review", message: "chapter.revalidation.completed", data: [
+            "bookId": bookID,
+            "chapterNumber": chapter.number,
+            "status": "pending_review",
+          ])
+          return
+        }
+        currentNote = automaticRevisionNote(for: review)
+        currentMode = "auto_rewrite"
+      } else {
+        attempts.append([
+          "pass": false,
+          "status": "error",
+          "attempt": attemptNumber,
+          "error": outcome.error?.localizedDescription ?? "原正文重新校验异常",
+          "reviewedAt": isoTimestamp(),
+        ])
+        lastError = outcome.error
+        stopBeforeRewrite = outcome.persisted
+        currentNote = "\(note)\n\n【原正文重新校验仍未通过】\n\(outcome.error?.localizedDescription ?? "")"
+        currentMode = "auto_rewrite"
+      }
+    }
+
+    let deltaRepairReview = lastReview ?? (automaticLeadIn ? nil : triggerReview)
+    if !stopBeforeRewrite, let deltaRepairReview, shouldAttemptDeltaOnlyRepair(deltaRepairReview) {
+      automaticLeadIn = true
+      let outcome = await performDeltaOnlyRevision(
+        bookID: bookID,
+        chapter: chapter,
+        note: currentNote,
+        startedAt: startedAt,
+        priorAttempts: attempts
+      )
+      anyRoundPersisted = anyRoundPersisted || outcome.persisted
+      let attemptNumber = attempts.count + 1
+      if let review = outcome.review {
+        attempts.append(reviewAttemptRecord(review, attempt: attemptNumber))
+        lastReview = review
+        if review.pass {
+          generationJobs[key] = try? makeGenerationJob(
+            bookID: bookID,
+            chapterNumber: chapter.number,
+            title: chapter.title,
+            phase: "ready-for-review",
+            message: "一致性登记已修复，正文未重写，等待人工审核",
+            startedAt: startedAt,
+            finishedAt: isoTimestamp(),
+            attempts: attempts
+          )
+          recordDebug(scope: "review", message: "chapter.delta_revision.completed", data: [
+            "bookId": bookID,
+            "chapterNumber": chapter.number,
+            "status": "pending_review",
+          ])
+          return
+        }
+        currentNote = automaticRevisionNote(for: review)
+        currentMode = "auto_rewrite"
+      } else {
+        attempts.append([
+          "pass": false,
+          "status": "error",
+          "attempt": attemptNumber,
+          "error": outcome.error?.localizedDescription ?? "Delta 修复异常",
+          "reviewedAt": isoTimestamp(),
+        ])
+        lastError = outcome.error
+        stopBeforeRewrite = outcome.persisted
+        currentNote = "\(note)\n\n【Delta 单独修复失败，允许重写正文与 Delta】\n\(outcome.error?.localizedDescription ?? "")"
+        currentMode = "auto_rewrite"
+      }
+    }
+
+    if stopBeforeRewrite {
+      finalizeRevisionFailure(
+        bookID: bookID,
+        chapter: baseChapter,
+        originalChapter: chapter,
+        note: currentNote,
+        mode: currentMode,
+        attempts: attempts,
+        startedAt: startedAt,
+        lastReview: lastReview,
+        lastError: lastError,
+        anyRoundPersisted: anyRoundPersisted,
+        automatic: true,
+        roundsCompleted: 0
+      )
+      return
+    }
+
+    for round in 1...maxAutoRevisionRounds {
+      completedRewriteRounds = round
+      // A round is "automatic" when it follows an initial failure or is not the
+      // very first manual pass; that drives the UI badge and autoFixed flag.
+      let isAutomaticRound = initialReview != nil || automaticLeadIn || round > 1
+      let outcome = await performRevisionRound(
+        bookID: bookID,
+        baseChapter: baseChapter,
+        originalContent: chapter.content,
+        note: currentNote,
+        mode: currentMode,
+        round: round,
+        startedAt: startedAt,
+        priorAttempts: attempts,
+        isAutomaticRound: isAutomaticRound
+      )
+      anyRoundPersisted = anyRoundPersisted || outcome.persisted
+      let attemptNumber = attempts.count + 1
+      if let review = outcome.review {
+        attempts.append(reviewAttemptRecord(review, attempt: attemptNumber))
+        lastReview = review
+        if review.pass {
+          finalizeRevisionSuccess(
+            bookID: bookID,
+            chapterNumber: chapter.number,
+            title: outcome.title,
+            attempts: attempts,
+            round: round,
+            startedAt: startedAt,
+            automatic: isAutomaticRound
+          )
+          return
+        }
+        // Failed review: carry this round's findings into the next round.
+        baseChapter = ChapterDetail(from: baseChapter, title: outcome.title, content: outcome.content)
+        currentNote = automaticRevisionNote(for: review)
+        currentMode = "auto_rewrite"
+        lastError = nil
+      } else {
+        // The round threw before yielding a reviewable draft. Record the error
+        // as an attempt and, if rounds remain, retry with the error folded into
+        // the note so the model knows what to avoid.
+        attempts.append([
+          "pass": false,
+          "status": "error",
+          "attempt": attemptNumber,
+          "error": outcome.error?.localizedDescription ?? "修订轮次异常",
+          "reviewedAt": isoTimestamp(),
+        ])
+        lastError = outcome.error
+        if outcome.persisted {
+          baseChapter = ChapterDetail(
+            from: baseChapter,
+            title: outcome.title,
+            content: outcome.content
+          )
+        }
+        currentNote = "\(currentNote)\n\n【上一轮修订异常，请修正后重写】\n\(outcome.error?.localizedDescription ?? "")"
+        currentMode = "auto_rewrite"
+      }
+
+      if outcome.error != nil, outcome.persisted { break }
+      if round < maxAutoRevisionRounds {
+        generationJobs[key] = try? makeGenerationJob(
+          bookID: bookID,
+          chapterNumber: chapter.number,
+          title: baseChapter.title,
+          phase: "llm_fixing",
+          message: "第 \(round) 次修改未通过，正在进行第 \(round + 1) 次自动修改",
+          startedAt: startedAt,
+          revisionRound: round + 1,
+          maxRevisionRounds: maxAutoRevisionRounds,
+          attempts: attempts
+        )
+      }
+    }
+
+    finalizeRevisionFailure(
+      bookID: bookID,
+      chapter: baseChapter,
+      originalChapter: chapter,
+      note: currentNote,
+      mode: currentMode,
+      attempts: attempts,
+      startedAt: startedAt,
+      lastReview: lastReview,
+      lastError: lastError,
+      anyRoundPersisted: anyRoundPersisted,
+      automatic: initialReview != nil || automaticLeadIn || maxAutoRevisionRounds > 1,
+      roundsCompleted: completedRewriteRounds
+    )
+  }
+
+  /// The stored delta for a chapter that is being repaired, treating "never
+  /// written" as an empty delta rather than a hard error.
+  ///
+  /// `chapterConsistencyDelta` throws when the runtime file is absent, which is
+  /// the right contract for approval and projection — those must not proceed on
+  /// a chapter with no registration. Repair is the opposite case: a draft whose
+  /// prose was recovered from a torn shell, or whose delta request failed, has
+  /// no file yet and is exactly what needs repairing. Throwing there sent the
+  /// chapter to a full rewrite and discarded the prose the recovery had just
+  /// saved, so both repair entry points start from an empty delta instead.
+  private func repairableConsistencyDelta(
+    bookID: String,
+    chapterNumber: Int,
+    operation: String
+  ) -> ContinuityDelta {
+    do {
+      return try chapterConsistencyDelta(bookID: bookID, chapterNumber: chapterNumber)
+    } catch {
+      recordDebug(scope: "review", message: "chapter.delta.missingForRepair", level: "warning", data: [
+        "bookId": bookID,
+        "chapterNumber": chapterNumber,
+        "operation": operation,
+        "error": error.localizedDescription,
+      ])
+      return ContinuityDelta()
+    }
+  }
+
+  private func shouldRevalidateStoredDraft(note: String, review: NativeReview) -> Bool {
+    guard review.model == "native-draft-validator" else { return false }
+    let trimmed = note.trimmingCharacters(in: .whitespacesAndNewlines)
+    let storedGuidance = review.revisionGuidance.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !storedGuidance.isEmpty, trimmed == storedGuidance { return true }
+    let markers = [
+      "仅重新校验原文", "仅重新审核原文", "仅复审原文", "只复审原文",
+      "不改正文", "无需重写", "保持正文不变", "原文保持不变",
+    ]
+    return markers.contains(where: trimmed.contains)
+  }
+
+  private func performStoredDraftRevalidation(
+    bookID: String,
+    chapter: ChapterDetail,
+    note: String,
+    startedAt: String,
+    priorAttempts: [[String: Any]]
+  ) async -> RevisionRoundOutcome {
+    let key = generationKey(bookID, chapter.number)
+    var didWriteChapter = false
     do {
       let plan = try synchronizeContinuityProjection(bookID: bookID)
-      let beat = try chapterBeat(bookID: bookID, chapterNumber: chapter.number)
       let chapterPlan = plan.plan.chapters.first { $0.number == chapter.number }
+      try validateChapterLength(
+        chapter.content,
+        chapterNumber: chapter.number,
+        minWords: chapterPlan?.minWords ?? plan.constraints.targetChapterWords,
+        maxWords: chapterPlan?.maxWords ?? plan.constraints.targetChapterWords,
+        label: "原章节正文"
+      )
+      try validateChapterCraft(
+        chapter.content,
+        chapterNumber: chapter.number,
+        label: "原章节正文",
+        openingContext: try openingAbilityAnchorContext(
+          bookID: bookID,
+          before: chapter.number
+        )
+      )
+      let candidateDelta = repairableConsistencyDelta(
+        bookID: bookID,
+        chapterNumber: chapter.number,
+        operation: "revalidation"
+      )
+      let beat = try chapterBeat(bookID: bookID, chapterNumber: chapter.number)
+      generationJobs[key] = try makeGenerationJob(
+        bookID: bookID,
+        chapterNumber: chapter.number,
+        title: chapter.title,
+        phase: "reviewing",
+        message: "本地规则已通过，正在复审原正文",
+        startedAt: startedAt,
+        attempts: priorAttempts
+      )
+      recordDebug(scope: "review", message: "chapter.revalidation.started", data: [
+        "bookId": bookID,
+        "chapterNumber": chapter.number,
+      ])
+      let review = try await reviewChapter(
+        bookID: bookID,
+        chapterNumber: chapter.number,
+        title: chapter.title,
+        content: chapter.content,
+        candidateDelta: candidateDelta,
+        beat: beat,
+        excludingChapter: chapter.number
+      )
+      try writeChapter(
+        bookID: bookID,
+        number: chapter.number,
+        title: chapter.title,
+        content: chapter.content,
+        status: review.pass ? "pending_review" : "revision_failed",
+        llmReview: reviewRecord(
+          review,
+          status: review.pass ? "passed" : "failed",
+          attempts: priorAttempts + [
+            reviewAttemptRecord(review, attempt: priorAttempts.count + 1),
+          ]
+        )
+      )
+      didWriteChapter = true
+      try updateStateChapter(bookID: bookID, number: chapter.number) { record in
+        var history = record["revisionHistory"] as? [[String: Any]] ?? []
+        history.append([
+          "time": isoTimestamp(),
+          "note": note,
+          "type": "revalidation",
+          "oldContentLength": proseCount(chapter.content),
+          "newContentLength": proseCount(chapter.content),
+          "success": review.pass,
+          "reviseMode": "revalidation",
+        ])
+        record["revisionHistory"] = history
+      }
+      _ = try synchronizeContinuityProjection(bookID: bookID)
+      return RevisionRoundOutcome(
+        review: review,
+        title: chapter.title,
+        content: chapter.content,
+        error: nil,
+        persisted: true
+      )
+    } catch {
+      recordDebug(scope: "review", message: "chapter.revalidation.failed", level: "warning", data: [
+        "bookId": bookID,
+        "chapterNumber": chapter.number,
+        "error": error.localizedDescription,
+      ])
+      return RevisionRoundOutcome(
+        review: nil,
+        title: chapter.title,
+        content: chapter.content,
+        error: error,
+        persisted: didWriteChapter
+      )
+    }
+  }
+
+  private func performDeltaOnlyRevision(
+    bookID: String,
+    chapter: ChapterDetail,
+    note: String,
+    startedAt: String,
+    priorAttempts: [[String: Any]]
+  ) async -> RevisionRoundOutcome {
+    let key = generationKey(bookID, chapter.number)
+    var didWriteChapter = false
+    do {
+      generationJobs[key] = try makeGenerationJob(
+        bookID: bookID,
+        chapterNumber: chapter.number,
+        title: chapter.title,
+        phase: "llm_fixing",
+        message: "正在只修复一致性登记，不重写正文",
+        startedAt: startedAt,
+        attempts: priorAttempts
+      )
+      recordDebug(scope: "review", message: "chapter.delta_revision.started", data: [
+        "bookId": bookID,
+        "chapterNumber": chapter.number,
+      ])
+      let currentDelta = repairableConsistencyDelta(
+        bookID: bookID,
+        chapterNumber: chapter.number,
+        operation: "deltaOnlyRepair"
+      )
+      let repairedRaw = try await requestConsistencyDeltaRepair(
+        chapterNumber: chapter.number,
+        title: chapter.title,
+        content: chapter.content,
+        currentDelta: currentDelta,
+        findings: note
+      )
+      let candidateDelta = try normalizedConsistencyDelta(
+        repairedRaw,
+        chapterNumber: chapter.number
+      )
+      let beat = try chapterBeat(bookID: bookID, chapterNumber: chapter.number)
+      generationJobs[key] = try makeGenerationJob(
+        bookID: bookID,
+        chapterNumber: chapter.number,
+        title: chapter.title,
+        phase: "reviewing",
+        message: "一致性登记已修复，正在复审原正文",
+        startedAt: startedAt,
+        attempts: priorAttempts
+      )
+      let review = try await reviewChapter(
+        bookID: bookID,
+        chapterNumber: chapter.number,
+        title: chapter.title,
+        content: chapter.content,
+        candidateDelta: candidateDelta,
+        beat: beat,
+        excludingChapter: chapter.number
+      )
+      try writeChapter(
+        bookID: bookID,
+        number: chapter.number,
+        title: chapter.title,
+        content: chapter.content,
+        status: review.pass ? "pending_review" : "revision_failed",
+        llmReview: reviewRecord(
+          review,
+          status: review.pass ? "passed" : "failed",
+          autoFixed: true,
+          attempts: priorAttempts + [
+            reviewAttemptRecord(review, attempt: priorAttempts.count + 1),
+          ]
+        )
+      )
+      didWriteChapter = true
+      try persistConsistencyDelta(
+        bookID: bookID,
+        chapterNumber: chapter.number,
+        title: chapter.title,
+        summary: review.summary,
+        delta: repairedRaw
+      )
+      try updateStateChapter(bookID: bookID, number: chapter.number) { record in
+        var history = record["revisionHistory"] as? [[String: Any]] ?? []
+        history.append([
+          "time": isoTimestamp(),
+          "note": note,
+          "type": "delta_repair",
+          "oldContentLength": proseCount(chapter.content),
+          "newContentLength": proseCount(chapter.content),
+          "success": review.pass,
+          "reviseMode": "delta_repair",
+        ])
+        record["revisionHistory"] = history
+      }
+      _ = try synchronizeContinuityProjection(bookID: bookID)
+      return RevisionRoundOutcome(
+        review: review,
+        title: chapter.title,
+        content: chapter.content,
+        error: nil,
+        persisted: true
+      )
+    } catch {
+      recordDebug(scope: "review", message: "chapter.delta_revision.failed", level: "warning", data: [
+        "bookId": bookID,
+        "chapterNumber": chapter.number,
+        "error": error.localizedDescription,
+      ])
+      return RevisionRoundOutcome(
+        review: nil,
+        title: chapter.title,
+        content: chapter.content,
+        error: error,
+        persisted: didWriteChapter
+      )
+    }
+  }
+
+  private func requestConsistencyDeltaRepair(
+    chapterNumber: Int,
+    title: String,
+    content: String,
+    currentDelta: ContinuityDelta,
+    findings: String
+  ) async throws -> [String: Any] {
+    let currentJSON = String(data: try encoder.encode(currentDelta), encoding: .utf8) ?? "{}"
+    let prompt = """
+      你是 InkOS 一致性登记修复器。正文已经定稿，本次禁止改写正文、标题、剧情、字数或文风，只修复 consistencyDelta。
+      根据审核意见校正当前 Delta，保留没有问题的 ID 和字段，只修改审核点名的登记错误；正文未支持的事实不得新增。
+      entities.type 最终只能输出五个英文值：character、object、location、faction、concept。审核意见中的 item、物品、物件、设备、资源或储备一律输出 object，地点或场所输出 location，人物输出 character。
+      只输出修复后的 consistencyDelta JSON：{"upsert":{"immutableCanon":[],"worldRules":[],"entities":[],"knowledgeBoundaries":[],"timeline":[],"hooks":[]},"remove":{"immutableCanon":[],"worldRules":[],"entities":[],"knowledgeBoundaries":[],"timeline":[],"hooks":[]}}。
+
+      【审核意见】
+      \(findings)
+
+      【当前 consistencyDelta】
+      \(currentJSON)
+
+      【固定正文】
+      第\(chapterNumber)章 \(title)
+      \(content)
+      """
+    // Streamed for the transport, not for a preview — see the beat batch call.
+    let result = try await requestLLM(
+      prompt: prompt,
+      role: .primary,
+      json: true,
+      timeout: 900,
+      onPartialContent: { _ in }
+    )
+    guard let object = parseJSONObject(result.content) else {
+      throw InkOSCoreError("Delta 单独修复未返回合法 JSON", statusCode: 422)
+    }
+    if let delta = object["consistencyDelta"] as? [String: Any] { return delta }
+    if object["upsert"] != nil { return object }
+    throw InkOSCoreError("Delta 单独修复未返回 consistencyDelta", statusCode: 422)
+  }
+
+  /// One rewrite+re-review round. On success it persists the new draft, delta,
+  /// and revision-history entry, and returns the review. Any thrown error is
+  /// captured into the outcome (`review == nil`) so the caller's loop can decide
+  /// whether to retry or finalize — a single round never aborts the loop.
+  private func performRevisionRound(
+    bookID: String,
+    baseChapter: ChapterDetail,
+    originalContent: String,
+    note: String,
+    mode: String,
+    round: Int,
+    startedAt: String,
+    priorAttempts: [[String: Any]],
+    isAutomaticRound: Bool
+  ) async -> RevisionRoundOutcome {
+    let key = generationKey(bookID, baseChapter.number)
+    var latestTitle = baseChapter.title
+    var latestContent = baseChapter.content
+    var didWriteChapter = false
+    do {
+      generationJobs[key] = try makeGenerationJob(
+        bookID: bookID,
+        chapterNumber: baseChapter.number,
+        title: baseChapter.title,
+        phase: isAutomaticRound ? "llm_fixing" : "revising",
+        message: isAutomaticRound
+          ? "正在进行第 \(round) 次自动修改"
+          : "原生 InkOSCore 正在修订章节",
+        startedAt: startedAt,
+        revisionRound: round,
+        maxRevisionRounds: maxAutoRevisionRounds,
+        attempts: priorAttempts
+      )
+      let plan = try synchronizeContinuityProjection(bookID: bookID)
+      let beat = try chapterBeat(bookID: bookID, chapterNumber: baseChapter.number)
+      let chapterPlan = plan.plan.chapters.first { $0.number == baseChapter.number }
       let minWords = chapterPlan?.minWords ?? plan.constraints.targetChapterWords
       let maxWords = chapterPlan?.maxWords ?? plan.constraints.targetChapterWords
-      let craft = try craftDirectives(bookID: bookID, chapterNumber: chapter.number)
+      // 计算当前字数、验收上限（与 validateChapterLength 保持一致）和方向提示，
+      // 避免模型在"字数不够→字数太多→字数不够"之间反复震荡。
+      let currentCount = proseCount(baseChapter.content)
+      let ceiling = maxWords + max(200, maxWords / 10)
+      let targetWords = (minWords + maxWords) / 2
+      let wordGapInstruction: String
+      if currentCount < minWords {
+        wordGapInstruction =
+          "还差约 \(minWords - currentCount) 字，需要展开场景或补充细节；" +
+          "切勿以凑字符号、空行或重复句子填充。"
+      } else if currentCount > ceiling {
+        wordGapInstruction =
+          "已超出验收上限 \(ceiling) 字约 \(currentCount - ceiling) 字，" +
+          "必须精简或将多余剧情移至后续章节。"
+      } else if currentCount > maxWords {
+        wordGapInstruction =
+          "超出软上限约 \(currentCount - maxWords) 字（验收上限 \(ceiling) 字），建议适当精简。"
+      } else {
+        wordGapInstruction = "字数已在目标区间，修订以质量为主，保持字数基本不变。"
+      }
+      let craft = try craftDirectives(bookID: bookID, chapterNumber: baseChapter.number)
       let context = try storyContext(bookID: bookID, maxCharacters: 60_000)
       let beatSection = beat.map(beatBriefText)
         ?? "（本章没有节拍卡，按既有正文范围修订，不要扩大本章承载的剧情量）"
       let prompt = """
         你是 InkOS 章节修订器。请依据修改意见修订完整正文，保持既有设定、人物知识边界、持久物品和前后章因果。
-        修订后正文字数必须落在 \(minWords) 至 \(maxWords) 字之间。
+        此前章节与本章既有正文确立的中断、不可用或耗尽状态（断信号、断电、断水、资源耗尽等）有约束力：修订稿使用通信、电力、设施或消耗品之前必须确认其可用；改变状态可用性时必须在正文写出发生的时刻与原因；同章之内不得自相矛盾。
+        当前正文 \(currentCount) 字；目标区间 \(minWords)–\(maxWords) 字（参考目标 \(targetWords) 字，验收上限 \(ceiling) 字）。\(wordGapInstruction)
         修订只在本章节拍卡范围内进行：不得引入节拍卡禁止清单中的内容，不得把后续章节的剧情提前到本章。
         consistencyDelta 必须完整描述修订后本章的新贡献；旧版本仅由本章产生的记录会自动退出。新增或更新写入 upsert；remove 只用于正文事件明确终止的既有跨章记录。
-        只输出 JSON：{"title":"章节标题","content":"完整正文","summary":"修订摘要","consistencyDelta":{"upsert":{"immutableCanon":[],"worldRules":[],"entities":[],"knowledgeBoundaries":[],"timeline":[],"hooks":[]},"remove":{"immutableCanon":[],"worldRules":[],"entities":[],"knowledgeBoundaries":[],"timeline":[],"hooks":[]}}}。
+        修订稿的 Delta 必须覆盖修订后正文的全部事实：原版本已登记且仍然成立的实体与伏笔必须保留，修订不是从零登记；正文出现的每个具名人物、地点、持久物品都必须登记；本章兑现或推翻的既有伏笔必须在 remove.hooks 中按 ID 关闭；不得静默丢弃索引中的既有实体。
+        entities.type 只能输出 character、object、location、faction、concept；物品、设备、资源和储备统一写 object，不得写 item 或中文类型名。
+        只输出 JSON：{"title":"章节标题","content":"完整正文","summary":"修订摘要","consistencyDelta":{"upsert":{"immutableCanon":[],"worldRules":[],"entities":[{"id":"","name":"","type":"character|object|location|faction|concept"}],"knowledgeBoundaries":[],"timeline":[],"hooks":[]},"remove":{"immutableCanon":[],"worldRules":[],"entities":[],"knowledgeBoundaries":[],"timeline":[],"hooks":[]}}}。
         修订模式：\(mode)
         修改意见：\(note)
 
@@ -381,13 +1099,13 @@ extension InkOSCore {
         \(context)
 
         【原章节】
-        第\(chapter.number)章 \(chapter.title)
-        \(chapter.content)
+        第\(baseChapter.number)章 \(baseChapter.title)
+        \(baseChapter.content)
         """
       let refreshedPlan = try synchronizeContinuityProjection(bookID: bookID)
       let (parsed, result) = try await requestChapterPayload(
         prompt: prompt,
-        chapterNumber: chapter.number,
+        chapterNumber: baseChapter.number,
         requireDelta: refreshedPlan.continuity.policy.requireConsistencyDelta,
         timeout: 600,
         onPartialContent: { [weak self] partial in
@@ -399,123 +1117,390 @@ extension InkOSCore {
         throw InkOSCoreError("模型未返回 consistencyDelta（自动补登后仍缺失）", statusCode: 422)
       }
       let rawDelta = suppliedDelta ?? [:]
-      let candidateDelta = try normalizedConsistencyDelta(rawDelta, chapterNumber: chapter.number)
+      let candidateDelta = try normalizedConsistencyDelta(rawDelta, chapterNumber: baseChapter.number)
       let title = normalizedChapterTitle(
-        string(parsed["title"], fallback: chapter.title),
-        chapterNumber: chapter.number
+        string(parsed["title"], fallback: baseChapter.title),
+        chapterNumber: baseChapter.number
       )
       let content = stripChapterHeading(string(parsed["content"], fallback: result.content))
+      latestTitle = title
+      latestContent = content
       try validateChapterLength(
         content,
-        chapterNumber: chapter.number,
+        chapterNumber: baseChapter.number,
         minWords: minWords,
         maxWords: maxWords,
         label: "修订正文"
       )
       try validateChapterCraft(
         content,
-        chapterNumber: chapter.number,
-        label: "修订正文"
+        chapterNumber: baseChapter.number,
+        label: "修订正文",
+        openingContext: try openingAbilityAnchorContext(
+          bookID: bookID,
+          before: baseChapter.number
+        )
       )
       generationJobs[key] = try makeGenerationJob(
         bookID: bookID,
-        chapterNumber: chapter.number,
+        chapterNumber: baseChapter.number,
         title: title,
         phase: "reviewing",
-        message: "正在执行修订后一致性审核",
+        message: "正在执行第 \(round) 次修订后一致性审核",
         startedAt: startedAt,
-        liveText: generationJobs[key]?.liveText
+        revisionRound: round,
+        maxRevisionRounds: maxAutoRevisionRounds,
+        attempts: priorAttempts
       )
       recordDebug(scope: "generation", message: "chapter.phase", data: [
-        "bookId": bookID, "chapterNumber": chapter.number, "phase": "reviewing",
+        "bookId": bookID, "chapterNumber": baseChapter.number, "phase": "reviewing", "round": round,
       ])
       let review = try await reviewChapter(
         bookID: bookID,
-        chapterNumber: chapter.number,
+        chapterNumber: baseChapter.number,
         title: title,
         content: content,
         candidateDelta: candidateDelta,
         beat: beat,
-        excludingChapter: chapter.number
+        excludingChapter: baseChapter.number
       )
-      let reviewObject: [String: Any] = [
-        "status": review.pass ? "passed" : "failed",
-        "model": review.model,
-        "summary": review.summary,
-        "issues": review.issues,
-        "craftAdvisories": review.advisories,
-        "revisionGuidance": review.revisionGuidance,
-        "reviewedAt": isoTimestamp(),
-      ]
       try writeChapter(
         bookID: bookID,
-        number: chapter.number,
+        number: baseChapter.number,
         title: title,
         content: content,
         status: review.pass ? "pending_review" : "revision_failed",
-        llmReview: reviewObject
+        llmReview: reviewRecord(
+          review,
+          status: review.pass ? "passed" : "failed",
+          autoFixed: isAutomaticRound ? true : nil,
+          attempts: priorAttempts + [reviewAttemptRecord(review, attempt: priorAttempts.count + 1)]
+        )
       )
+      didWriteChapter = true
       try persistConsistencyDelta(
         bookID: bookID,
-        chapterNumber: chapter.number,
+        chapterNumber: baseChapter.number,
         title: title,
         summary: string(parsed["summary"], fallback: review.summary),
         delta: rawDelta
       )
-      try updateStateChapter(bookID: bookID, number: chapter.number) { record in
+      try updateStateChapter(bookID: bookID, number: baseChapter.number) { record in
         var history = record["revisionHistory"] as? [[String: Any]] ?? []
         history.append([
           "time": isoTimestamp(),
           "note": note,
           "type": mode,
-          "oldContentLength": proseCount(chapter.content),
+          "oldContentLength": proseCount(baseChapter.content),
           "newContentLength": proseCount(content),
           "success": review.pass,
           "reviseMode": mode,
+          "round": round,
         ])
         record["revisionHistory"] = history
       }
       _ = try synchronizeContinuityProjection(bookID: bookID)
       // Later beats were planned against the previous version of this chapter,
-      // so they must be re-planned once its text changed. This is cache
-      // cleanup: the revision itself is already persisted, so a failure here
-      // must not report the revision as failed.
+      // so they must be re-planned once its text changed. Cache cleanup only:
+      // the draft is already persisted, so a failure here must not fail the round.
       do {
-        _ = try await invalidateChapterBeats(bookID: bookID, fromChapter: chapter.number + 1)
+        _ = try await invalidateChapterBeats(bookID: bookID, fromChapter: baseChapter.number + 1)
       } catch {
         recordDebug(
           scope: "craft", message: "chapter_beats.invalidate_failed", level: "error",
           data: [
             "bookId": bookID,
-            "fromChapter": chapter.number + 1,
+            "fromChapter": baseChapter.number + 1,
             "error": error.localizedDescription,
           ])
       }
-      let finished = isoTimestamp()
-      generationJobs[key] = try makeGenerationJob(
-        bookID: bookID,
-        chapterNumber: chapter.number,
-        title: title,
-        phase: review.pass ? "ready-for-review" : "revision_failed",
-        message: review.pass ? "修订完成，等待人工审核" : "修订后仍有一致性问题",
-        startedAt: startedAt,
-        finishedAt: finished,
-        error: review.pass ? nil : review.issues.joined(separator: "；"),
-        liveText: generationJobs[key]?.liveText
+      return RevisionRoundOutcome(
+        review: review, title: title, content: content, error: nil, persisted: true
       )
     } catch {
-      generationJobs[key] = try? makeGenerationJob(
-        bookID: bookID,
-        chapterNumber: chapter.number,
-        title: chapter.title,
-        phase: "error",
-        message: "章节修订失败",
-        startedAt: startedAt,
-        finishedAt: isoTimestamp(),
-        error: error.localizedDescription,
-        liveText: generationJobs[key]?.liveText
+      recordDebug(scope: "review", message: "chapter.revision_round.failed", level: "error", data: [
+        "bookId": bookID,
+        "chapterNumber": baseChapter.number,
+        "round": round,
+        "error": error.localizedDescription,
+      ])
+      return RevisionRoundOutcome(
+        review: nil,
+        title: latestTitle,
+        content: latestContent,
+        error: error,
+        persisted: didWriteChapter
       )
     }
+  }
+
+  /// Finalizes a chapter that passed re-review: the round already persisted the
+  /// draft, so this only marks the job ready for manual review.
+  private func finalizeRevisionSuccess(
+    bookID: String,
+    chapterNumber: Int,
+    title: String,
+    attempts: [[String: Any]],
+    round: Int,
+    startedAt: String,
+    automatic: Bool
+  ) {
+    generationJobs[generationKey(bookID, chapterNumber)] = try? makeGenerationJob(
+      bookID: bookID,
+      chapterNumber: chapterNumber,
+      title: title,
+      phase: "ready-for-review",
+      message: automatic
+        ? "第 \(round) 次自动修改通过，等待人工审核"
+        : "修订完成，等待人工审核",
+      startedAt: startedAt,
+      finishedAt: isoTimestamp(),
+      liveText: generationJobs[generationKey(bookID, chapterNumber)]?.liveText,
+      revisionRound: round,
+      maxRevisionRounds: maxAutoRevisionRounds,
+      attempts: attempts
+    )
+    recordDebug(scope: "review", message: "chapter.auto_revision.completed", data: [
+      "bookId": bookID,
+      "chapterNumber": chapterNumber,
+      "status": "pending_review",
+      "rounds": round,
+    ])
+  }
+
+  /// Finalizes after all rounds failed. The last round that produced a draft
+  /// already persisted `revision_failed`; if every round threw before producing
+  /// one, this writes the failure record against the best content available so
+  /// the chapter still carries the attempt history and a status the UI can act on.
+  private func finalizeRevisionFailure(
+    bookID: String,
+    chapter: ChapterDetail,
+    originalChapter: ChapterDetail,
+    note: String,
+    mode: String,
+    attempts: [[String: Any]],
+    startedAt: String,
+    lastReview: NativeReview?,
+    lastError: Error?,
+    anyRoundPersisted: Bool,
+    automatic: Bool,
+    roundsCompleted: Int
+  ) {
+    let key = generationKey(bookID, chapter.number)
+    let errorText = lastError?.localizedDescription
+      ?? lastReview?.issues.joined(separator: "；")
+      ?? "自动修改多轮后仍未通过"
+    let review: NativeReview
+    if let lastError {
+      review = NativeReview(
+        pass: false,
+        model: "native-revision-loop",
+        summary: anyRoundPersisted ? "最新自动修改轮次发生异常。" : "多轮自动修改均未产出可复审的草稿。",
+        issues: ["[hard] 修订异常：\(lastError.localizedDescription)"],
+        revisionGuidance: "请根据错误信息修正后重新提交修改。"
+      )
+    } else if let lastReview {
+      review = lastReview
+    } else {
+      review = NativeReview(
+        pass: false,
+        model: "native-revision-loop",
+        summary: "自动修改结束，但没有得到可复审结果。",
+        issues: [],
+        revisionGuidance: "请重新提交修改。"
+      )
+    }
+    try? writeChapter(
+      bookID: bookID,
+      number: chapter.number,
+      title: chapter.title,
+      content: chapter.content,
+      status: "revision_failed",
+      llmReview: reviewRecord(
+        review,
+        status: "failed",
+        autoFixed: automatic ? true : nil,
+        rewriteError: lastError?.localizedDescription,
+        attempts: attempts
+      )
+    )
+    if !anyRoundPersisted {
+      try? updateStateChapter(bookID: bookID, number: chapter.number) { record in
+        var history = record["revisionHistory"] as? [[String: Any]] ?? []
+        history.append([
+          "time": isoTimestamp(),
+          "note": note,
+          "type": mode,
+          "oldContentLength": proseCount(originalChapter.content),
+          "newContentLength": proseCount(originalChapter.content),
+          "success": false,
+          "reviseMode": mode,
+          "error": errorText,
+        ])
+        record["revisionHistory"] = history
+      }
+    }
+    let failureMessage: String
+    if lastError != nil, roundsCompleted == 0 {
+      failureMessage = "复审结果落盘后处理异常，等待人工处理"
+    } else if lastError != nil, roundsCompleted < maxAutoRevisionRounds {
+      failureMessage = "第 \(roundsCompleted) 次修改落盘后处理异常，等待人工处理"
+    } else {
+      failureMessage = "已自动修改 \(roundsCompleted) 次仍未通过，等待人工修改"
+    }
+    generationJobs[key] = try? makeGenerationJob(
+      bookID: bookID,
+      chapterNumber: chapter.number,
+      title: chapter.title,
+      phase: "revision_failed",
+      message: failureMessage,
+      startedAt: startedAt,
+      finishedAt: isoTimestamp(),
+      error: errorText,
+      liveText: generationJobs[key]?.liveText,
+      revisionRound: roundsCompleted > 0 ? roundsCompleted : nil,
+      maxRevisionRounds: maxAutoRevisionRounds,
+      attempts: attempts
+    )
+    recordDebug(scope: "review", message: "chapter.auto_revision.exhausted", level: "warning", data: [
+      "bookId": bookID,
+      "chapterNumber": chapter.number,
+      "rounds": roundsCompleted,
+      "automatic": automatic,
+      "error": errorText,
+    ])
+  }
+
+  private func reviewRecord(
+    _ review: NativeReview,
+    status: String,
+    autoFixed: Bool? = nil,
+    rewriteError: String? = nil,
+    attempts: [[String: Any]] = []
+  ) -> [String: Any] {
+    var record: [String: Any] = [
+      "status": status,
+      "model": review.model,
+      "summary": review.summary,
+      "issues": review.issues,
+      "craftAdvisories": review.advisories,
+      "revisionGuidance": review.revisionGuidance,
+      "reviewedAt": isoTimestamp(),
+      "attempts": attempts,
+    ]
+    if let autoFixed { record["autoFixed"] = autoFixed }
+    if let rewriteError, !rewriteError.isEmpty { record["rewriteError"] = rewriteError }
+    return record
+  }
+
+  private func persistGeneratedDraftForRevision(
+    bookID: String,
+    chapterNumber: Int,
+    title: String,
+    content: String,
+    summary: String,
+    rawDelta: [String: Any]?,
+    validationError: Error,
+    startedAt: String
+  ) throws {
+    let key = generationKey(bookID, chapterNumber)
+    let errorMessage = validationError.localizedDescription
+    let issue = "[hard] 本地章节规则：\(errorMessage)"
+    let review = NativeReview(
+      pass: false,
+      model: "native-draft-validator",
+      summary: "完整草稿已保留，等待修改后复审。",
+      issues: [issue],
+      revisionGuidance: "保留已生成的正文，按本地审核意见修改后重新提交审核。"
+    )
+    let reviewObject = reviewRecord(
+      review,
+      status: "failed",
+      autoFixed: false,
+      attempts: [reviewAttemptRecord(review, attempt: 1)]
+    )
+    try writeChapter(
+      bookID: bookID,
+      number: chapterNumber,
+      title: title,
+      content: content,
+      status: "revision_failed",
+      llmReview: reviewObject
+    )
+    if let rawDelta {
+      do {
+        try persistConsistencyDelta(
+          bookID: bookID,
+          chapterNumber: chapterNumber,
+          title: title,
+          summary: summary,
+          delta: rawDelta
+        )
+      } catch {
+        recordDebug(scope: "continuity", message: "chapter.delta_retain_failed", level: "warning", data: [
+          "bookId": bookID,
+          "chapterNumber": chapterNumber,
+          "error": error.localizedDescription,
+        ])
+      }
+    }
+    generationJobs[key] = try? makeGenerationJob(
+      bookID: bookID,
+      chapterNumber: chapterNumber,
+      title: title,
+      phase: "revision_failed",
+      message: "草稿已保留，等待修改",
+      startedAt: startedAt,
+      finishedAt: isoTimestamp(),
+      error: errorMessage,
+      liveText: generationJobs[key]?.liveText
+    )
+    recordDebug(scope: "generation", message: "chapter.validation_failed_retained", level: "warning", data: [
+      "bookId": bookID,
+      "chapterNumber": chapterNumber,
+      "error": errorMessage,
+      "status": "revision_failed",
+    ])
+  }
+
+  private func reviewAttemptRecord(_ review: NativeReview, attempt: Int) -> [String: Any] {
+    [
+      "pass": review.pass,
+      "status": review.pass ? "passed" : "failed",
+      "attempt": attempt,
+      "model": review.model,
+      "summary": review.summary,
+      "issues": review.issues,
+      "revisionGuidance": review.revisionGuidance,
+      "reviewedAt": isoTimestamp(),
+    ]
+  }
+
+  private func reviewAttemptRecord(_ stored: ReviewAttempt, attempt: Int) -> [String: Any] {
+    var record: [String: Any] = ["attempt": attempt]
+    if let pass = stored.pass { record["pass"] = pass }
+    if let status = stored.status { record["status"] = status }
+    if let model = stored.model { record["model"] = model }
+    if let summary = stored.summary { record["summary"] = summary }
+    if let issues = stored.issues { record["issues"] = issues }
+    if let guidance = stored.revisionGuidance { record["revisionGuidance"] = guidance }
+    if let reviewedAt = stored.reviewedAt { record["reviewedAt"] = reviewedAt }
+    if let baseURL = stored.baseUrl { record["baseUrl"] = baseURL }
+    if let error = stored.error { record["error"] = error }
+    if let latency = stored.latencyMs { record["latencyMs"] = latency }
+    return record
+  }
+
+  private func automaticRevisionNote(for review: NativeReview) -> String {
+    var sections = ["以下是系统初审发现的硬问题。请逐项修正后重写完整正文与 consistencyDelta。"]
+    let guidance = review.revisionGuidance.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !guidance.isEmpty { sections.append("【修改方案】\n\(guidance)") }
+    if !review.issues.isEmpty {
+      sections.append("【必须解决的问题】\n" + review.issues.enumerated()
+        .map { "\($0.offset + 1). \($0.element)" }
+        .joined(separator: "\n"))
+    }
+    return sections.joined(separator: "\n\n")
   }
 
   struct NativeReview: Sendable {
@@ -533,7 +1518,9 @@ extension InkOSCore {
   /// Reviews continuity (blocking) and craft quality (advisory) in one pass.
   /// Only `[hard]` issues fail a chapter: craft findings must not turn every
   /// chapter into `revision_failed`, or the pipeline stalls on taste.
-  private func reviewChapter(
+  /// Internal (not private) so drivers can re-review stored chapters when
+  /// validating review-rule changes.
+  func reviewChapter(
     bookID: String,
     chapterNumber: Int,
     title: String,
@@ -576,16 +1563,18 @@ extension InkOSCore {
 
       第一类：硬连续性（阻断）。审核正文和候选 consistencyDelta 的跨章一致性、人物知情边界、时间地点、伤势、持久物品、世界规则和伏笔生命周期。
       逐项确认正文新增或改变的人物、物品、地点、组织、规则、知识、时间事件和伏笔都登记在 Delta 中；Delta 的每项更新或删除也必须有正文依据。
+      entities.type 的唯一规范值是 character、object、location、faction、concept；物品、设备、资源和储备必须是 object。item、物品等输入别名即使会被本地归一化，也不得作为审核建议或输出口径。
       当 allowUnplannedEntities=false 时，正文不得引入审核前索引中不存在的人物、物品、地点、组织或概念。
       节拍卡的禁止清单等同硬约束：正文若出现被本章明令推迟的剧情、人物、物品、能力或结局，记为 hard。
       正文字数必须在 \(minWords) 至 \(maxWords) 字之间，超出记为 hard。
       章末必须停在节拍卡声明的选择、反转、倒计时或新信息上。若以总结、氛围淡出、格言独白或"安心睡去"式收尾收束全章，记为 hard。
       正文不得用清单、备忘录、条目化盘点或资料登记块承担叙事。主角本人的账本记录也只能以动作与判断混合的方式呈现，不能以并列条目铺陈，出现记为 hard。
-      开篇章（第 1 至 3 章）必须给出主角核心能力或金手指的明确锚点：异常征兆、首次显现或章末触发均可，但不得以任何理由整章回避。若开篇章完全未触及核心能力，记为 hard。
+      第 1 至 3 章作为开篇段整体必须至少建立一次主角核心能力或金手指锚点：异常征兆、首次显现或章末触发均可。前章已经建立后，当前章无需重复；节拍卡明确禁止能力显现时，以禁止清单为准，不得为了重复锚点提前能力。仅在截至当前章整个开篇段仍完全没有锚点时记为 hard。
+      环境状态与资源可用性必须前后一致：此前章节或本章前文确立的中断、不可用或耗尽状态（断信号、断电、断水、封路、资源耗尽、设施损坏等），后文不得在没有恢复、替代或解释的情况下当作可用。同章之内自相矛盾（如先说信号彻底没了、后文又收到群视频）同样记为 hard。
       以上任一问题输出前缀 [hard]。
 
       第二类：写法质量（不阻断）。依据下方写法内核与本书写法约束检查：
-      是否有用总结代替关键场景，是否跳过了本该写出的冲突过程；开场是否为背景综述或履历介绍；对话是否承载了关键分歧和转折；本章必需事件和挫折是否真的在场景里发生；视角是否统一；配角语言是否符合其身份、能否相互区分；承诺的冷幽默是否落地。
+      是否有用总结代替关键场景，是否跳过了本该写出的冲突过程；开场是否为背景综述或履历介绍；对话是否承载了关键分歧和转折；本章必需事件和挫折是否真的在场景里发生；视角是否统一；配角语言是否符合其身份、能否相互区分；承诺的冷幽默是否落地；主角是否只有功能反应而没有一处情感泄底（恐惧、犹豫、疲惫、自嘲等）——配角有人味而主角像机器时尤其要点名。
       这些问题输出前缀 [soft]，并在 revisionGuidance 中给出具体可执行的改法。
 
       pass 只取决于 [hard]：没有 [hard] 问题时 pass=true，即使存在 [soft] 问题。
@@ -615,25 +1604,60 @@ extension InkOSCore {
       正文字数：\(proseCount(content))
       \(content)
       """
-    let result = try await requestLLM(prompt: prompt, role: .review, json: true, timeout: 300)
+    // Streamed for the transport, not for a preview — see the note on the beat
+    // batch call in InkOSCoreCraft. A reasoning model returns nothing on a
+    // non-streaming request until it stops thinking, and `timeoutInterval`
+    // measures inactivity, so this call aborted whenever the review took
+    // longer than the ceiling. It carries the chapter text, the candidate
+    // delta and the post-application continuity index, and it runs on every
+    // review round, which makes it the heaviest remaining exposure.
+    let result = try await requestLLM(
+      prompt: prompt,
+      role: .review,
+      json: true,
+      timeout: 900,
+      onPartialContent: { _ in }
+    )
     let object = parseJSONObject(result.content) ?? [:]
     let allIssues = (object["issues"] as? [Any] ?? []).compactMap(reviewIssueText)
     let blocking = allIssues.filter(isBlockingIssue)
-    let advisories = allIssues.filter { !isBlockingIssue($0) }
+    let rawAdvisories = allIssues.filter { !isBlockingIssue($0) }
+    let advisories = rawAdvisories.filter { !recommendsNoncanonicalEntityType($0) }
     let requestedPass = (object["pass"] as? Bool) ?? false
+    let rawGuidance = string(object["revisionGuidance"])
+    let revisionGuidance = recommendsNoncanonicalEntityType(rawGuidance)
+      ? (blocking + advisories).joined(separator: "\n")
+      : rawGuidance
     if !advisories.isEmpty {
       recordDebug(scope: "review", message: "chapter.craft_advisories", data: [
         "bookId": bookID, "chapterNumber": chapterNumber, "count": advisories.count,
       ])
     }
     return NativeReview(
-      pass: blocking.isEmpty && (requestedPass || advisories.count == allIssues.count),
+      pass: blocking.isEmpty && (requestedPass || rawAdvisories.count == allIssues.count),
       model: result.model,
       summary: string(object["summary"], fallback: "审核完成"),
       issues: blocking,
-      revisionGuidance: string(object["revisionGuidance"]),
+      revisionGuidance: revisionGuidance,
       advisories: advisories
     )
+  }
+
+  private func recommendsNoncanonicalEntityType(_ text: String) -> Bool {
+    let compact = text
+      .lowercased()
+      .replacingOccurrences(of: #"[\s'\"“”‘’]"#, with: "", options: .regularExpression)
+    guard compact.contains("item") || compact.contains("物品") else { return false }
+    let validWarnings = ["不得写item", "不能写item", "item无效", "item不是规范", "item会被归一"]
+    if validWarnings.contains(where: compact.contains) { return false }
+    let invalidPatterns = [
+      #"(改回|统一为|统一成|type改为|类型改为).{0,24}(item|物品)"#,
+      #"此前.{0,20}(通过|采用).{0,12}(item|物品)"#,
+      #"口径为.{0,12}(item|物品)"#,
+    ]
+    return invalidPatterns.contains {
+      compact.range(of: $0, options: .regularExpression) != nil
+    }
   }
 
   /// A finding blocks only when it is explicitly hard, or when it carries no
@@ -704,10 +1728,11 @@ extension InkOSCore {
       \(entityPolicy)
       \(checkpointPolicy)
       本章的写作范围由下面的节拍卡界定：只写节拍卡安排的内容，节拍卡列为禁止提前出现的内容一律不得发生。宁可把一个问题写透，也不要多推进剧情。
-      consistencyDelta 必须记录本章新增、更新或删除的事实；新增随机设定必须登记，并与既有事实兼容。
+      consistencyDelta 必须记录本章新增、更新或删除的事实，它是本章对连续性索引的全部贡献而非节选：正文出现的每个具名人物、地点、持久物品、组织、概念都必须登记；本章兑现或推翻的既有伏笔必须在 remove.hooks 中按 ID 关闭；索引中的既有实体不得静默丢弃，本章仍然成立的事实必须保留；新增随机设定必须登记，并与既有事实兼容。
       entities 每一项的 type 只能取五个值之一，必须按对象性质如实归类，禁止一律填 character：
       character 有意识的人物或生物；location 楼层、房间、区域、建筑等场所；object 物品、设备、资源、储备等实体物；faction 组织、势力、团体；concept 能力、规则、现象等抽象概念。例如“201公寓”“储物间”是 location，“电热水器存水”“界务门”这类物件或装置是 object，只有真正的人才是 character。
       正文里改变生存账本或后续决策的关键资源（存水量、存粮、燃料、电量等）必须在 entities 或 hooks 中登记，且 Delta 中的每个数字与结论都要与正文严格一致，不得出现正文一个数、Delta 另一个数的矛盾。
+      此前章节确立的中断、不可用或耗尽状态（断信号、断电、断水、封路、资源耗尽等）对本章有约束力：使用通信、电力、设施或消耗品之前必须确认其当前可用；本章若要改变某个状态的可用性（如信号短暂恢复），必须在正文写出发生的时刻与原因，并登记进 consistencyDelta 的 worldRules；同章之内不得自相矛盾。
       只输出 JSON：{"title":"章节标题","content":"完整正文","summary":"章节摘要","consistencyDelta":{"upsert":{"immutableCanon":[],"worldRules":[],"entities":[{"id":"","name":"","type":"character|location|object|faction|concept"}],"knowledgeBoundaries":[],"timeline":[],"hooks":[]},"remove":{"immutableCanon":[],"worldRules":[],"entities":[],"knowledgeBoundaries":[],"timeline":[],"hooks":[]}}}。
       \(guidance.map { "本章额外要求：\($0)" } ?? "")
 
@@ -729,11 +1754,12 @@ extension InkOSCore {
   /// rules and style guide out of the prompt as a book grows.
   func storyContext(bookID: String, maxCharacters: Int) throws -> String {
     let storyURL = try existingBookURL(bookID).appendingPathComponent("story", isDirectory: true)
-    // (path, share of the total budget). Shares sum to 0.62; the continuity
+    // (path, share of the total budget). Shares sum to 0.66; the continuity
     // index and volume checkpoint take the rest.
     let reserved: [(path: String, share: Double)] = [
       ("book_rules.md", 0.08),
       ("story_bible.md", 0.12),
+      ("protagonist.md", 0.04),
       ("outline/story_frame.md", 0.04),
       ("outline/volume_map.md", 0.06),
       ("character_matrix.md", 0.06),
@@ -863,42 +1889,62 @@ extension InkOSCore {
     }
     request.httpBody = try JSONSerialization.data(withJSONObject: body)
     let started = Date()
-    if let onPartialContent {
-      let streamed = try await performLLMStreamingRequest(
-        request,
-        operation: "chat.completions.stream",
-        onPartialContent: onPartialContent
-      )
-      guard !streamed.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-        throw InkOSCoreError("模型返回了空内容", statusCode: 502)
+    // Transient upstream failures (rate limit, 5xx, network) get up to two
+    // retries with backoff. Client errors (4xx) and cancellation propagate
+    // immediately — retrying those only burns time.
+    let maxAttempts = 3
+    for attempt in 1...maxAttempts {
+      do {
+        if let onPartialContent {
+          let streamed = try await performLLMStreamingRequest(
+            request,
+            operation: "chat.completions.stream",
+            onPartialContent: onPartialContent
+          )
+          guard !streamed.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw InkOSCoreError("模型返回了空内容", statusCode: 502)
+          }
+          return LLMResult(
+            content: streamed.content,
+            model: model,
+            baseURL: baseURL,
+            latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1000),
+            finishReason: streamed.finishReason
+          )
+        }
+        let (data, response) = try await performLLMRequest(request, operation: "chat.completions")
+        guard let http = response as? HTTPURLResponse else { throw InkOSCoreError("模型返回格式异常") }
+        guard (200..<300).contains(http.statusCode) else {
+          throw try remoteError(data: data, status: http.statusCode, prefix: "模型请求失败")
+        }
+        let responseObject = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+        let choices = responseObject["choices"] as? [[String: Any]] ?? []
+        let message = choices.first?["message"] as? [String: Any]
+        let content = extractMessageContent(message?["content"])
+        guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+          throw InkOSCoreError("模型返回了空内容", statusCode: 502)
+        }
+        return LLMResult(
+          content: content,
+          model: model,
+          baseURL: baseURL,
+          latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1000),
+          finishReason: (choices.first?["finish_reason"] as? String)?.nonEmpty
+        )
+      } catch let error as InkOSCoreError {
+        let transient = [429, 500, 502, 503, 504].contains(error.statusCode)
+        guard transient, attempt < maxAttempts else { throw error }
+        let delaySeconds = attempt == 1 ? 4 : 12
+        recordDebug(scope: "llm", message: "request.retry", level: "warning", data: [
+          "attempt": attempt,
+          "statusCode": error.statusCode,
+          "error": error.localizedDescription,
+          "retryAfterSeconds": delaySeconds,
+        ])
+        try await Task.sleep(nanoseconds: UInt64(delaySeconds) * 1_000_000_000)
       }
-      return LLMResult(
-        content: streamed.content,
-        model: model,
-        baseURL: baseURL,
-        latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1000),
-        finishReason: streamed.finishReason
-      )
     }
-    let (data, response) = try await performLLMRequest(request, operation: "chat.completions")
-    guard let http = response as? HTTPURLResponse else { throw InkOSCoreError("模型返回格式异常") }
-    guard (200..<300).contains(http.statusCode) else {
-      throw try remoteError(data: data, status: http.statusCode, prefix: "模型请求失败")
-    }
-    let responseObject = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-    let choices = responseObject["choices"] as? [[String: Any]] ?? []
-    let message = choices.first?["message"] as? [String: Any]
-    let content = extractMessageContent(message?["content"])
-    guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-      throw InkOSCoreError("模型返回了空内容", statusCode: 502)
-    }
-    return LLMResult(
-      content: content,
-      model: model,
-      baseURL: baseURL,
-      latencyMilliseconds: Int(Date().timeIntervalSince(started) * 1000),
-      finishReason: (choices.first?["finish_reason"] as? String)?.nonEmpty
-    )
+    throw InkOSCoreError("模型请求失败", statusCode: 500)
   }
 
   func loadRawConfig() throws -> [String: Any] {
@@ -1116,16 +2162,43 @@ extension InkOSCore {
   }
 
   private func streamedChapterText(from rawText: String) -> String {
-    guard let marker = rawText.range(
-      of: #""content"\s*:\s*""#,
-      options: .regularExpression
-    ) else { return "" }
+    extractedJSONStringField("content", from: rawText, requireTerminator: false) ?? ""
+  }
+
+  /// Decodes a single `"field": "…"` pair out of `rawText` without requiring the
+  /// enclosing JSON object to parse.
+  ///
+  /// A model that emits a finished chapter inside a torn JSON shell holds the
+  /// only copy of that prose, so this scanner tolerates the shell while staying
+  /// strict about the value itself: an unescaped quote closes the field only
+  /// when JSON's own terminators follow it (`}`, or `,` before the next
+  /// `"key":`). That keeps the bare quotes models write around dialogue from
+  /// truncating a chapter mid-sentence.
+  ///
+  /// `requireTerminator: false` returns whatever decoded so far, which is what
+  /// the live streaming preview needs while the field is still arriving.
+  func extractedJSONStringField(
+    _ field: String,
+    from rawText: String,
+    requireTerminator: Bool = true
+  ) -> String? {
+    let pattern = "\"\(NSRegularExpression.escapedPattern(for: field))\"\\s*:\\s*\""
+    guard let marker = rawText.range(of: pattern, options: .regularExpression) else { return nil }
     let characters = Array(rawText[marker.upperBound...])
     var output = ""
     var index = 0
+    var closed = false
     while index < characters.count {
       let character = characters[index]
-      if character == "\"" { break }
+      if character == "\"" {
+        if closesJSONString(characters, quoteIndex: index) {
+          closed = true
+          break
+        }
+        output.append(character)
+        index += 1
+        continue
+      }
       guard character == "\\" else {
         output.append(character)
         index += 1
@@ -1137,6 +2210,8 @@ extension InkOSCore {
       case "n": output.append("\n"); index += 2
       case "r": output.append("\r"); index += 2
       case "t": output.append("\t"); index += 2
+      case "b": output.append("\u{08}"); index += 2
+      case "f": output.append("\u{0C}"); index += 2
       case "\"": output.append("\""); index += 2
       case "\\": output.append("\\"); index += 2
       case "/": output.append("/"); index += 2
@@ -1151,20 +2226,78 @@ extension InkOSCore {
         index += 2
       }
     }
+    if requireTerminator, !closed { return nil }
     return output
   }
 
-  /// Structured chapter payload with two resilience layers. Previously a
+  /// True when the quote at `quoteIndex` is a real end-of-string quote rather
+  /// than one the model left unescaped inside the prose. Requires either the
+  /// end of the enclosing object or a value separator followed by the next
+  /// object key.
+  private func closesJSONString(_ characters: [Character], quoteIndex: Int) -> Bool {
+    var index = quoteIndex + 1
+    while index < characters.count, characters[index].isWhitespace { index += 1 }
+    guard index < characters.count else { return false }
+    if characters[index] == "}" { return true }
+    guard characters[index] == "," else { return false }
+    index += 1
+    while index < characters.count, characters[index].isWhitespace { index += 1 }
+    guard index < characters.count, characters[index] == "\"" else { return false }
+    index += 1
+    while index < characters.count, characters[index] != "\"" {
+      guard characters[index] != "\\", !characters[index].isNewline else { return false }
+      index += 1
+    }
+    guard index < characters.count else { return false }
+    index += 1
+    while index < characters.count, characters[index].isWhitespace { index += 1 }
+    return index < characters.count && characters[index] == ":"
+  }
+
+  /// Rebuilds the prose half of a chapter payload from a response whose JSON
+  /// shell is broken but whose `content` string is verifiably closed.
+  ///
+  /// Only fields that can be confirmed complete are returned. A
+  /// `consistencyDelta` sitting in a torn shell is never reused — the caller
+  /// re-requests it through the cheap delta-only path — and a missing title or
+  /// summary is left absent so the caller's existing fallbacks apply.
+  func recoverCompleteChapterProse(
+    from rawText: String,
+    chapterNumber: Int
+  ) -> [String: Any]? {
+    guard let content = extractedJSONStringField("content", from: rawText),
+      !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else { return nil }
+    var object: [String: Any] = ["content": content]
+    if let title = extractedJSONStringField("title", from: rawText)?
+      .trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty
+    {
+      object["title"] = title
+    }
+    if let summary = extractedJSONStringField("summary", from: rawText)?
+      .trimmingCharacters(in: .whitespacesAndNewlines), !summary.isEmpty
+    {
+      object["summary"] = summary
+    }
+    return object
+  }
+
+  /// Structured chapter payload with three resilience layers. Previously a
   /// single malformed model output — truncated stream, unescaped control
   /// characters, or a missing consistencyDelta — discarded a full chapter
   /// write with the opaque "模型未返回 consistencyDelta" error and preserved
   /// no evidence of what the model actually emitted.
   ///
-  /// Layer 1: unparseable output is logged (finishReason, length, head/tail)
-  /// and retried once with a strict-format suffix. Layer 2: a payload that
-  /// parses but omits a required delta gets one cheap delta-only completion
-  /// instead of a full rewrite. The chapter text is never salvaged from
-  /// broken JSON — a retry is cheap compared to trusting a torn response.
+  /// Layer 1: unparseable output is logged (finishReason, length, head/tail).
+  /// Layer 2: if that output still carries a verifiably closed `content`
+  /// string, the prose is recovered as-is and only the lost delta is
+  /// re-requested. A finished chapter is the expensive half of the response,
+  /// and regenerating it invites the truncation that broke chapter 5 of
+  /// 《渊雨浩劫》: the first draft was complete behind a torn shell, the
+  /// full retry then ran out of output budget. A full retry with a
+  /// strict-format suffix happens only when the prose itself is torn.
+  /// Layer 3: a payload that parses but omits a required delta gets one cheap
+  /// delta-only completion instead of a full rewrite.
   func requestChapterPayload(
     prompt: String,
     chapterNumber: Int,
@@ -1180,6 +2313,7 @@ extension InkOSCore {
       onPartialContent: onPartialContent
     )
     var parsed = parseJSONObject(result.content)
+    var recoveredProse = false
     if parsed == nil {
       recordDebug(scope: "generation", message: "chapter.invalidJson", level: "error", data: [
         "chapterNumber": chapterNumber,
@@ -1188,18 +2322,49 @@ extension InkOSCore {
         "head": String(result.content.prefix(200)),
         "tail": String(result.content.suffix(200)),
       ])
-      result = try await requestLLM(
-        prompt: prompt + """
+      if let recovered = recoverCompleteChapterProse(
+        from: result.content,
+        chapterNumber: chapterNumber
+      ) {
+        parsed = recovered
+        recoveredProse = true
+        recordDebug(scope: "generation", message: "chapter.proseRecovered", data: [
+          "chapterNumber": chapterNumber,
+          "attempt": 1,
+          "contentLength": string(recovered["content"]).count,
+          "recoveredTitle": recovered["title"] != nil,
+          "recoveredSummary": recovered["summary"] != nil,
+        ])
+      } else {
+        result = try await requestLLM(
+          prompt: prompt + """
 
 
-          严格要求：上次输出不是合法 JSON。本次必须输出严格合法的 JSON：字符串内的换行一律写成 \\n 转义，不得出现未转义的引号或控制字符，整个对象必须以 } 闭合结束。
-          """,
-        role: .primary,
-        json: true,
-        timeout: timeout,
-        onPartialContent: onPartialContent
-      )
-      parsed = parseJSONObject(result.content)
+            严格要求：上次输出不是合法 JSON。本次必须输出严格合法的 JSON：字符串内的换行一律写成 \\n 转义，不得出现未转义的引号或控制字符，整个对象必须以 } 闭合结束。
+            """,
+          role: .primary,
+          json: true,
+          timeout: timeout,
+          onPartialContent: onPartialContent
+        )
+        parsed = parseJSONObject(result.content)
+        if parsed == nil,
+          let recovered = recoverCompleteChapterProse(
+            from: result.content,
+            chapterNumber: chapterNumber
+          )
+        {
+          parsed = recovered
+          recoveredProse = true
+          recordDebug(scope: "generation", message: "chapter.proseRecovered", data: [
+            "chapterNumber": chapterNumber,
+            "attempt": 2,
+            "contentLength": string(recovered["content"]).count,
+            "recoveredTitle": recovered["title"] != nil,
+            "recoveredSummary": recovered["summary"] != nil,
+          ])
+        }
+      }
     }
     guard var object = parsed else {
       throw InkOSCoreError(
@@ -1207,7 +2372,10 @@ extension InkOSCore {
         statusCode: 422
       )
     }
-    if requireDelta, object["consistencyDelta"] as? [String: Any] == nil {
+    // Recovery deliberately drops the delta that sat in the broken shell, so
+    // repair it even when policy would tolerate its absence: the model already
+    // wrote one and a delta-only call is cheap.
+    if (requireDelta || recoveredProse), object["consistencyDelta"] as? [String: Any] == nil {
       recordDebug(scope: "generation", message: "chapter.deltaRepair.started", data: [
         "chapterNumber": chapterNumber,
       ])
@@ -1218,20 +2386,68 @@ extension InkOSCore {
         第\(chapterNumber)章
         \(string(object["content"]))
         """
-      if let repaired = try? await requestLLM(
-        prompt: repairPrompt,
-        role: .primary,
-        json: true,
-        timeout: 300
-      ), let repairedObject = parseJSONObject(repaired.content) {
+      // Every exit from this branch is logged. The repair used to swallow its
+      // failure three ways — a thrown request, an unparseable response, and a
+      // parsed object without a delta all produced the same silent nil — which
+      // left only the caller's "自动补登后仍缺失" to debug from. That mattered
+      // little while the repair ran solely for a parsed payload missing its
+      // delta; prose recovery now depends on it for every torn shell, so the
+      // reason has to survive.
+      do {
+        // Streamed for the transport, not for a preview — see the beat batch call.
+        let repaired = try await requestLLM(
+          prompt: repairPrompt,
+          role: .primary,
+          json: true,
+          timeout: 900,
+          onPartialContent: { _ in }
+        )
+        guard let repairedObject = parseJSONObject(repaired.content) else {
+          recordDebug(
+            scope: "generation", message: "chapter.deltaRepair.failed", level: "error",
+            data: [
+              "chapterNumber": chapterNumber,
+              "reason": "invalidJson",
+              "finishReason": repaired.finishReason ?? "unknown",
+              "contentLength": repaired.content.count,
+              "head": String(repaired.content.prefix(200)),
+              "tail": String(repaired.content.suffix(200)),
+            ])
+          return (object, result)
+        }
         let delta = (repairedObject["consistencyDelta"] as? [String: Any])
           ?? (repairedObject["upsert"] != nil ? repairedObject : nil)
-        if let delta {
-          object["consistencyDelta"] = delta
-          recordDebug(scope: "generation", message: "chapter.deltaRepair.completed", data: [
-            "chapterNumber": chapterNumber,
-          ])
+        guard let delta else {
+          recordDebug(
+            scope: "generation", message: "chapter.deltaRepair.failed", level: "error",
+            data: [
+              "chapterNumber": chapterNumber,
+              "reason": "missingDeltaField",
+              "keys": repairedObject.keys.sorted().joined(separator: ","),
+            ])
+          return (object, result)
         }
+        object["consistencyDelta"] = delta
+        recordDebug(scope: "generation", message: "chapter.deltaRepair.completed", data: [
+          "chapterNumber": chapterNumber,
+        ])
+      } catch let error as InkOSCoreError {
+        recordDebug(
+          scope: "generation", message: "chapter.deltaRepair.failed", level: "error",
+          data: [
+            "chapterNumber": chapterNumber,
+            "reason": "requestFailed",
+            "statusCode": error.statusCode,
+            "error": error.localizedDescription,
+          ])
+      } catch {
+        recordDebug(
+          scope: "generation", message: "chapter.deltaRepair.failed", level: "error",
+          data: [
+            "chapterNumber": chapterNumber,
+            "reason": "requestFailed",
+            "error": error.localizedDescription,
+          ])
       }
     }
     return (object, result)
