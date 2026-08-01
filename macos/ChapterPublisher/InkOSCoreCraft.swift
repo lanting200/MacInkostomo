@@ -327,7 +327,7 @@ extension InkOSCore {
     let progressStart = percentText(range.start - volumeStart, of: volumeChapters)
     let progressEnd = percentText(range.end - volumeStart + 1, of: volumeChapters)
     let targetWords = plan.plan.chapters.first { $0.number == range.start }?.targetWords
-      ?? plan.constraints.targetChapterWords
+      ?? plan.constraints.targetChapterWords  // targetWords only used for display; zero-width not a risk here
 
     let storyFrame = try settingText(bookID: bookID, path: "outline/story_frame.md", limit: 6_000)
     let volumeMap = try settingText(bookID: bookID, path: "outline/volume_map.md", limit: 12_000)

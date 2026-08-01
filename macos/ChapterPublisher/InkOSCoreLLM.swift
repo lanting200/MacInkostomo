@@ -264,13 +264,12 @@ extension InkOSCore {
           throw InkOSCoreError("模型未返回 consistencyDelta（自动补登后仍缺失）", statusCode: 422)
         }
         candidateDelta = try normalizedConsistencyDelta(rawDelta, chapterNumber: chapterNumber)
+        let lengthBand = plan.chapterWordBand(for: chapterNumber)
         try validateChapterLength(
           content,
           chapterNumber: chapterNumber,
-          minWords: plan.plan.chapters.first { $0.number == chapterNumber }?.minWords
-            ?? plan.constraints.targetChapterWords,
-          maxWords: plan.plan.chapters.first { $0.number == chapterNumber }?.maxWords
-            ?? plan.constraints.targetChapterWords,
+          minWords: lengthBand.minWords,
+          maxWords: lengthBand.maxWords,
           label: "章节正文"
         )
         try validateChapterCraft(
@@ -761,12 +760,12 @@ extension InkOSCore {
     var didWriteChapter = false
     do {
       let plan = try synchronizeContinuityProjection(bookID: bookID)
-      let chapterPlan = plan.plan.chapters.first { $0.number == chapter.number }
+      let band = plan.chapterWordBand(for: chapter.number)
       try validateChapterLength(
         chapter.content,
         chapterNumber: chapter.number,
-        minWords: chapterPlan?.minWords ?? plan.constraints.targetChapterWords,
-        maxWords: chapterPlan?.maxWords ?? plan.constraints.targetChapterWords,
+        minWords: band.minWords,
+        maxWords: band.maxWords,
         label: "原章节正文"
       )
       try validateChapterCraft(
@@ -1051,9 +1050,9 @@ extension InkOSCore {
       )
       let plan = try synchronizeContinuityProjection(bookID: bookID)
       let beat = try chapterBeat(bookID: bookID, chapterNumber: baseChapter.number)
-      let chapterPlan = plan.plan.chapters.first { $0.number == baseChapter.number }
-      let minWords = chapterPlan?.minWords ?? plan.constraints.targetChapterWords
-      let maxWords = chapterPlan?.maxWords ?? plan.constraints.targetChapterWords
+      let revisionBand = plan.chapterWordBand(for: baseChapter.number)
+      let minWords = revisionBand.minWords
+      let maxWords = revisionBand.maxWords
       // 计算当前字数、验收上限（与 validateChapterLength 保持一致）和方向提示，
       // 避免模型在"字数不够→字数太多→字数不够"之间反复震荡。
       let currentCount = proseCount(baseChapter.content)
@@ -1556,9 +1555,9 @@ extension InkOSCore {
       )
     }
     let plan = try synchronizeContinuityProjection(bookID: bookID)
-    let chapterPlan = plan.plan.chapters.first { $0.number == chapterNumber }
-    let minWords = chapterPlan?.minWords ?? plan.constraints.targetChapterWords
-    let maxWords = chapterPlan?.maxWords ?? plan.constraints.targetChapterWords
+    let reviewBand = plan.chapterWordBand(for: chapterNumber)
+    let minWords = reviewBand.minWords
+    let maxWords = reviewBand.maxWords
     let previous = chapterNumber > 1 ? (try? readChapterText(bookID: bookID, number: chapterNumber - 1)) ?? "" : ""
     let context = try storyContext(bookID: bookID, maxCharacters: 80_000)
     let craft = try craftDirectives(bookID: bookID, chapterNumber: chapterNumber)
@@ -1710,11 +1709,13 @@ extension InkOSCore {
     beat: ChapterBeat? = nil
   ) throws -> String {
     let plan = try synchronizeContinuityProjection(bookID: bookID)
-    let chapterPlan = plan.plan.chapters.first(where: { $0.number == chapterNumber })
-    let targetWords = chapterPlan?.targetWords ?? 3_000
-    let minWords = chapterPlan?.minWords ?? targetWords
-    let maxWords = chapterPlan?.maxWords ?? targetWords
-    let volume = chapterPlan?.volumeNumber ?? 1
+    let genBand = plan.chapterWordBand(for: chapterNumber)
+    let targetWords = plan.plan.chapters.first(where: { $0.number == chapterNumber })?.targetWords
+      ?? genBand.minWords + (genBand.maxWords - genBand.minWords) / 2
+    let minWords = genBand.minWords
+    let maxWords = genBand.maxWords
+    let bodyFloor = minWords * 85 / 100
+    let volume = plan.plan.chapters.first(where: { $0.number == chapterNumber })?.volumeNumber ?? 1
     let volumePlan = plan.plan.volumes.first(where: { $0.number == volume })
     let entityPolicy = plan.continuity.policy.allowUnplannedEntities
       ? "允许引入规划外实体，但必须在 consistencyDelta.entities 中完整登记后才能使用。"
@@ -1731,7 +1732,7 @@ extension InkOSCore {
     let craft = try craftDirectives(bookID: bookID, chapterNumber: chapterNumber)
     return """
       你是原生 InkOS 长篇小说写作引擎。生成第\(chapterNumber)章完整正文。
-      正文字数必须落在 \(minWords) 至 \(maxWords) 字之间，目标 \(targetWords) 字。严格遵守权威设定、分卷目标、时间线、人物知识边界、持久物品与特殊约束。
+      正文字数必须落在 \(minWords) 至 \(maxWords) 字之间，目标 \(targetWords) 字（验收上限 \(maxWords + max(200, maxWords / 10)) 字）。中文字符不得少于 \(bodyFloor) 个，标点、空行与符号不计入密度；内容不足时展开场景与对话，禁止靠符号或空行凑数。严格遵守权威设定、分卷目标、时间线、人物知识边界、持久物品与特殊约束。
       当前分卷：第\(volume)卷（第\(volumePlan?.startChapter ?? chapterNumber)-\(volumePlan?.endChapter ?? chapterNumber)章）。
       \(volumePolicy)
       \(entityPolicy)

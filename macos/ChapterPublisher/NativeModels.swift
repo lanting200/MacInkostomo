@@ -327,6 +327,31 @@ struct ChapterDetail: Codable, Identifiable, Hashable, Sendable {
     try values.encodeIfPresent(llmReview, forKey: .llmReview)
     try values.encodeIfPresent(inkosReviewSync, forKey: .inkosReviewSync)
   }
+
+  /// Derives a new detail from an existing one, overriding only the fields a
+  /// revision round replaces (title, content). Used to make each auto-revision
+  /// round rewrite the latest draft rather than the original chapter.
+  init(from other: ChapterDetail, title: String, content: String) {
+    number = other.number
+    self.title = title
+    self.content = content
+    status = other.status
+    inkosStatus = other.inkosStatus
+    publisherStatus = other.publisherStatus
+    wordCount = other.wordCount
+    auditIssues = other.auditIssues
+    lengthWarnings = other.lengthWarnings
+    reviewNote = other.reviewNote
+    reviewNotes = other.reviewNotes
+    revisionHistory = other.revisionHistory
+    publishedAt = other.publishedAt
+    volume = other.volume
+    volumeTitle = other.volumeTitle
+    createdAt = other.createdAt
+    updatedAt = other.updatedAt
+    llmReview = other.llmReview
+    inkosReviewSync = other.inkosReviewSync
+  }
 }
 
 // MARK: - Workflow jobs and debug data
@@ -357,6 +382,11 @@ struct GenerationJob: Codable, Identifiable, Hashable, Sendable {
   let review: ReviewAttempt?
   let llmReview: LLMReview?
   let attempts: [ReviewAttempt]?
+  /// 1-based index of the current automatic rewrite round; nil outside an
+  /// auto-revision loop (initial writing, manual first pass).
+  let revisionRound: Int?
+  /// Total automatic rewrite rounds allowed before the chapter falls to manual.
+  let maxRevisionRounds: Int?
   let actualChapterNum: Int?
   let startedAt: String?
   let updatedAt: String?
@@ -711,6 +741,19 @@ struct LongFormConstraints: Codable, Equatable, Sendable {
     self.targetChapterWords = targetChapterWords
     self.chapterWordTolerance = chapterWordTolerance
     self.specialConstraints = specialConstraints
+  }
+
+  /// Word band to use when a chapter has no plan entry (chapter number beyond the
+  /// planned range, or a plan that has not been generated yet). Mirrors the
+  /// planner's own derivation so the fallback is a real band; using
+  /// `targetChapterWords` for both ends collapses it to a single point and asks
+  /// the model for an impossible "N 至 N 字" target.
+  var fallbackChapterWordBand: (minWords: Int, maxWords: Int) {
+    let target = max(1, targetChapterWords)
+    let tolerance = max(0, chapterWordTolerance)
+    let low = max(1, Int((Double(target) * Double(100 - tolerance) / 100).rounded()))
+    let high = max(low, Int((Double(target) * Double(100 + tolerance) / 100).rounded()))
+    return (low, high)
   }
 
   private enum CodingKeys: String, CodingKey {
@@ -1499,6 +1542,18 @@ struct LongFormPlanResponse: Codable, Equatable, Sendable {
   let createdAt: String?
   let updatedAt: String?
 
+  /// Single source of truth for a chapter's word band. Chapters past the planned
+  /// range (or books whose plan predates the chapter) fall back to a real band
+  /// derived from the constraints instead of a zero-width `target 至 target`.
+  func chapterWordBand(for chapterNumber: Int) -> (minWords: Int, maxWords: Int) {
+    if let entry = plan.chapters.first(where: { $0.number == chapterNumber }) {
+      let low = entry.minWords
+      let high = entry.maxWords
+      if low > 0, high >= low { return (low, high) }
+    }
+    return constraints.fallbackChapterWordBand
+  }
+
   private enum CodingKeys: String, CodingKey {
     case version, revision, bookId, constraints, plan, continuity, source, createdAt, updatedAt
   }
@@ -1825,6 +1880,11 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
   var chapterWordTolerance: Int
   var premise: String
   var characters: String
+  /// LLM-expanded protagonist personality. Lives in story/protagonist.md and is
+  /// injected into every chapter prompt, so creation cannot complete until a
+  /// human has reviewed it (protagonistReviewed).
+  var protagonistProfile: String
+  var protagonistReviewed: Bool
   var worldbuilding: String
   var outline: String
   var volumePlan: String
@@ -1846,6 +1906,8 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
     chapterWordTolerance: Int = 15,
     premise: String = "",
     characters: String = "",
+    protagonistProfile: String = "",
+    protagonistReviewed: Bool = false,
     worldbuilding: String = "",
     outline: String = "",
     volumePlan: String = "",
@@ -1866,6 +1928,8 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
     self.chapterWordTolerance = chapterWordTolerance
     self.premise = premise
     self.characters = characters
+    self.protagonistProfile = protagonistProfile
+    self.protagonistReviewed = protagonistReviewed
     self.worldbuilding = worldbuilding
     self.outline = outline
     self.volumePlan = volumePlan
@@ -1899,7 +1963,7 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
     case targetChapterWords
     case volumeCount, targetVolumes
     case chapterWordTolerance, chapterWordTolerancePercent
-    case premise, characters, worldbuilding, outline, volumePlan, pacing, style
+    case premise, characters, protagonistProfile, protagonistReviewed, worldbuilding, outline, volumePlan, pacing, style
     case constraints, specialConstraints
     case creationGuide
   }
@@ -1933,6 +1997,8 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
 
     premise = values.lossyString(forKey: .premise)
     characters = values.lossyString(forKey: .characters)
+    protagonistProfile = values.lossyString(forKey: .protagonistProfile)
+    protagonistReviewed = (try? values.decode(Bool.self, forKey: .protagonistReviewed)) ?? false
     worldbuilding = values.lossyString(forKey: .worldbuilding)
     outline = values.lossyString(forKey: .outline)
     volumePlan = values.lossyString(forKey: .volumePlan)
@@ -1967,6 +2033,8 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
     try values.encode(chapterWordTolerance, forKey: .chapterWordTolerancePercent)
     try values.encode(premise, forKey: .premise)
     try values.encode(characters, forKey: .characters)
+    try values.encode(protagonistProfile, forKey: .protagonistProfile)
+    try values.encode(protagonistReviewed, forKey: .protagonistReviewed)
     try values.encode(worldbuilding, forKey: .worldbuilding)
     try values.encode(outline, forKey: .outline)
     try values.encode(volumePlan, forKey: .volumePlan)
