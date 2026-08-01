@@ -355,11 +355,11 @@ extension InkOSCore {
       3. 主角的 setback 必须让他在本章结束时处于比开场更被动或更紧迫的位置，而不是"清点完家底后安心等待"。
 
       字段含义：
-      number 章号；volumeNumber 卷号；goal 本章要解决或推进的一个具体问题；openingHook 开场的具体时刻或动作，不是背景介绍；scenes 本章 1 至 3 个场景，每项写清地点、在场人物和现场冲突；requiredEvents 本章必须在正文里被看见发生的事，2 至 4 条，写成可验证的具体事件；forbiddenElements 本章禁止提前出现或提前解决的内容，3 至 6 条，逐条点名具体剧情、人物、物品或能力；endingHook 章末停留的选择、反转、倒计时或新信息；focusCharacters 本章出场并有作用的人物，含新引入者；newNamedCharacters 本章新引入的具名人物数量；timeSpan 本章覆盖的故事时间跨度；setback 本章必须出现的挫折、代价或失败；notes 给写作模型的补充提醒。
+      number 章号；volumeNumber 卷号；goal 本章要解决或推进的一个具体问题；openingHook 开场的具体时刻或动作，不是背景介绍；scenes 本章 1 至 3 个场景，每项写清地点、在场人物和现场冲突；requiredEvents 本章必须在正文里被看见发生的事，2 至 4 条，写成可验证的具体事件；forbiddenElements 本章禁止提前出现或提前解决的内容，3 至 6 条，逐条点名具体剧情、人物、物品或能力；endingHook 章末停留的选择、反转、倒计时或新信息；focusCharacters 本章出场并有作用的人物，含新引入者；newNamedCharacters 本章新引入的具名人物数量；timeSpan 本章覆盖的故事时间跨度（可选：仅当时间有明显跳跃时填写，连续剧情可留空）；setback 本章必须出现的挫折、代价或失败；notes 给写作模型的补充提醒。
 
       只输出 JSON：
       {"beats":[{"number":\(range.start),"volumeNumber":\(range.volume),"goal":"","openingHook":"","scenes":[""],"requiredEvents":[""],"forbiddenElements":[""],"endingHook":"","focusCharacters":[""],"newNamedCharacters":0,"timeSpan":"","setback":"","notes":""}]}
-      beats 必须按章号升序覆盖第 \(range.start) 至 \(range.end) 章，一章一项，不多不少。所有字符串字段非空。
+      beats 必须按章号升序覆盖第 \(range.start) 至 \(range.end) 章，一章一项，不多不少。除 timeSpan 外所有字符串字段非空；timeSpan 仅在时间有明显跳跃时填写，连续叙述的章节可留空。
 
       【故事基石】
       \(storyFrame)
