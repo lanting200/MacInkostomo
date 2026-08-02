@@ -163,10 +163,72 @@ half-built features read as done.
   boundaries, current state, persistent-object and resource ledgers, foreshadowing
   pool, chapter summaries, the latest volume-end checkpoint, and the full text of
   the previous chapter. Generated chapters must submit a `consistencyDelta`.
+- A complete generated draft is always retained: if local length, craft, or
+  Delta validation fails, the chapter is written as `revision_failed` with the
+  native validation findings so it remains available for revision.
+- Retention also covers a finished chapter trapped in a broken JSON shell.
+  When `requestChapterPayload` cannot parse a response, it logs
+  `chapter.invalidJson` and then tries `recoverCompleteChapterProse`, which
+  decodes `title`/`content`/`summary` field-by-field without the enclosing
+  object. Recovery requires a verifiably closed `content` string — an
+  unescaped quote ends the field only when `}` or `,` plus the next `"key":`
+  follows it, so bare quotes around dialogue do not truncate prose. A
+  successful recovery logs `chapter.proseRecovered`, discards the delta from
+  the torn shell, and re-requests only that delta through the existing
+  `chapter.deltaRepair.*` path. The full-chapter retry with a strict-format
+  suffix runs only when the prose itself is torn mid-string; a second torn
+  shell is recovered the same way. Regenerating a complete chapter is what
+  drove chapter 5 of 《渊雨浩劫》 into a `finishReason=length` truncation
+  after its first draft had already arrived intact.
+- Every delta-repair exit is logged. `chapter.deltaRepair.failed` carries a
+  `reason` of `requestFailed` (with `statusCode`), `invalidJson` (with
+  head/tail), or `missingDeltaField` (with the keys that did arrive). The
+  repair previously swallowed all three into the same silent nil, leaving only
+  the caller's "自动补登后仍缺失" to debug from.
+- Every chapter-pipeline model call streams, including the ones with no live
+  preview: beat batch, chapter write, review, and both delta repairs. This is a
+  transport requirement, not a UI choice. A reasoning model sends nothing on a
+  non-streaming request until it finishes thinking, and `URLRequest.timeoutInterval`
+  measures inactivity, so the request aborts with `URLError -1001` whenever
+  thinking outlasts the ceiling. Measured on one beat prompt: non-streaming
+  first byte 113.9s, streaming 2.4s followed by ~800 reads. Chapter 11 of
+  《渊雨浩劫》 failed six consecutive attempts at 300/305/313s — every one on the
+  ceiling, none on the relay being unreachable (TCP connected in 0.023s).
+  Ceilings are 900s, covering the slowest observed beat batch (899s).
+  `NativeCoreSmoke` fails on a transport mismatch, so reverting any of these to
+  non-streaming breaks the tests rather than regressing silently.
+- The two repair entry points — `performStoredDraftRevalidation` and
+  `performDeltaOnlyRevision` — start from an empty delta when the chapter has
+  no `story/runtime/chapter-XXXX.consistency.json` yet, logging
+  `chapter.delta.missingForRepair`. `chapterConsistencyDelta` still throws for
+  approval and projection, where a chapter with no registration must not
+  proceed. Repair is the opposite case: a draft whose delta request failed has
+  no file, and throwing there drove the chapter into a full rewrite that
+  discarded the prose recovery had just saved.
+- The opening ability-anchor rule is cumulative across chapters 1-3. Once an
+  earlier opening chapter establishes the anomaly, later opening chapters do
+  not repeat it, and a chapter beat's forbidden list takes precedence over
+  inserting another ability manifestation.
 - Local rules validate cross-chapter order, entity admission, deletion targets, and
   immutable conflicts before an independent model jointly reviews the text, the
-  candidate delta, and the post-application continuity index. Any hard conflict
-  puts the chapter into `revision_failed`.
+  candidate delta, and the post-application continuity index. An initial model
+  `[hard]` finding that only concerns Delta registration enters a Delta-only
+  repair and re-review without rewriting prose. Other hard findings enter an
+  automatic revision loop of up to `maxAutoRevisionRounds` (2) rewrite+re-review
+  rounds, each feeding the previous round's findings back into the rewrite; any
+  round that passes goes to manual review, and only exhausting all rounds puts
+  the chapter into `revision_failed`.
+  A manual rejection (`reviseChapter`) joins the same loop — round one uses the
+  human note, later rounds continue automatically. A local length/craft
+  validation failure does not enter the loop: the full draft is retained and
+  written straight to `revision_failed` for manual rejection. Resubmitting the
+  stored native-validator guidance first revalidates and independently reviews
+  the unchanged draft; rewriting starts only if that preflight still fails.
+  Every round, including local failures that never produced a reviewable draft,
+  appends to `llmReview.attempts` without resetting earlier submissions. If a
+  later round errors after an earlier draft was persisted, the chapter record
+  still receives the complete attempt chain and the latest error. The workflow
+  monitor surfaces the current round using the configured maximum.
 - After manual approval (`approveChapter`), the chapter's `consistencyDelta` is
   projected into `long-form-plan.json.continuity`; re-revision retracts the old
   contribution and re-approval replaces it. Manual edits in the settings page are

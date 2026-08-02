@@ -286,7 +286,8 @@ struct ReviewWorkspaceView: View {
 
   private var chapterHeaderSubtitle: String {
     guard model.currentBookID != nil else { return "选择作品后显示" }
-    let base = "\(model.chapters.count) 章 · 待审 \(selectedBook?.pendingReview ?? 0)"
+    let revisionCount = (selectedBook?.revisionRequested ?? 0) + (selectedBook?.rejected ?? 0)
+    let base = "\(model.chapters.count) 章 · 待审 \(selectedBook?.pendingReview ?? 0) · 待修改 \(revisionCount)"
     return currentGenerationJob == nil ? base : "\(base) · 正在生成"
   }
 
@@ -319,6 +320,8 @@ struct ReviewWorkspaceView: View {
 private struct BookSidebarRow: View {
   let book: BookSummary
 
+  private var revisionCount: Int { book.revisionRequested + book.rejected }
+
   var body: some View {
     VStack(alignment: .leading, spacing: 7) {
       HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -334,15 +337,15 @@ private struct BookSidebarRow: View {
       HStack(spacing: 9) {
         statusCount(color: .orange, value: book.pendingReview, label: "待审")
         statusCount(color: .green, value: book.approved, label: "已通过")
-        if book.rejected > 0 {
-          statusCount(color: .red, value: book.rejected, label: "待修改")
+        if revisionCount > 0 {
+          statusCount(color: .red, value: revisionCount, label: "待修改")
         }
       }
     }
     .padding(.vertical, 5)
     .accessibilityElement(children: .ignore)
     .accessibilityLabel(
-      "\(book.title)，共 \(book.chapterCount) 章，待审 \(book.pendingReview)，已通过 \(book.approved)，待修改 \(book.rejected)"
+      "\(book.title)，共 \(book.chapterCount) 章，待审 \(book.pendingReview)，已通过 \(book.approved)，待修改 \(revisionCount)"
     )
   }
 
@@ -1314,9 +1317,20 @@ private struct ChapterWorkflowMonitorView: View {
     VStack(alignment: .leading, spacing: 14) {
       HStack(alignment: .firstTextBaseline, spacing: 10) {
         VStack(alignment: .leading, spacing: 2) {
-          Text("第 \(chapterNumber) 章")
-            .font(.caption)
-            .foregroundStyle(.secondary)
+          HStack(spacing: 6) {
+            Text("第 \(chapterNumber) 章")
+              .font(.caption)
+              .foregroundStyle(.secondary)
+            if let roundBadge {
+              Text(roundBadge)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 6)
+                .frame(height: 18)
+                .background(Color.orange.opacity(0.14), in: Capsule())
+                .accessibilityLabel(roundBadge)
+            }
+          }
           Text(job?.message ?? "正在建立任务")
             .font(.headline)
         }
@@ -1393,6 +1407,15 @@ private struct ChapterWorkflowMonitorView: View {
     if job?.phase == "reviewing" { return "正文生成完成，正在执行一致性初审。" }
     if job?.isActive == false { return job?.error ?? "任务已完成。" }
     return "正在等待模型返回正文片段…"
+  }
+
+  /// "第 X / N 次自动修改" while the core is inside an auto-revision round;
+  /// nil during initial writing or a plain manual first pass.
+  private var roundBadge: String? {
+    guard let round = job?.revisionRound, let max = job?.maxRevisionRounds, round >= 1 else {
+      return nil
+    }
+    return "第 \(round) / \(max) 次自动修改"
   }
 
   private var activeStage: Int {

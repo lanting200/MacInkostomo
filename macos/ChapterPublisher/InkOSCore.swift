@@ -29,6 +29,8 @@ actor InkOSCore {
   let settingsBackupsURL: URL
 
   var generationJobs: [String: GenerationJob] = [:]
+  /// Beat-batch start chapters currently being planned in the background.
+  var beatPrefetchInFlight: Set<Int> = []
   var creationJobs: [String: CreationJob] = [:]
   var fanqieCSRFTokenValue: String?
   var fanqieCSRFTokenExpiresAt: Date?
@@ -592,7 +594,10 @@ actor InkOSCore {
     finishedAt: String? = nil,
     error: String? = nil,
     liveText: String? = nil,
-    liveTextTruncated: Bool = false
+    liveTextTruncated: Bool = false,
+    revisionRound: Int? = nil,
+    maxRevisionRounds: Int? = nil,
+    attempts: [[String: Any]]? = nil
   ) throws -> GenerationJob {
     var object: [String: Any] = [
       "bookId": bookID,
@@ -607,6 +612,9 @@ actor InkOSCore {
     if let title { object["title"] = title }
     if let finishedAt { object["finishedAt"] = finishedAt }
     if let error { object["error"] = error }
+    if let revisionRound { object["revisionRound"] = revisionRound }
+    if let maxRevisionRounds { object["maxRevisionRounds"] = maxRevisionRounds }
+    if let attempts { object["attempts"] = attempts }
     if let liveText {
       object["liveText"] = liveText
       object["liveTextTruncated"] = liveTextTruncated

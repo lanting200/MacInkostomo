@@ -64,8 +64,14 @@ extension InkOSCore {
     let backup = try createSettingsBackup(bookID: bookID)
     do { try atomicWrite(content, to: url) }
     catch {
-      _ = try? restoreSettingsBackup(bookID: bookID, backupURL: backup)
-      throw InkOSCoreError("保存失败，已恢复修改前设定：\(error.localizedDescription)")
+      do {
+        try restoreSettingsBackup(bookID: bookID, backupURL: backup)
+        throw InkOSCoreError("保存失败，已恢复修改前设定：\(error.localizedDescription)")
+      } catch let restoreError {
+        throw InkOSCoreError(
+          "保存失败且恢复备份也失败。原始错误：\(error.localizedDescription)；恢复错误：\(restoreError.localizedDescription)"
+        )
+      }
     }
     recordDebug(scope: "settings", message: "story_setting.saved", data: [
       "bookId": bookID, "path": path, "size": content.utf8.count,

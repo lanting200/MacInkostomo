@@ -29,6 +29,7 @@ struct CreateBookSheet: View {
   @State private var isAssisting = false
   @State private var assistCompleted = false
   @State private var isSubmitting = false
+  @State private var protagonistConfirmed = false
 
   init(model: WorkspaceModel) {
     _model = ObservedObject(wrappedValue: model)
@@ -46,6 +47,8 @@ struct CreateBookSheet: View {
   private var canSubmit: Bool {
     assistCompleted
       && !guide.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      && protagonistConfirmed
+      && request.protagonistProfile.trimmingCharacters(in: .whitespacesAndNewlines).count >= 20
       && validationMessage == nil
       && !isAssisting
       && !isSubmitting
@@ -487,6 +490,26 @@ struct CreateBookSheet: View {
       }
 
       Divider()
+
+      VStack(alignment: .leading, spacing: 8) {
+        Text("主角性格（必审）")
+          .font(.callout.weight(.semibold))
+        Text("LLM 生成的主角性格会注入之后每一章的写作提示，直接决定主角像不像一个真实的人。请逐字审核、改成你要的样子；确认前无法创建小说。")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+        createTextArea(
+          "主角性格档案",
+          placeholder: "性格特质、缺陷软肋、情绪习惯、说话方式、防御机制、与人相处模式。",
+          text: $request.protagonistProfile,
+          minHeight: 120,
+          required: true
+        )
+        Toggle("我已逐字审核并确认主角性格", isOn: $protagonistConfirmed)
+          .toggleStyle(.checkbox)
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+
+      Divider()
       summarySection("故事简介", text: request.premise)
       Divider()
       summarySection("主要人物", text: request.characters)
@@ -568,18 +591,21 @@ struct CreateBookSheet: View {
   private func discardGeneratedPlan() {
     request.premise = ""
     request.characters = ""
+    request.protagonistProfile = ""
     request.worldbuilding = ""
     request.outline = ""
     request.volumePlan = ""
     request.pacing = ""
     request.style = ""
     request.constraints = ""
+    protagonistConfirmed = false
   }
 
   private func submit() {
     guard canSubmit else { return }
     request = projectedRequest
     request.title = request.title.trimmingCharacters(in: .whitespacesAndNewlines)
+    request.protagonistReviewed = protagonistConfirmed
     request.synchronizeLongFormFields()
     persistDraftImmediately()
     isSubmitting = true
@@ -596,6 +622,7 @@ struct CreateBookSheet: View {
           guide = .init()
           requirements = ""
           assistCompleted = false
+          protagonistConfirmed = false
           CreateBookDraftPersistence.clear()
         } else {
           pendingCreationJobID = CreateBookDraftPersistence.load().pendingCreationJobID
@@ -615,6 +642,7 @@ struct CreateBookSheet: View {
       if let generated = await model.assistCreateBook(guide: synchronizedGuide) {
         request = generated.payload
         assistCompleted = true
+        protagonistConfirmed = false
         guideStep = .review
         persistDraftImmediately()
       }
