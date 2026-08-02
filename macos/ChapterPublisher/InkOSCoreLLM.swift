@@ -1,9 +1,10 @@
 import Foundation
 
-/// Maximum number of automatic "rewrite + re-review" rounds after an initial
-/// review (or local validation) failure before a chapter is left for manual
-/// revision. Each round is a full model rewrite plus an independent re-review.
-private let maxAutoRevisionRounds = 2
+/// Returns the configured upper bound for automatic rewrite+re-review
+/// rounds. Reads from the model config file so the value can be adjusted
+/// per-book without a code change. Defaults to 3 when not set; capped at
+/// 10 to prevent runaway loops.
+private let maxAutoRevisionRoundsFallback = 3
 
 extension InkOSCore {
   struct LLMResult: Sendable {
@@ -22,6 +23,16 @@ extension InkOSCore {
   }
 
   // MARK: - Configuration
+
+  /// Upper bound for automatic rewrite+re-review rounds. Reads
+  /// `maxAutoRevisionRounds` from the model config (integer) so the value
+  /// can be tuned per-deployment without a code change. Falls back to
+  /// `maxAutoRevisionRoundsFallback` (3) when absent or zero; capped at 10.
+  private var maxAutoRevisionRounds: Int {
+    let raw = (try? loadRawConfig()) ?? [:]
+    let n = raw["maxAutoRevisionRounds"] as? Int ?? 0
+    return n > 0 ? min(n, 10) : maxAutoRevisionRoundsFallback
+  }
 
   func fetchInkOSConfig() async throws -> InkOSConfig {
     let raw = try loadRawConfig()
@@ -237,13 +248,16 @@ extension InkOSCore {
         bookID: bookID,
         chapterNumber: chapterNumber,
         guidance: guidance,
-        beat: beat
+        beat: beat,
+        plan: plan
       )
-      let currentPlan = try synchronizeContinuityProjection(bookID: bookID)
+      // Reuse the plan already loaded above — the projection cannot change
+      // between prompt construction and the LLM call, and re-reading the
+      // file just for `requireConsistencyDelta` is redundant I/O.
       let (parsed, result) = try await requestChapterPayload(
         prompt: prompt,
         chapterNumber: chapterNumber,
-        requireDelta: currentPlan.continuity.policy.requireConsistencyDelta,
+        requireDelta: plan.continuity.policy.requireConsistencyDelta,
         timeout: 600,
         onPartialContent: { [weak self] partial in
           await self?.updateGenerationLiveText(key: key, rawText: partial)
@@ -260,7 +274,7 @@ extension InkOSCore {
       let rawDelta = suppliedDelta ?? [:]
       let candidateDelta: ContinuityDelta
       do {
-        if currentPlan.continuity.policy.requireConsistencyDelta, suppliedDelta == nil {
+        if plan.continuity.policy.requireConsistencyDelta, suppliedDelta == nil {
           throw InkOSCoreError("模型未返回 consistencyDelta（自动补登后仍缺失）", statusCode: 422)
         }
         candidateDelta = try normalizedConsistencyDelta(rawDelta, chapterNumber: chapterNumber)
@@ -659,9 +673,11 @@ extension InkOSCore {
           )
           return
         }
-        // Failed review: carry this round's findings into the next round.
+        // Failed review: carry this round's findings into the next round,
+        // together with a summary of what the previous note asked for, so
+        // the model doesn't repeat the same misunderstanding.
         baseChapter = ChapterDetail(from: baseChapter, title: outcome.title, content: outcome.content)
-        currentNote = automaticRevisionNote(for: review)
+        currentNote = automaticRevisionNote(for: review, priorNote: currentNote, completedRound: round)
         currentMode = "auto_rewrite"
         lastError = nil
       } else {
@@ -1116,7 +1132,20 @@ extension InkOSCore {
           + "必须用真实的场景、动作与对话补足，不能靠标点、空行或符号堆砌。"
         : "另需保证中文字符不少于 \(bodyFloor) 个（当前 \(currentBodyCount) 个），标点与空行不计入密度。"
       let craft = try craftDirectives(bookID: bookID, chapterNumber: baseChapter.number)
-      let context = try storyContext(bookID: bookID, maxCharacters: 60_000)
+      let context = try storyContext(bookID: bookID, maxCharacters: 60_000, plan: plan)
+      // Include the tail of the preceding chapter so the model can see the
+      // continuity anchor it must connect to. Generation prompts have always
+      // carried the full previous chapter; revision prompts historically did
+      // not, which caused衔接 hard issues that then required another round.
+      let previousTail: String
+      if baseChapter.number > 1,
+         let prevText = try? readChapterText(bookID: bookID, number: baseChapter.number - 1),
+         !prevText.isEmpty
+      {
+        previousTail = String(prevText.suffix(800))
+      } else {
+        previousTail = ""
+      }
       let beatSection = beat.map(beatBriefText)
         ?? "（本章没有节拍卡，按既有正文范围修订，不要扩大本章承载的剧情量）"
       let prompt = """
@@ -1139,23 +1168,26 @@ extension InkOSCore {
 
         【全书约束与状态】
         \(context)
+        \(previousTail.isEmpty ? "" : "\n        【上一章结尾（衔接参考，最后800字）】\n        \(previousTail)")
 
         【原章节】
         第\(baseChapter.number)章 \(baseChapter.title)
         \(baseChapter.content)
         """
-      let refreshedPlan = try synchronizeContinuityProjection(bookID: bookID)
+      // Reuse the plan loaded at the top of this round instead of triggering
+      // another synchronizeContinuityProjection I/O call just to read
+      // requireConsistencyDelta — the value cannot change during prompt construction.
       let (parsed, result) = try await requestChapterPayload(
         prompt: prompt,
         chapterNumber: baseChapter.number,
-        requireDelta: refreshedPlan.continuity.policy.requireConsistencyDelta,
+        requireDelta: plan.continuity.policy.requireConsistencyDelta,
         timeout: 600,
         onPartialContent: { [weak self] partial in
           await self?.updateGenerationLiveText(key: key, rawText: partial)
         }
       )
       let suppliedDelta = parsed["consistencyDelta"] as? [String: Any]
-      if refreshedPlan.continuity.policy.requireConsistencyDelta, suppliedDelta == nil {
+      if plan.continuity.policy.requireConsistencyDelta, suppliedDelta == nil {
         throw InkOSCoreError("模型未返回 consistencyDelta（自动补登后仍缺失）", statusCode: 422)
       }
       let rawDelta = suppliedDelta ?? [:]
@@ -1551,8 +1583,33 @@ extension InkOSCore {
     return record
   }
 
-  private func automaticRevisionNote(for review: NativeReview) -> String {
-    var sections = ["以下是系统初审发现的硬问题。请逐项修正后重写完整正文与 consistencyDelta。"]
+  /// Builds the note fed to the next rewrite round.
+  ///
+  /// When `priorNote` is provided the model can see what the previous round
+  /// was asked to fix and what it produced — without that context, round 2
+  /// starts from the same abstract prompt as round 1 and tends to make the
+  /// same mistakes. The prior note is capped at 1 200 chars so it does not
+  /// crowd out the current guidance.
+  private func automaticRevisionNote(
+    for review: NativeReview,
+    priorNote: String? = nil,
+    completedRound: Int = 0
+  ) -> String {
+    var sections: [String] = []
+    if let prior = priorNote?.trimmingCharacters(in: .whitespacesAndNewlines), !prior.isEmpty,
+       completedRound > 0
+    {
+      let capped = prior.count > 1_200 ? "…" + prior.suffix(1_200) : prior
+      sections.append(
+        "【第 \(completedRound) 轮修改指令（已执行）】\n\(capped)"
+      )
+      sections.append(
+        "第 \(completedRound) 轮修改完成后审核仍未通过（结论：\(review.summary)）。"
+          + "请在上一轮修改的基础上继续修正，不要推翻已经正确的部分。"
+      )
+    } else {
+      sections.append("以下是系统初审发现的硬问题。请逐项修正后重写完整正文与 consistencyDelta。")
+    }
     let guidance = review.revisionGuidance.trimmingCharacters(in: .whitespacesAndNewlines)
     if !guidance.isEmpty { sections.append("【修改方案】\n\(guidance)") }
     if !review.issues.isEmpty {
@@ -1617,7 +1674,7 @@ extension InkOSCore {
     // the revision prompt only "suggested" trimming that range.
     let reviewCeiling = maxWords + max(200, maxWords / 10)
     let previous = chapterNumber > 1 ? (try? readChapterText(bookID: bookID, number: chapterNumber - 1)) ?? "" : ""
-    let context = try storyContext(bookID: bookID, maxCharacters: 80_000)
+    let context = try storyContext(bookID: bookID, maxCharacters: 80_000, plan: plan)
     let craft = try craftDirectives(bookID: bookID, chapterNumber: chapterNumber)
     let deltaJSON = String(data: try encoder.encode(candidateDelta), encoding: .utf8) ?? "{}"
     let projectedJSON = String(data: try encoder.encode(projected), encoding: .utf8) ?? "{}"
@@ -1792,9 +1849,12 @@ extension InkOSCore {
     bookID: String,
     chapterNumber: Int,
     guidance: String?,
-    beat: ChapterBeat? = nil
+    beat: ChapterBeat? = nil,
+    plan existingPlan: LongFormPlanResponse? = nil
   ) throws -> String {
-    let plan = try synchronizeContinuityProjection(bookID: bookID)
+    // Reuse the caller's plan when available so this function doesn't trigger
+    // another synchronizeContinuityProjection I/O round.
+    let plan = try existingPlan ?? synchronizeContinuityProjection(bookID: bookID)
     let genBand = plan.chapterWordBand(for: chapterNumber)
     let targetWords = plan.plan.chapters.first(where: { $0.number == chapterNumber })?.targetWords
       ?? genBand.minWords + (genBand.maxWords - genBand.minWords) / 2
@@ -1838,7 +1898,7 @@ extension InkOSCore {
       \(beatSection)
 
       【权威设定与当前状态】
-      \(try storyContext(bookID: bookID, maxCharacters: 100_000))
+      \(try storyContext(bookID: bookID, maxCharacters: 100_000, plan: plan))
 
       【上一章全文】
       \(previous)
@@ -1848,13 +1908,21 @@ extension InkOSCore {
   /// Assembles the authoritative context. Files get reserved shares of the
   /// budget so the continuity index cannot silently push the story bible, hard
   /// rules and style guide out of the prompt as a book grows.
-  func storyContext(bookID: String, maxCharacters: Int) throws -> String {
+  ///
+  /// Pass an already-loaded `plan` to avoid a redundant
+  /// `synchronizeContinuityProjection` I/O round when the caller has already
+  /// read the projection. The plan is used only for `truncateContinuityIndex`;
+  /// when nil it is fetched here as before.
+  func storyContext(bookID: String, maxCharacters: Int, plan existingPlan: LongFormPlanResponse? = nil) throws -> String {
     let storyURL = try existingBookURL(bookID).appendingPathComponent("story", isDirectory: true)
     // (path, share of the total budget). Shares sum to 0.66; the continuity
     // index and volume checkpoint take the rest.
+    // chapter_summaries.md gets a larger share (8 %) because it grows with
+    // every chapter: the old 5 % left later chapters with no summary history.
+    // story_bible.md trimmed from 12 % to 10 % to keep the total at 0.66.
     let reserved: [(path: String, share: Double)] = [
       ("book_rules.md", 0.08),
-      ("story_bible.md", 0.12),
+      ("story_bible.md", 0.10),
       ("protagonist.md", 0.04),
       ("outline/story_frame.md", 0.04),
       ("outline/volume_map.md", 0.06),
@@ -1863,11 +1931,12 @@ extension InkOSCore {
       ("object_ledger.md", 0.04),
       ("particle_ledger.md", 0.03),
       ("pending_hooks.md", 0.03),
-      ("chapter_summaries.md", 0.05),
+      ("chapter_summaries.md", 0.08),
       ("current_focus.md", 0.02),
       ("style_guide.md", 0.04),
     ]
-    let plan = try synchronizeContinuityProjection(bookID: bookID)
+    // Reuse the caller's plan to avoid a redundant sync round.
+    let plan = try existingPlan ?? synchronizeContinuityProjection(bookID: bookID)
     let checkpointText = try latestVolumeCheckpointText(bookID: bookID)
 
     var sections: [String] = []
