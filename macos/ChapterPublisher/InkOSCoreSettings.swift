@@ -1,6 +1,21 @@
 import Foundation
 
 extension InkOSCore {
+  /// Subdirectories of `story/` that hold machine-owned runtime state rather
+  /// than editable settings: consistency deltas, the continuity projection,
+  /// chapter beats and volume checkpoints.
+  ///
+  /// These are excluded from settings backup and restore. A backup used to copy
+  /// all of `story/`, and restore replaced the whole directory, so recovering a
+  /// settings edit also rolled `runtime/` back — silently deleting the
+  /// consistency deltas of every chapter written since the backup. Those
+  /// chapters stay `approved` while their deltas vanish, which drops their facts
+  /// from the continuity index and makes re-review fail on "本章缺少
+  /// consistencyDelta". Continuity is not a setting; it is derived from approved
+  /// chapters and must not travel with a text edit. Manual continuity changes go
+  /// through the continuity overlay instead.
+  static let nonEditableStorySubdirectories: Set<String> = ["runtime", "snapshots", "state"]
+
   // MARK: - Story settings
 
   func fetchBookSettings(bookID: String) async throws -> BookSettingsResponse {
@@ -9,7 +24,7 @@ extension InkOSCore {
     let files = try markdownFiles(in: storyURL).compactMap { url -> [String: Any]? in
       let relative = relativePath(url, under: storyURL)
       let first = relative.split(separator: "/").first.map(String.init) ?? ""
-      guard !["runtime", "snapshots", "state"].contains(first) else { return nil }
+      guard !Self.nonEditableStorySubdirectories.contains(first) else { return nil }
       let metadata = settingMetadata(relative)
       let group = settingGroups.first(where: { $0.id == metadata.group }) ?? settingGroups.last!
       return [
@@ -111,6 +126,7 @@ extension InkOSCore {
       "brief.md": ("direction", 20, "项目简介", "创建时的基础需求。", false),
       "current_focus.md": ("direction", 30, "当前聚焦", "下一章的节拍卡摘要；由已审核进度自动重写。", true),
       "book_rules.md": ("canon", 10, "硬规则", "人物、能力、世界和叙事边界。", false),
+      "protagonist.md": ("characters", 10, "主角性格", "主角的性格核心、缺陷、情绪习惯与说话方式；创建时经人工确认，生成章节的必读上下文。", false),
       "story_bible.md": ("canon", 20, "故事圣经", "世界观、力量体系与长期一致性依据。", false),
       "outline/story_frame.md": ("canon", 30, "故事基石", "核心冲突和终局方向。", false),
       "outline/volume_map.md": ("canon", 40, "分卷地图", "每卷范围、目标与回收安排。", false),
@@ -150,12 +166,20 @@ extension InkOSCore {
     let story = try existingBookURL(bookID).appendingPathComponent("story", isDirectory: true).standardizedFileURL
     let normalized = path.replacingOccurrences(of: "\\", with: "/")
     let first = normalized.split(separator: "/").first.map(String.init) ?? ""
-    guard normalized.hasSuffix(".md"), !["runtime", "snapshots", "state"].contains(first) else {
+    guard normalized.hasSuffix(".md"), !Self.nonEditableStorySubdirectories.contains(first) else {
       throw InkOSCoreError("设定路径无效", statusCode: 400)
     }
     let url = story.appendingPathComponent(normalized).standardizedFileURL
     guard url.path.hasPrefix(story.path + "/") else { throw InkOSCoreError("设定路径无效", statusCode: 400) }
     return url
+  }
+
+  /// Top-level entries of a `story/` directory that settings backup and restore
+  /// own, i.e. everything except the machine-owned runtime state.
+  private func editableStoryEntries(in directory: URL) throws -> [URL] {
+    try directoryContents(directory).filter {
+      !Self.nonEditableStorySubdirectories.contains($0.lastPathComponent)
+    }
   }
 
   private func createSettingsBackup(bookID: String) throws -> URL {
@@ -168,17 +192,51 @@ extension InkOSCore {
       timestamp += 1
       backup = root.appendingPathComponent(String(timestamp), isDirectory: true)
     }
-    try fileManager.copyItem(at: story, to: backup)
+    try fileManager.createDirectory(at: backup, withIntermediateDirectories: true)
+    for entry in try editableStoryEntries(in: story) {
+      try fileManager.copyItem(
+        at: entry,
+        to: backup.appendingPathComponent(entry.lastPathComponent, isDirectory: entry.hasDirectoryPath)
+      )
+    }
     return backup
   }
 
+  /// Restores the editable settings from a backup, leaving `runtime/` in place.
+  ///
+  /// Staged into a sibling directory first so a mid-copy failure cannot leave
+  /// the book with neither the old nor the new settings. Backups taken before
+  /// the exclusion existed still contain a `runtime/` snapshot; it is skipped
+  /// on the way back so an old backup cannot resurrect stale continuity.
   @discardableResult
   private func restoreSettingsBackup(bookID: String, backupURL: URL) throws -> Int {
     let story = try existingBookURL(bookID).appendingPathComponent("story", isDirectory: true)
-    let temporary = story.deletingLastPathComponent().appendingPathComponent(".story-restore-\(UUID().uuidString)")
-    try fileManager.copyItem(at: backupURL, to: temporary)
-    if fileManager.fileExists(atPath: story.path) { try fileManager.removeItem(at: story) }
-    try fileManager.moveItem(at: temporary, to: story)
+    let staging = story.deletingLastPathComponent()
+      .appendingPathComponent(".story-restore-\(UUID().uuidString)", isDirectory: true)
+    try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
+    defer { try? fileManager.removeItem(at: staging) }
+    let incoming = try editableStoryEntries(in: backupURL)
+    for entry in incoming {
+      try fileManager.copyItem(
+        at: entry,
+        to: staging.appendingPathComponent(entry.lastPathComponent, isDirectory: entry.hasDirectoryPath)
+      )
+    }
+    try fileManager.createDirectory(at: story, withIntermediateDirectories: true)
+    for entry in try editableStoryEntries(in: story) {
+      try fileManager.removeItem(at: entry)
+    }
+    for entry in try directoryContents(staging) {
+      try fileManager.moveItem(
+        at: entry,
+        to: story.appendingPathComponent(entry.lastPathComponent, isDirectory: entry.hasDirectoryPath)
+      )
+    }
+    recordDebug(scope: "settings", message: "story_settings.restore.scope", data: [
+      "bookId": bookID,
+      "restoredEntries": incoming.count,
+      "preservedRuntime": Self.nonEditableStorySubdirectories.sorted().joined(separator: ","),
+    ])
     return try markdownFiles(in: story).count
   }
 

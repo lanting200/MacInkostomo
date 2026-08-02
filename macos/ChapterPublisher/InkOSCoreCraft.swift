@@ -110,7 +110,17 @@ extension InkOSCore {
     var plan = try loadChapterBeatPlan(bookID: bookID)
     let removedBeats = plan.beats.filter { $0.number >= fromChapter }.count
     plan.beats.removeAll { $0.number >= fromChapter }
-    plan.batches.removeAll { $0.endChapter >= fromChapter }
+    // A batch that straddles `fromChapter` keeps the beats below it, so drop only
+    // the batch records that lie entirely at or above the cut and shrink the
+    // straddling one to what survived. Removing straddling records outright left
+    // surviving beats with no batch covering them.
+    plan.batches.removeAll { $0.startChapter >= fromChapter }
+    plan.batches = plan.batches.map { batch in
+      guard batch.endChapter >= fromChapter else { return batch }
+      var truncated = batch
+      truncated.endChapter = fromChapter - 1
+      return truncated
+    }
     plan.updatedAt = isoTimestamp()
     try atomicWrite(encoder.encode(plan), to: try chapterBeatsURL(bookID: bookID))
     recordDebug(scope: "craft", message: "chapter_beats.invalidated", data: [
@@ -126,10 +136,15 @@ extension InkOSCore {
     chapterNumber: Int,
     plan: LongFormPlanResponse
   ) async throws -> ChapterBeat {
-    if let existing = try chapterBeat(bookID: bookID, chapterNumber: chapterNumber) {
+    let stored = try loadChapterBeatPlan(bookID: bookID)
+    if let existing = stored.beat(for: chapterNumber) {
       return existing
     }
-    let range = beatBatchRange(chapterNumber: chapterNumber, plan: plan)
+    let range = beatBatchRange(
+      chapterNumber: chapterNumber,
+      plan: plan,
+      existingBeats: Set(stored.beats.map(\.number))
+    )
     let generated = try await generateChapterBeatBatch(
       bookID: bookID,
       range: range,
@@ -152,12 +167,19 @@ extension InkOSCore {
     currentChapter: Int,
     plan: LongFormPlanResponse
   ) {
-    let current = beatBatchRange(chapterNumber: currentChapter, plan: plan)
+    let existingBeats = Set(
+      ((try? loadChapterBeatPlan(bookID: bookID))?.beats ?? []).map(\.number)
+    )
+    let current = beatBatchRange(
+      chapterNumber: currentChapter,
+      plan: plan,
+      existingBeats: existingBeats
+    )
     guard currentChapter >= current.end - 2 else { return }
     let nextStart = current.end + 1
     guard nextStart <= plan.plan.targetChapters else { return }
     guard !beatPrefetchInFlight.contains(nextStart) else { return }
-    guard (try? chapterBeat(bookID: bookID, chapterNumber: nextStart)) == nil else { return }
+    guard !existingBeats.contains(nextStart) else { return }
     beatPrefetchInFlight.insert(nextStart)
     recordDebug(scope: "craft", message: "chapter_beats.prefetch.started", data: [
       "bookId": bookID, "fromChapter": nextStart,
@@ -178,9 +200,22 @@ extension InkOSCore {
     }
   }
 
+  /// The batch window containing `chapterNumber`, aligned to fixed size-10
+  /// offsets inside its volume, with the start advanced past any chapter that
+  /// already holds a beat.
+  ///
+  /// Alignment alone reopened settled chapters. `invalidateChapterBeats` drops
+  /// beats from a revised chapter onward but the window still begins at the
+  /// aligned boundary, so regenerating one missing beat rewrote every earlier
+  /// beat in the window — chapters already written and approved. The model then
+  /// planned a fresh arc for them (its `previousBeatsText` shows the batch before
+  /// the window, not the beats it is about to overwrite), and the beat for the
+  /// chapter actually being written was built on that invented arc instead of the
+  /// prose on disk.
   private func beatBatchRange(
     chapterNumber: Int,
-    plan: LongFormPlanResponse
+    plan: LongFormPlanResponse,
+    existingBeats: Set<Int> = []
   ) -> (start: Int, end: Int, volume: Int) {
     let chapterPlan = plan.plan.chapters.first { $0.number == chapterNumber }
     let volumeNumber = chapterPlan?.volumeNumber ?? 1
@@ -189,9 +224,11 @@ extension InkOSCore {
     let volumeEnd = volume?.endChapter ?? chapterNumber
     let size = Self.chapterBeatBatchSize
     let offset = (chapterNumber - volumeStart) / size
-    let start = volumeStart + offset * size
-    let end = min(start + size - 1, volumeEnd)
-    return (start, end, volumeNumber)
+    let alignedStart = volumeStart + offset * size
+    var start = alignedStart
+    while start < chapterNumber, existingBeats.contains(start) { start += 1 }
+    let end = min(alignedStart + size - 1, volumeEnd)
+    return (start, max(start, end), volumeNumber)
   }
 
   private func generateChapterBeatBatch(

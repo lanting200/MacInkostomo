@@ -704,7 +704,11 @@ extension InkOSCore {
       lastReview: lastReview,
       lastError: lastError,
       anyRoundPersisted: anyRoundPersisted,
-      automatic: initialReview != nil || automaticLeadIn || maxAutoRevisionRounds > 1,
+      // `maxAutoRevisionRounds > 1` used to sit in this disjunction; it is a
+      // constant, so a purely manual revision was always recorded as an
+      // automatic fix. A run is automatic when it followed an initial failure,
+      // a revalidation/delta lead-in, or reached a second rewrite round.
+      automatic: initialReview != nil || automaticLeadIn || completedRewriteRounds > 1,
       roundsCompleted: completedRewriteRounds
     )
   }
@@ -1558,6 +1562,12 @@ extension InkOSCore {
     let reviewBand = plan.chapterWordBand(for: chapterNumber)
     let minWords = reviewBand.minWords
     let maxWords = reviewBand.maxWords
+    // The review model must judge length against the same threshold
+    // `validateChapterLength` enforces. Telling it `maxWords` was hard while
+    // local validation accepted up to the ceiling created a dead band between
+    // the two: a draft passed locally, then the review failed it as [hard], and
+    // the revision prompt only "suggested" trimming that range.
+    let reviewCeiling = maxWords + max(200, maxWords / 10)
     let previous = chapterNumber > 1 ? (try? readChapterText(bookID: bookID, number: chapterNumber - 1)) ?? "" : ""
     let context = try storyContext(bookID: bookID, maxCharacters: 80_000)
     let craft = try craftDirectives(bookID: bookID, chapterNumber: chapterNumber)
@@ -1574,7 +1584,7 @@ extension InkOSCore {
       entities.type 的唯一规范值是 character、object、location、faction、concept；物品、设备、资源和储备必须是 object。item、物品等输入别名即使会被本地归一化，也不得作为审核建议或输出口径。
       当 allowUnplannedEntities=false 时，正文不得引入审核前索引中不存在的人物、物品、地点、组织或概念。
       节拍卡的禁止清单等同硬约束：正文若出现被本章明令推迟的剧情、人物、物品、能力或结局，记为 hard。
-      正文字数必须在 \(minWords) 至 \(maxWords) 字之间，超出记为 hard。
+      正文字数目标区间是 \(minWords) 至 \(maxWords) 字，验收上限 \(reviewCeiling) 字。低于 \(minWords) 字或高于 \(reviewCeiling) 字记为 hard；落在 \(maxWords) 与 \(reviewCeiling) 字之间只作为 soft 提醒，不阻断。
       章末必须停在节拍卡声明的选择、反转、倒计时或新信息上。若以总结、氛围淡出、格言独白或"安心睡去"式收尾收束全章，记为 hard。
       正文不得用清单、备忘录、条目化盘点或资料登记块承担叙事。主角本人的账本记录也只能以动作与判断混合的方式呈现，不能以并列条目铺陈，出现记为 hard。
       第 1 至 3 章作为开篇段整体必须至少建立一次主角核心能力或金手指锚点：异常征兆、首次显现或章末触发均可。前章已经建立后，当前章无需重复；节拍卡明确禁止能力显现时，以禁止清单为准，不得为了重复锚点提前能力。仅在截至当前章整个开篇段仍完全没有锚点时记为 hard。
@@ -1626,7 +1636,30 @@ extension InkOSCore {
       timeout: 900,
       onPartialContent: { _ in }
     )
-    let object = parseJSONObject(result.content) ?? [:]
+    // An unparseable review response must not read as "no issues found". The
+    // pass condition below only inspects the decoded issue list, so a `?? [:]`
+    // fallback produced an empty list and passed the chapter on a malformed
+    // review — the one outcome that must never be silent.
+    guard let object = parseJSONObject(result.content) else {
+      recordDebug(scope: "review", message: "chapter.review.invalidJson", level: "error", data: [
+        "bookId": bookID,
+        "chapterNumber": chapterNumber,
+        "model": result.model,
+        "finishReason": result.finishReason ?? "unknown",
+        "contentLength": result.content.count,
+        "head": String(result.content.prefix(200)),
+        "tail": String(result.content.suffix(200)),
+      ])
+      return NativeReview(
+        pass: false,
+        model: result.model,
+        summary: "审核模型未返回合法 JSON，无法判定本章是否通过。",
+        issues: [
+          "[hard] 审核响应异常：模型未返回合法 JSON（finishReason=\(result.finishReason ?? "未知")，输出 \(result.content.count) 字符）",
+        ],
+        revisionGuidance: "重新提交审核；若持续失败请检查审核模型配置与输出长度上限。"
+      )
+    }
     let allIssues = (object["issues"] as? [Any] ?? []).compactMap(reviewIssueText)
     let blocking = allIssues.filter(isBlockingIssue)
     let rawAdvisories = allIssues.filter { !isBlockingIssue($0) }
@@ -1641,8 +1674,13 @@ extension InkOSCore {
         "bookId": bookID, "chapterNumber": chapterNumber, "count": advisories.count,
       ])
     }
+    // `pass` is decided by the absence of [hard] findings, with one guard: a
+    // response that claims failure while listing no findings at all is
+    // self-contradictory and fails. The previous second clause
+    // (`rawAdvisories.count == allIssues.count`) was just `blocking.isEmpty`
+    // restated, so it silently converted that contradiction into a pass.
     return NativeReview(
-      pass: blocking.isEmpty && (requestedPass || rawAdvisories.count == allIssues.count),
+      pass: blocking.isEmpty && (requestedPass || !allIssues.isEmpty),
       model: result.model,
       summary: string(object["summary"], fallback: "审核完成"),
       issues: blocking,

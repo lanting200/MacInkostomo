@@ -72,6 +72,12 @@ extension InkOSCore {
       "chapterWordTolerance": guide.chapterWordTolerance,
       "premise": lockedText(label: "剧情概述", confirmed: guide.storyPremise, generated: string(generated["premise"])),
       "characters": lockedText(label: "主角", confirmed: protagonist, generated: string(generated["characters"])),
+      "protagonistProfile": string(
+        generated["protagonistProfile"],
+        fallback: "\(guide.protagonistName)：\(guide.protagonistProfile)"
+      ),
+      // LLM 生成的主角性格未经人工确认前不得创建书籍。
+      "protagonistReviewed": false,
       "worldbuilding": lockedText(
         label: "世界规则与边界",
         confirmed: guide.worldRules,
@@ -134,6 +140,14 @@ extension InkOSCore {
     let bookURL = try safeBookURL(bookID)
     guard !fileManager.fileExists(atPath: bookURL.path) else {
       throw InkOSCoreError("同名小说已经存在", statusCode: 409)
+    }
+    // The protagonist profile is injected into every chapter prompt, so a
+    // machine-written personality must never reach generation unreviewed.
+    guard input.protagonistReviewed else {
+      throw InkOSCoreError("请先审核并确认主角性格，再创建小说", statusCode: 400)
+    }
+    guard input.protagonistProfile.trimmingCharacters(in: .whitespacesAndNewlines).count >= 20 else {
+      throw InkOSCoreError("主角性格档案过短（至少 20 字），请在创建页补充后再创建", statusCode: 400)
     }
 
     let jobID = UUID().uuidString
@@ -324,8 +338,13 @@ extension InkOSCore {
     let chapterCount = max(1, Int((Double(constraints.targetTotalWords) / Double(constraints.targetChapterWords)).rounded()))
     let baseWords = constraints.targetTotalWords / chapterCount
     let wordRemainder = constraints.targetTotalWords % chapterCount
-    let minWords = max(1, Int((Double(constraints.targetChapterWords) * Double(100 - constraints.chapterWordTolerance) / 100).rounded()))
-    let maxWords = max(minWords, Int((Double(constraints.targetChapterWords) * Double(100 + constraints.chapterWordTolerance) / 100).rounded()))
+    // Band and per-chapter target come from different arithmetic: the band from
+    // `targetChapterWords ± tolerance`, the target from
+    // `targetTotalWords / chapterCount`. When the division is not clean the two
+    // disagree, and the generation prompt then states an impossible instruction
+    // ("必须落在 3400 至 4600 字，目标 3333 字"). The band is what validation
+    // enforces, so the target is clamped into it.
+    let (minWords, maxWords) = constraints.derivedChapterWordBand
 
     var chapters: [[String: Any]] = []
     var volumes: [[String: Any]] = []
@@ -338,7 +357,8 @@ extension InkOSCore {
       let end = cursor + count - 1
       var volumeWords = 0
       for chapterNumber in start...end {
-        let target = baseWords + (chapterNumber <= wordRemainder ? 1 : 0)
+        let budgeted = baseWords + (chapterNumber <= wordRemainder ? 1 : 0)
+        let target = min(maxWords, max(minWords, budgeted))
         volumeWords += target
         chapters.append([
           "number": chapterNumber,
@@ -413,6 +433,7 @@ extension InkOSCore {
       "brief.md": "# \(input.title)\n\n\(input.premise)",
       "book_rules.md": "# 硬规则\n\n\(input.constraints)\n\n## 世界边界\n\(input.worldbuilding)",
       "story_bible.md": "# 故事圣经\n\n## 人物\n\(input.characters)\n\n## 世界观\n\(input.worldbuilding)",
+      "protagonist.md": "# 主角性格\n\n\(input.protagonistProfile)",
       "style_guide.md": "# 文风指南\n\n\(input.style)\n\n## 节奏\n\(input.pacing)",
       "craft_rules.md": InkOSCore.defaultCraftRules,
       "outline/story_frame.md": "# 故事基石\n\n\(input.outline)",
@@ -462,8 +483,10 @@ extension InkOSCore {
   private func createBookPrompt(_ guide: CreateBookGuide) -> String {
     """
     你是小说策划编辑。用户只回答了普通作者能够决定的问题，请把这些回答整理成可直接执行的完整长篇小说方案。
-    只输出 JSON，字段为 premise、characters、worldbuilding、outline、volumePlan、pacing、style。
+    只输出 JSON，字段为 premise、characters、protagonistProfile、worldbuilding、outline、volumePlan、pacing、style。
     所有字段都必须是非空中文字符串。用户确认事实必须原样保留；用户未决定的世界规则、人物关系、节奏和文风由你合理补全。
+    protagonistProfile 是主角性格档案，将逐字呈现给用户审核修改，必须写成"一个具体的人"而不是标签堆砌，包含：三个以内具体性格特质；一个真实的缺陷或软肋（会在小事上拖累他的那种）；情绪反应习惯（压力下先做什么、累极了会怎样）；说话方式与口癖；防御机制（如冷幽默）以及他在防什么；与人相处的方式。避免"冷静""果断""善良"这类空泛评语，每条都要落到可观察的行为上。
+    characters 是包括主角在内的群像表，与 protagonistProfile 一致但不重复其细节。
     volumePlan 必须覆盖全部 \(guide.volumeCount) 卷并标明每卷章节范围、阶段目标、主要冲突、卷末变化和需要回收的伏笔。
     规划必须维护跨卷因果、角色成长、时间线、知识边界、资源代价和随机小设定的一致性，不要向用户反问。
 

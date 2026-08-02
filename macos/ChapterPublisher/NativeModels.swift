@@ -743,18 +743,31 @@ struct LongFormConstraints: Codable, Equatable, Sendable {
     self.specialConstraints = specialConstraints
   }
 
-  /// Word band to use when a chapter has no plan entry (chapter number beyond the
-  /// planned range, or a plan that has not been generated yet). Mirrors the
-  /// planner's own derivation so the fallback is a real band; using
-  /// `targetChapterWords` for both ends collapses it to a single point and asks
-  /// the model for an impossible "N 至 N 字" target.
-  var fallbackChapterWordBand: (minWords: Int, maxWords: Int) {
+  /// Smallest usable width for a chapter word band. A band narrower than this —
+  /// `chapterWordTolerance` is user-settable down to 0, which collapses it to a
+  /// single point — asks the model to land on an exact character count, which no
+  /// draft can reliably hit, so every chapter fails length validation.
+  static let minimumChapterWordBandWidth = 300
+
+  /// The single derivation of a chapter's word band from the constraints. Used by
+  /// the planner when it writes per-chapter entries and as the fallback for a
+  /// chapter with no plan entry, so a plan file and a fallback can never disagree.
+  var derivedChapterWordBand: (minWords: Int, maxWords: Int) {
     let target = max(1, targetChapterWords)
     let tolerance = max(0, chapterWordTolerance)
-    let low = max(1, Int((Double(target) * Double(100 - tolerance) / 100).rounded()))
-    let high = max(low, Int((Double(target) * Double(100 + tolerance) / 100).rounded()))
+    var low = max(1, Int((Double(target) * Double(100 - tolerance) / 100).rounded()))
+    var high = max(low, Int((Double(target) * Double(100 + tolerance) / 100).rounded()))
+    let deficit = Self.minimumChapterWordBandWidth - (high - low)
+    if deficit > 0 {
+      low = max(1, low - deficit / 2)
+      high = max(low + Self.minimumChapterWordBandWidth, low)
+    }
     return (low, high)
   }
+
+  /// Word band to use when a chapter has no plan entry (chapter number beyond the
+  /// planned range, or a plan that has not been generated yet).
+  var fallbackChapterWordBand: (minWords: Int, maxWords: Int) { derivedChapterWordBand }
 
   private enum CodingKeys: String, CodingKey {
     case targetTotalWords, totalWordCount, totalWords
@@ -1545,11 +1558,21 @@ struct LongFormPlanResponse: Codable, Equatable, Sendable {
   /// Single source of truth for a chapter's word band. Chapters past the planned
   /// range (or books whose plan predates the chapter) fall back to a real band
   /// derived from the constraints instead of a zero-width `target 至 target`.
+  ///
+  /// A stored entry narrower than the minimum width is widened here rather than
+  /// trusted: plans written before the width floor existed (or with
+  /// `chapterWordTolerance` at 0) carry bands no draft can satisfy, and those
+  /// files are already on disk.
   func chapterWordBand(for chapterNumber: Int) -> (minWords: Int, maxWords: Int) {
     if let entry = plan.chapters.first(where: { $0.number == chapterNumber }) {
       let low = entry.minWords
       let high = entry.maxWords
-      if low > 0, high >= low { return (low, high) }
+      if low > 0, high >= low {
+        let deficit = LongFormConstraints.minimumChapterWordBandWidth - (high - low)
+        guard deficit > 0 else { return (low, high) }
+        let widenedLow = max(1, low - deficit / 2)
+        return (widenedLow, max(widenedLow + LongFormConstraints.minimumChapterWordBandWidth, high))
+      }
     }
     return constraints.fallbackChapterWordBand
   }
