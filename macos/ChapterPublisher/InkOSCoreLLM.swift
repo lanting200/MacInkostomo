@@ -433,6 +433,16 @@ extension InkOSCore {
     let content: String
     let error: Error?
     let persisted: Bool
+
+    static func stalled(lastTitle: String, lastContent: String) -> RevisionRoundOutcome {
+      RevisionRoundOutcome(
+        review: nil,
+        title: lastTitle,
+        content: lastContent,
+        error: InkOSCoreError("修订输出与原文完全相同，继续重试无意义"),
+        persisted: false
+      )
+    }
   }
 
   private func storedNativeReview(_ review: LLMReview?) -> NativeReview? {
@@ -658,11 +668,12 @@ extension InkOSCore {
         // The round threw before yielding a reviewable draft. Record the error
         // as an attempt and, if rounds remain, retry with the error folded into
         // the note so the model knows what to avoid.
+        let errorMessage = outcome.error?.localizedDescription ?? "修订轮次异常"
         attempts.append([
           "pass": false,
           "status": "error",
           "attempt": attemptNumber,
-          "error": outcome.error?.localizedDescription ?? "修订轮次异常",
+          "error": errorMessage,
           "reviewedAt": isoTimestamp(),
         ])
         lastError = outcome.error
@@ -673,7 +684,18 @@ extension InkOSCore {
             content: outcome.content
           )
         }
-        currentNote = "\(currentNote)\n\n【上一轮修订异常，请修正后重写】\n\(outcome.error?.localizedDescription ?? "")"
+        // If the model returned unchanged output, retrying with the same prompt
+        // is futile. Break immediately rather than burning more rounds.
+        if errorMessage.contains("完全相同") || errorMessage.contains("stalled") {
+          recordDebug(scope: "craft", message: "chapter.revision.terminated", level: "warning", data: [
+            "bookId": bookID,
+            "chapterNumber": chapter.number,
+            "round": round,
+            "reason": "模型输出停滞，终止自动重试。",
+          ])
+          break
+        }
+        currentNote = "\(currentNote)\n\n【上一轮修订异常，请修正后重写】\n\(errorMessage)"
         currentMode = "auto_rewrite"
       }
 
@@ -1062,11 +1084,19 @@ extension InkOSCore {
       let currentCount = proseCount(baseChapter.content)
       let ceiling = maxWords + max(200, maxWords / 10)
       let targetWords = (minWords + maxWords) / 2
+      let gap = minWords - currentCount
       let wordGapInstruction: String
       if currentCount < minWords {
-        wordGapInstruction =
-          "还差约 \(minWords - currentCount) 字，需要展开场景或补充细节；" +
-          "切勿以凑字符号、空行或重复句子填充。"
+        // Small gaps (<20 chars) are nearly impossible to hit precisely and
+        // lead to loops where the model returns identical text. When that close,
+        // accept it rather than demanding exact alignment.
+        if gap > 0 && gap < 20 {
+          wordGapInstruction = "字数 \(currentCount) 已接近下限 \(minWords)（差 \(gap) 字），保持当前长度即可，无需刻意增补。"
+        } else {
+          wordGapInstruction =
+            "还差约 \(gap) 字，需要展开场景或补充细节；" +
+            "切勿以凑字符号、空行或重复句子填充。"
+        }
       } else if currentCount > ceiling {
         wordGapInstruction =
           "已超出验收上限 \(ceiling) 字约 \(currentCount - ceiling) 字，" +
@@ -1137,6 +1167,24 @@ extension InkOSCore {
       let content = stripChapterHeading(string(parsed["content"], fallback: result.content))
       latestTitle = title
       latestContent = content
+
+      // Detect unchanged output: if the model returned exactly the same prose,
+      // further retries with the same prompt are futile. Mark as stalled rather
+      // than burning more rounds.
+      let newCount = proseCount(content)
+      let oldCount = proseCount(baseChapter.content)
+      if newCount == oldCount && content.trimmingCharacters(in: .whitespacesAndNewlines)
+        == baseChapter.content.trimmingCharacters(in: .whitespacesAndNewlines)
+      {
+        recordDebug(scope: "craft", message: "chapter.revision.stalled", level: "warning", data: [
+          "bookId": bookID,
+          "chapterNumber": baseChapter.number,
+          "round": round,
+          "reason": "模型返回内容与修订前完全相同，继续重试无意义。",
+        ])
+        return .stalled(lastTitle: title, lastContent: content)
+      }
+
       try validateChapterLength(
         content,
         chapterNumber: baseChapter.number,
@@ -1820,8 +1868,6 @@ extension InkOSCore {
       ("style_guide.md", 0.04),
     ]
     let plan = try synchronizeContinuityProjection(bookID: bookID)
-    let continuityData = try encoder.encode(plan.continuity)
-    let continuityText = String(data: continuityData, encoding: .utf8) ?? "{}"
     let checkpointText = try latestVolumeCheckpointText(bookID: bookID)
 
     var sections: [String] = []
@@ -1843,7 +1889,7 @@ extension InkOSCore {
     }
 
     let continuityAllowance = Swift.max(2_000, maxCharacters - used - (checkpointText?.count ?? 0))
-    let continuityHead = String(continuityText.prefix(continuityAllowance))
+    let continuityHead = truncateContinuityIndex(plan.continuity, maxChars: continuityAllowance)
     sections.insert("【结构化连续性索引（已审核章节 + 人工覆盖）】\n" + continuityHead, at: 0)
     used += continuityHead.count
     if let checkpointText {
@@ -2539,6 +2585,68 @@ extension InkOSCore {
   private func secretPreview(_ value: String) -> String {
     guard value.count > 8 else { return value.isEmpty ? "" : "••••" }
     return "\(value.prefix(4))••••\(value.suffix(4))"
+  }
+
+  /// Truncate continuity index by structure rather than raw character count.
+  /// The full JSON is often too large to fit, but slicing mid-string leaves
+  /// malformed JSON and hides the tail of the timeline. This keeps complete
+  /// entries, prioritizes recent timeline milestones, and adds a summary hint
+  /// when timeline is truncated so the model knows what order values are taken.
+  private func truncateContinuityIndex(
+    _ continuity: LongFormContinuity,
+    maxChars: Int
+  ) -> String {
+    var compact = continuity
+    // Timeline is the biggest and most context-sensitive section. Keep recent
+    // milestones (high order values = recent story events) and drop old ones
+    // if the full list won't fit.
+    if !compact.timeline.isEmpty {
+      let sortedTimeline = compact.timeline.sorted { $0.order > $1.order }
+      var kept: [LongFormTimelineMilestone] = []
+      var dryRun = compact
+      for milestone in sortedTimeline {
+        dryRun.timeline = kept + [milestone]
+        let candidate = (try? encoder.encode(dryRun)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        if candidate.count <= maxChars {
+          kept.append(milestone)
+        } else if kept.isEmpty {
+          // Even the first (most recent) milestone overflows; keep it anyway
+          // so the model has *something* rather than an empty timeline.
+          kept.append(milestone)
+          break
+        } else {
+          break
+        }
+      }
+      compact.timeline = kept.sorted { $0.order < $1.order }
+    }
+
+    let encoded = (try? encoder.encode(compact)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    guard encoded.count <= maxChars else {
+      // Still over budget even after timeline pruning. Fall back to character
+      // truncation but at least the timeline portion is structurally sound.
+      return String(encoded.prefix(maxChars))
+    }
+
+    // If we pruned timeline, add a summary hint so the model knows the range.
+    if compact.timeline.count < continuity.timeline.count, !continuity.timeline.isEmpty {
+      let allOrders = continuity.timeline.map(\.order).sorted()
+      let keptOrders = compact.timeline.map(\.order).sorted()
+      let droppedCount = continuity.timeline.count - compact.timeline.count
+      let hint = """
+
+        <!--
+        注：完整时间线共 \(continuity.timeline.count) 条，此处仅保留最近 \(compact.timeline.count) 条以适应上下文预算。
+        已省略 \(droppedCount) 条早期事件。
+        order 值范围：最小 \(allOrders.first ?? 0)，最大 \(allOrders.last ?? 0)，当前可见 \(keptOrders.first ?? 0)–\(keptOrders.last ?? 0)。
+        如需新增时间线条目，建议 order 从 \((allOrders.last ?? 0) + 1) 开始递增，避免与已有条目冲突。
+        -->
+        """
+      let withHint = encoded + hint
+      return withHint.count <= maxChars ? withHint : encoded
+    }
+
+    return encoded
   }
 }
 
