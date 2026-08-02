@@ -16,6 +16,8 @@ struct FanqieWorkspaceView: View {
   @State private var showingLogin = false
   @State private var showingCreateBook = false
   @State private var transferMode: FanqieTransferMode?
+  @State private var bookSearch = ""
+  @State private var chapterSearch = ""
 
   var body: some View {
     VStack(spacing: 0) {
@@ -124,8 +126,15 @@ struct FanqieWorkspaceView: View {
 
   private var bookList: some View {
     VStack(spacing: 0) {
-      NativeSectionHeader("作品", subtitle: "\(model.fanqieBooks.count) 本")
+      NativeSectionHeader("作品", subtitle: bookListSubtitle)
         .padding(12)
+
+      if !model.fanqieBooks.isEmpty {
+        NativeSearchField(prompt: "搜索作品", text: $bookSearch)
+          .padding(.horizontal, 10)
+          .padding(.bottom, 8)
+      }
+
       Divider()
       if model.fanqieBooks.isEmpty, !model.isLoading {
         NativeEmptyState(
@@ -135,8 +144,14 @@ struct FanqieWorkspaceView: View {
           actionTitle: "创建作品",
           action: { showingCreateBook = true }
         )
+      } else if filteredFanqieBooks.isEmpty {
+        NativeEmptyState(
+          title: "没有匹配的作品",
+          detail: "可按作品名或书号搜索。",
+          systemImage: "magnifyingglass"
+        )
       } else {
-        List(model.fanqieBooks, selection: selectedBookBinding) { book in
+        List(filteredFanqieBooks, selection: selectedBookBinding) { book in
           VStack(alignment: .leading, spacing: 3) {
             Text(book.title)
               .font(.callout.weight(.medium))
@@ -159,8 +174,15 @@ struct FanqieWorkspaceView: View {
 
   private var chapterList: some View {
     VStack(spacing: 0) {
-      NativeSectionHeader("章节", subtitle: "\(model.fanqieChapters.count) 章")
+      NativeSectionHeader("章节", subtitle: chapterListSubtitle)
         .padding(12)
+
+      if !model.fanqieChapters.isEmpty {
+        NativeSearchField(prompt: "搜索章节", text: $chapterSearch)
+          .padding(.horizontal, 10)
+          .padding(.bottom, 8)
+      }
+
       Divider()
       if model.selectedFanqieBookID == nil {
         NativeEmptyState(title: "选择作品", detail: "", systemImage: "book")
@@ -172,8 +194,14 @@ struct FanqieWorkspaceView: View {
           actionTitle: "上传章节",
           action: { transferMode = .upload }
         )
+      } else if filteredFanqieChapters.isEmpty {
+        NativeEmptyState(
+          title: "没有匹配的章节",
+          detail: "可按章节号、标题或状态搜索。",
+          systemImage: "magnifyingglass"
+        )
       } else {
-        List(model.fanqieChapters, selection: $selectedChapterID) { chapter in
+        List(filteredFanqieChapters, selection: $selectedChapterID) { chapter in
           Button {
             selectedChapterID = chapter.chapterId
             Task { await model.loadFanqieChapterContent(chapter) }
@@ -244,11 +272,48 @@ struct FanqieWorkspaceView: View {
     return model.fanqieChapters.first { $0.chapterId == selectedChapterID }
   }
 
+  /// Local filter over the already-loaded page of online books. Matching stays on
+  /// the list fields so typing never triggers a network round trip.
+  private var filteredFanqieBooks: [FanqieBook] {
+    let query = bookSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !query.isEmpty else { return model.fanqieBooks }
+    return model.fanqieBooks.filter {
+      $0.title.localizedCaseInsensitiveContains(query)
+        || $0.bookId.localizedCaseInsensitiveContains(query)
+        || ($0.status?.localizedCaseInsensitiveContains(query) ?? false)
+    }
+  }
+
+  private var filteredFanqieChapters: [FanqieChapter] {
+    let query = chapterSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !query.isEmpty else { return model.fanqieChapters }
+    return model.fanqieChapters.filter {
+      String($0.number).contains(query)
+        || $0.title.localizedCaseInsensitiveContains(query)
+        || $0.status.localizedCaseInsensitiveContains(query)
+    }
+  }
+
+  private var bookListSubtitle: String {
+    let total = model.fanqieBooks.count
+    let shown = filteredFanqieBooks.count
+    return shown == total ? "\(total) 本" : "\(shown) / \(total) 本"
+  }
+
+  private var chapterListSubtitle: String {
+    let total = model.fanqieChapters.count
+    let shown = filteredFanqieChapters.count
+    return shown == total ? "\(total) 章" : "\(shown) / \(total) 章"
+  }
+
   private var selectedBookBinding: Binding<String?> {
     Binding(
       get: { model.selectedFanqieBookID },
       set: { id in
         selectedChapterID = nil
+        // A stale keyword from the previous book would filter the incoming
+        // chapter list down to an empty "no match" pane.
+        chapterSearch = ""
         Task { await model.selectFanqieBook(id: id) }
       }
     )
