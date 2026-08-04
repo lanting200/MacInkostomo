@@ -573,7 +573,24 @@ extension InkOSCore {
     }
 
     let deltaRepairReview = lastReview ?? (automaticLeadIn ? nil : triggerReview)
-    if !stopBeforeRewrite, let deltaRepairReview, shouldAttemptDeltaOnlyRepair(deltaRepairReview) {
+    // A chapter with no stored delta takes the cheap delta-only repair first no
+    // matter how the review worded its findings — rewriting prose that is
+    // already correct cannot produce the missing registration, and the stall
+    // detector then kills the round. See chapterIsMissingConsistencyDelta.
+    let missingDelta = chapterIsMissingConsistencyDelta(
+      bookID: bookID,
+      chapterNumber: chapter.number
+    )
+    let wantsDeltaOnlyRepair = missingDelta
+      || (deltaRepairReview.map(shouldAttemptDeltaOnlyRepair) ?? false)
+    if !stopBeforeRewrite, wantsDeltaOnlyRepair {
+      if missingDelta {
+        recordDebug(scope: "review", message: "chapter.delta_revision.forced", data: [
+          "bookId": bookID,
+          "chapterNumber": chapter.number,
+          "reason": "本章没有已登记的 consistencyDelta，先只补登记，不重写正文。",
+        ])
+      }
       automaticLeadIn = true
       let outcome = await performDeltaOnlyRevision(
         bookID: bookID,
@@ -777,6 +794,20 @@ extension InkOSCore {
       ])
       return ContinuityDelta()
     }
+  }
+
+  /// True when the chapter has no usable stored delta at all.
+  ///
+  /// This is a state fact, not a review finding, so it must not depend on how a
+  /// review happened to word its issues. Chapter 23 of 《渊雨浩劫》 deadlocked
+  /// precisely there: prose recovery saved the draft, the delta stayed missing,
+  /// and because the review text mentioned 正文 the delta-only path was skipped
+  /// in favour of a full rewrite. The model then returned the same (already
+  /// correct) prose, the stall detector killed the round, and every retry
+  /// repeated it. When the delta is absent the cheap repair is the only sane
+  /// first move regardless of review wording.
+  func chapterIsMissingConsistencyDelta(bookID: String, chapterNumber: Int) -> Bool {
+    (try? chapterConsistencyDelta(bookID: bookID, chapterNumber: chapterNumber)) == nil
   }
 
   private func shouldRevalidateStoredDraft(note: String, review: NativeReview) -> Bool {
@@ -1076,6 +1107,13 @@ extension InkOSCore {
     var latestTitle = baseChapter.title
     var latestContent = baseChapter.content
     var didWriteChapter = false
+    // Captured before the round runs. A chapter whose delta was never written is
+    // being repaired, so identical prose afterwards means "the text was already
+    // correct" rather than "the model stalled" — see the stall check below.
+    let deltaWasMissing = chapterIsMissingConsistencyDelta(
+      bookID: bookID,
+      chapterNumber: baseChapter.number
+    )
     do {
       generationJobs[key] = try makeGenerationJob(
         bookID: bookID,
@@ -1203,11 +1241,21 @@ extension InkOSCore {
       // Detect unchanged output: if the model returned exactly the same prose,
       // further retries with the same prompt are futile. Mark as stalled rather
       // than burning more rounds.
+      //
+      // One exception, and it is the deadlock chapter 23 of 《渊雨浩劫》 hit:
+      // when the round starts with no stored delta, identical prose is the
+      // *correct* answer — the defect was the missing registration, not the
+      // text. Killing the round here discarded the delta the model had just
+      // supplied, so every retry repeated the same "内容与修订前完全相同"
+      // termination and the chapter could never leave revision_failed. Treat it
+      // as a stall only when the delta is still absent afterwards, which is a
+      // genuine no-progress round.
       let newCount = proseCount(content)
       let oldCount = proseCount(baseChapter.content)
-      if newCount == oldCount && content.trimmingCharacters(in: .whitespacesAndNewlines)
-        == baseChapter.content.trimmingCharacters(in: .whitespacesAndNewlines)
-      {
+      let proseUnchanged = newCount == oldCount
+        && content.trimmingCharacters(in: .whitespacesAndNewlines)
+          == baseChapter.content.trimmingCharacters(in: .whitespacesAndNewlines)
+      if proseUnchanged, !(deltaWasMissing && suppliedDelta != nil) {
         recordDebug(scope: "craft", message: "chapter.revision.stalled", level: "warning", data: [
           "bookId": bookID,
           "chapterNumber": baseChapter.number,
@@ -1215,6 +1263,14 @@ extension InkOSCore {
           "reason": "模型返回内容与修订前完全相同，继续重试无意义。",
         ])
         return .stalled(lastTitle: title, lastContent: content)
+      }
+      if proseUnchanged {
+        recordDebug(scope: "craft", message: "chapter.revision.deltaOnlyProgress", data: [
+          "bookId": bookID,
+          "chapterNumber": baseChapter.number,
+          "round": round,
+          "reason": "正文与修订前相同，但本轮补回了缺失的 consistencyDelta，按有效进展继续。",
+        ])
       }
 
       try validateChapterLength(
@@ -2618,20 +2674,86 @@ extension InkOSCore {
 
   func parseJSONObject(_ text: String) -> [String: Any]? {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    if let data = trimmed.data(using: .utf8),
-      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-    { return object }
+    if let object = decodedJSONObject(trimmed) { return object }
     let withoutFence = trimmed
       .replacingOccurrences(of: "```json", with: "")
       .replacingOccurrences(of: "```", with: "")
       .trimmingCharacters(in: .whitespacesAndNewlines)
-    if let data = withoutFence.data(using: .utf8),
+    if let object = decodedJSONObject(withoutFence) { return object }
+    guard let start = withoutFence.firstIndex(of: "{"),
+      let end = withoutFence.lastIndex(of: "}"),
+      start < end
+    else { return nil }
+    return decodedJSONObject(String(withoutFence[start...end]))
+  }
+
+  /// Decodes one candidate, retrying once with raw control characters inside
+  /// string values escaped. See `escapingRawControlCharacters`.
+  private func decodedJSONObject(_ candidate: String) -> [String: Any]? {
+    if let data = candidate.data(using: .utf8),
       let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
     { return object }
-    guard let start = trimmed.firstIndex(of: "{"), let end = trimmed.lastIndex(of: "}"), start < end,
-      let data = String(trimmed[start...end]).data(using: .utf8)
-    else { return nil }
+    let repaired = escapingRawControlCharacters(in: candidate)
+    guard repaired != candidate, let data = repaired.data(using: .utf8) else { return nil }
     return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+  }
+
+  /// Escapes control characters a model left raw inside JSON string values.
+  ///
+  /// `JSONSerialization` rejects any character in U+0000–U+001F appearing raw
+  /// inside a string, which is exactly what a model writing long Chinese prose
+  /// emits when it types a real newline instead of `\n`. The response is
+  /// otherwise structurally sound, so the whole payload used to be discarded
+  /// over a character that carries no meaning: chapter 23 of 《渊雨浩劫》 lost
+  /// an 8 148 character draft and then its 4 152 character delta repair this
+  /// way, both with `finishReason=stop` and a correctly closed shell.
+  ///
+  /// The scan tracks whether it sits inside a string so structural whitespace
+  /// between tokens is left untouched, and rewrites only the control
+  /// characters themselves — no other token is altered.
+  private func escapingRawControlCharacters(in text: String) -> String {
+    var output = ""
+    output.reserveCapacity(text.count)
+    var inString = false
+    var isEscaped = false
+    for character in text {
+      if isEscaped {
+        output.append(character)
+        isEscaped = false
+        continue
+      }
+      if character == "\\" {
+        output.append(character)
+        // A backslash only escapes its successor inside a string; outside one
+        // it cannot legally appear, so it must not mask a structural quote.
+        isEscaped = inString
+        continue
+      }
+      if character == "\"" {
+        inString.toggle()
+        output.append(character)
+        continue
+      }
+      guard inString else {
+        output.append(character)
+        continue
+      }
+      switch character {
+      case "\n": output.append("\\n")
+      case "\r": output.append("\\r")
+      case "\t": output.append("\\t")
+      default:
+        if character.unicodeScalars.count == 1,
+          let scalar = character.unicodeScalars.first,
+          scalar.value < 0x20
+        {
+          output.append(String(format: "\\u%04x", scalar.value))
+        } else {
+          output.append(character)
+        }
+      }
+    }
+    return output
   }
 
   private func extractMessageContent(_ value: Any?) -> String {
