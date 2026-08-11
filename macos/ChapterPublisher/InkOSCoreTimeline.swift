@@ -209,6 +209,7 @@ extension InkOSCore {
     past.sort { timelineSortKey($0) < timelineSortKey($1) }
     future.sort { timelineSortKey($0) < timelineSortKey($1) }
     unplaced.sort { timelineSortKey($0) < timelineSortKey($1) }
+    let latestPastSourceChapter = past.compactMap(\.sourceChapter).max()
 
     return DerivativeTimelineStatus(
       chapterNumber: chapterNumber,
@@ -216,11 +217,37 @@ extension InkOSCore {
       elapsedDays: storyDay - timeline.startDayOffset,
       anchorLabel: timeline.anchorLabel,
       startDateLabel: timeline.startDateLabel,
+      latestPastSourceChapter: latestPastSourceChapter,
       past: Array(past.suffix(Self.timelineEventListLimit)),
       future: Array(future.prefix(Self.timelineEventListLimit)),
       unplaced: Array(unplaced.prefix(Self.timelineEventListLimit)),
       isConfigured: timeline.isConfigured
     )
+  }
+
+  func resolvedDerivativeTimeline(
+    bookID: String,
+    continuity: LongFormContinuity
+  ) -> DerivativeTimeline {
+    resolvedAnchor(loadDerivativeTimeline(bookID: bookID), in: continuity)
+  }
+
+  /// Conservative source boundary for RAG quotations at the current story date.
+  /// A passage after this chapter can contain an event the timeline section labels
+  /// as future, which would leak the answer into the same prompt that forbids it.
+  func derivativeRetrievalMaximumSourceChapter(
+    status: DerivativeTimelineStatus,
+    timeline: DerivativeTimeline
+  ) -> Int? {
+    guard let anchorChapter = timeline.anchorSourceChapter else { return nil }
+    if status.storyDay < 0 {
+      // Before the anchor, even its own chapter may narrate the not-yet-happened
+      // event. An anchor in the retained index-0 preface therefore produces -1,
+      // intentionally matching no indexed chapter rather than leaking the anchor.
+      return anchorChapter - 1
+    }
+    let latestPlaced = status.latestPastSourceChapter ?? anchorChapter
+    return Swift.max(anchorChapter, latestPlaced)
   }
 
   /// Convenience for callers that have not already loaded the plan — the UI, mainly.
@@ -235,6 +262,36 @@ extension InkOSCore {
       chapterNumber: chapterNumber,
       continuity: plan.continuity
     )
+  }
+
+  /// The batch-closing half of the beat prompt: how far the story has moved by the
+  /// last chapter of the batch, plus any future events the opening list did not
+  /// show.
+  ///
+  /// Both lists are capped at `timelineEventListLimit`, and a batch that spans
+  /// enough story days retires the nearest future events mid-batch, so an event
+  /// ranked just beyond the cap at the opening chapter enters the printed list by
+  /// the closing chapter. A beat planner that never sees it can schedule it for a
+  /// late-batch chapter, where the writing prompt then forbids it — a conflict that
+  /// otherwise surfaces only as a failed review after a full chapter write.
+  func derivativeBeatClosingSection(
+    opening: DerivativeTimelineStatus,
+    closing: DerivativeTimelineStatus,
+    endChapter: Int
+  ) -> String? {
+    guard closing.storyDay != opening.storyDay else { return nil }
+    var text = "\n\n【本批次终点的原著时间进度】\n第 \(endChapter) 章预计距开篇 "
+      + "\(closing.elapsedDays) 天。本批次任何一章都不得触及上面"
+      + "「尚未发生」列表中的内容。"
+    let shownAtOpening = Set(opening.future.map(\.id))
+    let closingOnly = closing.future.filter { !shownAtOpening.contains($0.id) }
+    if !closingOnly.isEmpty {
+      text += "\n以下原著事件到本批次终点仍然尚未发生，同样绝对不得发生，也不得被任何人知晓、预告或讨论："
+      for event in closingOnly {
+        text += "\n- \(timelineEventLine(event))"
+      }
+    }
+    return text
   }
 
   private func timelineSortKey(_ event: DerivativeTimelineEvent) -> (Int, Int, String) {
@@ -254,25 +311,46 @@ extension InkOSCore {
     in continuity: LongFormContinuity
   ) -> DerivativeTimeline {
     var value = timeline
+    // IDs and source chapters are derived bindings, not user input. Discard them
+    // before each resolution so a replaced source cannot keep using the old axis.
+    value.anchorMilestoneID = nil
+    value.anchorSourceChapter = nil
+    let sourceMilestones = continuity.timeline.filter { $0.sourceChapter != nil }
     var anchor: LongFormTimelineMilestone?
     if let id = timeline.anchorMilestoneID?.trimmingCharacters(in: .whitespacesAndNewlines),
       !id.isEmpty
     {
-      anchor = continuity.timeline.first { $0.id == id }
+      anchor = sourceMilestones.first { $0.id == id }
     }
     if anchor == nil {
       let label = timeline.anchorLabel.trimmingCharacters(in: .whitespacesAndNewlines)
       if !label.isEmpty {
         // Exact label first, then containment, because extraction tends to write a
         // fuller sentence than the customer's shorthand.
-        anchor = continuity.timeline.first { $0.label == label }
-          ?? continuity.timeline.first { $0.label.contains(label) }
+        anchor = sourceMilestones.first { $0.label == label }
+          ?? sourceMilestones.first {
+            $0.label.contains(label) || label.contains($0.label)
+          }
       }
     }
     guard let anchor else { return value }
     value.anchorMilestoneID = anchor.id
-    if value.anchorSourceChapter == nil { value.anchorSourceChapter = anchor.sourceChapter }
+    value.anchorSourceChapter = anchor.sourceChapter
     return value
+  }
+
+  /// True only when the resolved binding still names a source milestone in the
+  /// continuity supplied by the current source projection.
+  func hasResolvedDerivativeSourceAnchor(
+    _ timeline: DerivativeTimeline,
+    continuity: LongFormContinuity
+  ) -> Bool {
+    guard let id = timeline.anchorMilestoneID,
+      let sourceChapter = timeline.anchorSourceChapter
+    else { return false }
+    return continuity.timeline.contains {
+      $0.id == id && $0.sourceChapter == sourceChapter
+    }
   }
 
   /// Renders the clock as a prompt section.

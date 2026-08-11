@@ -135,6 +135,12 @@ extension InkOSCore {
     input.synchronizeLongFormFields()
     let title = input.title.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !title.isEmpty else { throw InkOSCoreError("请填写书名", statusCode: 400) }
+    input.timelineAnchorLabel = input.timelineAnchorLabel.trimmingCharacters(
+      in: .whitespacesAndNewlines
+    )
+    if input.kind == .derivative, input.timelineAnchorLabel.isEmpty {
+      throw InkOSCoreError("同人小说必须填写原著时间锚点", statusCode: 400)
+    }
     let constraints = try validatedConstraints(
       LongFormConstraints(
         targetTotalWords: input.targetTotalWords,
@@ -474,13 +480,11 @@ extension InkOSCore {
     if input.kind == .derivative {
       let anchor = input.timelineAnchorLabel.trimmingCharacters(in: .whitespacesAndNewlines)
       let startLabel = input.timelineStartDateLabel.trimmingCharacters(in: .whitespacesAndNewlines)
-      if !anchor.isEmpty || !startLabel.isEmpty {
-        try saveDerivativeTimeline(bookID: bookID, DerivativeTimeline(
-          anchorLabel: anchor,
-          startDayOffset: input.timelineStartDayOffset,
-          startDateLabel: startLabel
-        ))
-      }
+      try saveDerivativeTimeline(bookID: bookID, DerivativeTimeline(
+        anchorLabel: anchor,
+        startDayOffset: input.timelineStartDayOffset,
+        startDateLabel: startLabel
+      ))
     }
   }
 
@@ -492,10 +496,16 @@ extension InkOSCore {
     guide.protagonistProfile = guide.protagonistProfile.trimmingCharacters(in: .whitespacesAndNewlines)
     guide.worldRules = guide.worldRules.trimmingCharacters(in: .whitespacesAndNewlines)
     guide.pacing = guide.pacing.trimmingCharacters(in: .whitespacesAndNewlines)
+    guide.timelineAnchorLabel = guide.timelineAnchorLabel.trimmingCharacters(
+      in: .whitespacesAndNewlines
+    )
     guard !guide.title.isEmpty else { throw InkOSCoreError("请填写书名", statusCode: 400) }
     guard guide.storyPremise.count >= 20 else { throw InkOSCoreError("剧情概述至少填写 20 个字符", statusCode: 400) }
     guard !guide.protagonistName.isEmpty, guide.protagonistProfile.count >= 10 else {
       throw InkOSCoreError("请完整填写主角姓名、起点和目标", statusCode: 400)
+    }
+    if guide.kind == .derivative, guide.timelineAnchorLabel.isEmpty {
+      throw InkOSCoreError("同人小说必须填写原著时间锚点", statusCode: 400)
     }
     guide.synchronizeBudget()
     _ = try validatedConstraints(

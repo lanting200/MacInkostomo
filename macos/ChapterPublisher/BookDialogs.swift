@@ -80,6 +80,9 @@ struct CreateBookSheet: View {
       if guide.sourceTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
         return "请填写原著名称"
       }
+      if guide.timelineAnchorLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        return "请填写原著时间锚点"
+      }
     }
     if guide.storyPremise.trimmingCharacters(in: .whitespacesAndNewlines).count < 20 {
       return "请用至少 20 个字讲讲你想写的故事"
@@ -444,7 +447,7 @@ struct CreateBookSheet: View {
         .foregroundStyle(.secondary)
       Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
         GridRow {
-          dialogField("以原著哪个事件为时间锚点？") {
+          dialogField("以原著哪个事件为时间锚点？", required: true) {
             TextField("例如：克莱恩穿越", text: $guide.timelineAnchorLabel)
           }
           dialogField("本书开篇相对锚点第几天？") {

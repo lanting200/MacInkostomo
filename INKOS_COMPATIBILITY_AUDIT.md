@@ -11,7 +11,12 @@ MacInkostomo 的产品运行路径已统一为 SwiftUI 与原生 Swift `InkOSCor
 - `InkOSLibrary.swift`: 产品功能的类型化函数入口。
 - `InkOSCore.swift`: actor 隔离、书籍/章节存储、审核状态、任务和结构化调试。
 - `InkOSCorePlanning.swift`: 创建引导、300 万字边界、逐卷与逐章精确预算。
+- `InkOSCoreContinuity.swift`: 连续性投影、Delta 归一化、模型 wrapper 清洗和不可变冲突保护。
 - `InkOSCoreLLM.swift`: 外部模型调用、生成、修订、独立一致性审核和 consistency delta。
+- `InkOSCoreCraft.swift`: 写法内核、章节节拍卡、提示词预算和审核后的运行状态刷新。
+- `InkOSCoreDerivative.swift`: 原著导入、SQLite/FTS 与端侧语义混合检索。
+- `InkOSCoreCanon.swift`: 原著正典抽取、断点恢复、作者 overlay 和同人准备门禁。
+- `InkOSCoreTimeline.swift`: 同人故事时钟、未来事件分类和检索章号上界。
 - `InkOSCoreSettings.swift`: 设定编辑、备份恢复和外部发布缓存。
 - `WorkspaceModel.swift`: UI 状态协调，不直接读写小说文件。
 
@@ -28,8 +33,19 @@ MacInkostomo 的产品运行路径已统一为 SwiftUI 与原生 Swift `InkOSCor
 3. 生成上下文包含硬规则、故事圣经、分卷地图、人物知识边界、当前状态、对象/资源账本、伏笔和上一章全文。
 4. 新设定通过 `consistencyDelta` 写入章节运行产物，并由可重放投影合并到权威连续性索引。
 5. 本地规则执行连续分卷、实体准入、删除目标、不可变事实和锁定属性校验。
-6. 完整生成稿若未通过本地篇幅、写法或 Delta 校验，正文仍以 `revision_failed` 落盘并保留审核意见；前三章的能力锚点按开篇段累计判断，已在前章建立后不要求重复，节拍卡禁止项优先。再次提交本地失败稿时先复审原文，独立审核只发现 Delta 登记问题时单独修复 Delta，其余硬冲突最多执行两轮全文重写与复审；全部轮次都在本地校验失败时仍保存每轮错误与最终失败历史。
-7. 人工通过直接调用 `approveChapter`，同步更新章节索引、工作台状态、连续性投影和卷末检查点。
+6. 普通章节 Delta 会清除模型给出的 `sourceDay`/`sourceChapter`，只有原著正典抽取能登记原著坐标。statement、label、description 等字段若被模型包装成对象或 JSON 字符串，会解包成实际文本；投影同步同时清理旧 wrapper，未知必填容器按可重试格式错误处理。
+7. 完整生成稿若未通过本地篇幅、写法或 Delta 校验，正文仍以 `revision_failed` 落盘并保留审核意见；前三章的能力锚点按开篇段累计判断，已在前章建立后不要求重复，节拍卡禁止项优先。再次提交本地失败稿时先复审原文，独立审核只发现 Delta 登记问题时单独修复 Delta，其余硬冲突最多执行配置的自动重写轮数（默认 3）并逐轮复审；全部轮次都在本地校验失败时仍保存每轮错误与最终失败历史。
+8. 连续性提示按字符预算生成完整可解析的紧凑 JSON，保留 policy，优先实体、到期伏笔和最近时间线，并记录省略与字段裁剪统计。节拍规划中的开放伏笔最多 24 条、4,800 字符，单条描述最多 180 字符，按截止期与最近开启时间排序且不截断半行。
+9. 人工通过直接调用 `approveChapter`，在同一可回滚事务中更新章节索引、工作台状态、连续性投影、卷末检查点并清除本章之后的节拍卡；随后按新投影刷新运行状态，且仅在批次末章通过后预取下一批。
+
+## 同人原著链路
+
+1. `WorkspaceModel.prepareDerivativeSource` 通过类型化 `InkOSLibrary` 入口导入原著并启动准备；原著会切章、建立 SQLite/FTS 索引，并按创建意图继续语义向量、正典和作者 overlay。
+2. `extractDerivativeCanon` 把 index 0 卷首/序章与数字章节都纳入检查点。跨批次同名实体按规范化名称归并，首个 ID/type 保持稳定，后续属性合并，type 冲突记录 `canon.entity.type_conflict`。旧检查点在续跑前按同一规则去重并只重建 source `baseContinuity`。
+3. 旧书缺少 `source/preparation.json` 时，会从 manifest、正典进度和现有索引合成可续跑 intent；已无持久副本的作者设定按空 overlay 恢复，不要求重新导入大文件。
+4. `generateChapter`、`reviseChapter` 和 `approveChapter` 在启动任务或提交审批前都执行同人准备门禁：正典、作者 overlay、所请求的语义索引必须完成，时间锚点必须解析到原著章号。
+5. 生成、全文修订和独立审校都调用 `derivativeGenerationSections`，共享本章原著时间进度和原文检索结果。没有已登记实体 key 时，只要节拍或回退 query 非空仍会检索；审校要求未来原著事件提前发生或被角色提前知晓、预言、议论时输出 `[hard][prose]`。
+6. 时间线在检索前计算原著章上界：锚点前截至锚点前一章，锚点后截至已发生事件中的最晚原著章。该上界进入 FTS 与语义 SQL 查询，未来章节不会进入候选池。
 
 ## 运行证明
 

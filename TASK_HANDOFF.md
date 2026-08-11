@@ -247,6 +247,48 @@ Model-null normalization probe passed: NSNull tolerated, required nulls throw
 **第 1 章仍是 `pending_review`，等人工审核。** 两条 soft 建议未处理（字数超上限 29 字、
 冷幽默人设未落地）。初审给的具体修法在 `chapters/index.json` 的 `revisionGuidance` 里。
 
+## 接手复核与补修（2026-08-11 第二轮）
+
+**`openHooksText` 上限已在交接后落实。** 代码侧 `InkOSCoreCraft.swift` 已有
+`chapterBeatOpenHookLimit = 24` / `chapterBeatOpenHooksMaxCharacters = 4_800` /
+单条描述 180 字符，按「已逾期 > 临近截止 > 最近开启」排序，截断按整行取舍并追加省略
+条数说明；探针 `assertOpenHooksPromptBudgeting` 覆盖。交接文档写完时此项还是待办，
+以代码为准。
+
+**四个 review 切入点的复核结论：**
+
+1. 三条未变异验证的重试断言已逐一变异验证，探针全部如期失败（改动后 `shasum`
+   复原，无残留）：
+   - 删掉 `guard raised > current else { throw error }`（顶格不停手）→
+     `NativeCoreSmoke.swift:3521`「an exhausted budget at the retry ceiling must
+     not succeed」；
+   - `raisable` 去掉 `lastAttemptNeedsMoreBudget` 条件（传输失败也抬预算）→
+     `:3596`「a transport failure must retry at the same ceiling, saw
+     [16384, 32768]]」；
+   - `truncatedJSONError` 去掉 `guard json`（截断散文也报错）→ 散文用例抛错丢弃
+     正文，探针以顶层错误崩溃。三条断言均为有效守卫。
+2. `truncatedJSONError` 的作用域由变异 3 直接证实：`guard json` 在，散文截断原样
+   返回；不在，散文被白扔。当前实现正确。
+3. 时间闸门三类分档逐分支读过：有 `sourceDay` 直接比较；只有 `sourceChapter` 按
+   锚点章号分侧，锚点当章 = 第 0 天（定义非插值）；两者皆无（作者 overlay / 章节
+   自建）不进任何清单。各分支与 AGENTS.md 记载一致，探针
+   `assertDerivativeTimelineGatesCanonEvents` 覆盖。
+4. 节拍卡与正文禁止清单**内容未完全对齐，已修复**。两份清单都由
+   `derivativeTimelineStatus` 计算、同章同源一致，但各自截断在
+   `timelineEventListLimit`（12 条）。节拍提示词打印的是**批次起点**的清单；批次内
+   日期推移让近期事件转为「已发生」后，原本排在第 13 位之后的事件会进入**批次终点**
+   的打印清单——节拍规划器从未见过它，可能把它排进批次末章，到写作阶段才被禁止清单
+   拦下，白付一轮重写。修复：新增 `derivativeBeatClosingSection`（
+   `InkOSCoreTimeline.swift`），终点段落点名「到批次终点仍未发生、但起点清单没有」
+   的事件；`derivativeBeatSections` 改走该函数。无日期推移或无新增事件时输出与
+   修复前逐字节一致。探针 `assertDerivativeBeatClosingCoversCappedFuture` 覆盖
+   （17 事件顶满上限、推移 6 天、恰好 5 条被挤掉的事件必须出现在终点段落）。
+
+**maxTokens 已调到 32768（用户已点头）。** 改的是生产配置
+`data/inkos-config.json`，改前备份为
+`data/inkos-config.json.backup-maxtokens-<时间戳>`，权限保持 0600。代码无默认值
+（配置缺省时请求不带 `max_tokens`），所以无需改动源码。
+
 ## 现场状态
 
 - 生产工作区：仓库根目录，书 ID `灰雾之前`，路径 `book/books/灰雾之前/`。

@@ -54,17 +54,18 @@ of the build or runtime. The only build system is the Xcode project.
     creation, chapter upload and replacement.
   - `InkOSCoreDerivative.swift`: original-work retrieval for derivative writing —
     encoding detection, chapter splitting, and hybrid BM25 + on-device semantic
-    search fused by reciprocal rank. `derivativeSourceContext` is called from
-    `generationPrompt` for derivative books, so retrieved canon reaches the writing
-    model; `CreateBookSheet` uploads the original and `WorkspaceModel`
+    search fused by reciprocal rank. `derivativeGenerationSections` is called from
+    generation, full revision, and independent review prompts, so retrieved canon
+    and the source timeline reach all three chapter-stage model calls;
+    `CreateBookSheet` uploads the original and `WorkspaceModel`
     `prepareDerivativeSource` ingests it right after the book is created. Retrieval
     keys include registered canon entities named in the beat goal, scenes and
     required events, not only `focusCharacters`.
   - `InkOSCoreCanon.swift`: turns an imported original into continuity — batched
     extraction of canon, world rules, entities, knowledge boundaries, timeline and
-    hooks, checkpointed per batch so a bounded run plus a resume reaches the same
-    place. Source chapter numbers are rewritten into the derivative book's units,
-    with provenance kept in `markers`.
+    hooks, including a retained index-0 preface, checkpointed per batch so a bounded
+    run plus a resume reaches the same place. Source chapter numbers are rewritten
+    into the derivative book's units, with provenance kept in `markers`.
   - `InkOSCoreTimeline.swift`: the 同人 story clock. `source/timeline.json` holds the
     anchor and the day offset of chapter 1; `derivativeStoryDay` sums each beat's
     `storyDays` to place a chapter, and `derivativeTimelineStatus` splits canon
@@ -183,6 +184,13 @@ half-built features read as done.
   boundaries, current state, persistent-object and resource ledgers, foreshadowing
   pool, chapter summaries, the latest volume-end checkpoint, and the full text of
   the previous chapter. Generated chapters must submit a `consistencyDelta`.
+- A normal chapter Delta never owns the original work's clock. The default
+  `normalizedConsistencyDelta` path clears model-supplied `sourceDay` and
+  `sourceChapter`; only canon extraction opts into those coordinates. Narrative
+  schema fields that arrive as wrapper objects or JSON-encoded wrappers are
+  unwrapped into their actual statement/label/description. Projection sync also
+  sanitizes legacy wrapper pollution; an unknown required container remains a
+  retryable malformed-Delta error instead of becoming JSON text in later prompts.
 - A complete generated draft is always retained: if local length, craft, or
   Delta validation fails, the chapter is written as `revision_failed` with the
   native validation findings so it remains available for revision.
@@ -280,6 +288,17 @@ half-built features read as done.
   contribution and re-approval replaces it. Manual edits in the settings page are
   stored as an overlay. Projection records live in
   `story/runtime/continuity-projection.json`.
+- Approval snapshots the beat file with the other continuity transaction files,
+  keeps the approved and earlier beats, and invalidates every later beat before the
+  transaction commits. Runtime state is then regenerated from the post-approval
+  projection. Only approval of the current batch's final chapter prefetches the next
+  batch, and the in-flight key includes the book ID so two books cannot collide.
+- Beat-planning prompts cap open hooks at 24 entries and 4,800 total characters,
+  with 180 characters per description. Overdue/nearest deadlines win, then recent
+  openings; rendering keeps whole lines and reports omissions. `storyContext`
+  compacts continuity into complete parseable JSON under its character allowance,
+  retains policy, prioritizes entity identity, due hooks, and recent timeline, and
+  records omitted counts and clipped fields under `_truncation`.
 - Consistency policies all run: `requireContinuousVolumes` (no skipping chapters or
   unreviewed chapters), `allowUnplannedEntities` (whether text may introduce
   unregistered entities), `requireConsistencyDelta` (mandatory chapter contract),
@@ -390,7 +409,25 @@ projection's `baseContinuity`.
   and approved chapter deltas. `source/preparation.json` separately persists the
   author's settings text and embedding intent, so `resumeDerivativePreparation`
   can finish overlay/index work even when canon is already complete; bootstrap
-  restores the unfinished banner after an app relaunch.
+  restores the unfinished banner after an app relaunch. A pre-`preparation.json`
+  book synthesizes a resumable intent from its manifest, existing cursor, and
+  index; the unavailable author-settings text becomes an empty overlay and the
+  source canon/embedding work continues without re-importing the original.
+- **Writing is gated on preparation.** `generateChapter`, `reviseChapter`, and
+  `approveChapter` all call `validateDerivativePreparationForWriting` before a job
+  or approval starts. Canon and the settings overlay must be complete, a requested
+  embedding index must be complete, and the configured timeline anchor must resolve
+  to a source chapter.
+- **The preface is canon.** A retained manifest chapter at index 0 is extracted and
+  checkpointed independently through `prefaceExtracted`. Legacy progress derives
+  that bit from completed ranges and resumes the preface before the numeric cursor
+  when needed.
+- **Source entities are name-stable across batches.** Canon extraction collapses
+  normalized same-name entities even when a model changes their generated IDs. The
+  first entity keeps its ID and type while later batches fill attributes; a type
+  mismatch records `canon.entity.type_conflict`. Loading an old checkpoint applies
+  the same de-duplication and rebuilds only source `baseContinuity`, retaining the
+  manual overlay and approved chapter contributions.
 - **Projection writes are snapshotted.** `mutateContinuityProjection` restores the
   projection, the plan, and the volume checkpoints if the post-merge
   `synchronizeContinuityProjection` throws. Without it a delta that passes its own
@@ -472,6 +509,22 @@ correct, only its timing is wrong.
   the book, before any extraction exists, so no milestone ID can be stored.
   `resolvedAnchor` matches by ID, then exact label, then containment, and fills
   `anchorSourceChapter` from whatever it matched.
+- **The timeline limits RAG at the SQL boundary.** Before day 0, retrieval may read
+  at most `anchorSourceChapter - 1`; at or after the anchor it may read through the
+  latest placed past event. The maximum is threaded through BM25/FTS and semantic
+  candidate queries, so future passages never enter either candidate pool.
+- **Generation, revision, and review share one derivative context builder.** It
+  injects the same timeline and source passages in all three prompts. Registered
+  source entities mentioned by beat goals, scenes, and required events become
+  lexical keys; a non-empty beat/fallback query still runs retrieval when that key
+  list is empty. Review must label premature occurrence, knowledge, prediction, or
+  discussion of a future source event as `[hard][prose]`.
+- **The beat prompt's forbidden list is printed at both batch ends.** The event
+  lists are capped at `timelineEventListLimit`, and a batch that retires the
+  nearest future events mid-batch would let an event ranked beyond the cap enter
+  the writing prompt's list without the planner ever seeing it — the beat could
+  schedule something the chapter prompt then forbids. `derivativeBeatClosingSection`
+  names exactly those closing-only events, so both prompts cover the same events.
 - **`bookKind` defaults to `.original`** when `book.json` predates the field. An
   original book merely loses prompt sections it has no source for, whereas treating
   an original book as derivative would order the writing model to obey canon that

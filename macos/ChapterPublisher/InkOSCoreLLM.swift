@@ -202,7 +202,10 @@ extension InkOSCore {
 
   func generateChapter(bookID: String, guidance: String?) async throws -> ProcessingResponse {
     let context = try await fetchChapters(bookID: bookID)
-    let plan = try await fetchLongFormPlan(bookID: bookID)
+    let plan = try validateDerivativePreparationForWriting(
+      bookID: bookID,
+      plan: await fetchLongFormPlan(bookID: bookID)
+    )
     try validateChapterSequence(
       bookID: bookID,
       chapterNumber: context.nextChapterNum,
@@ -216,7 +219,7 @@ extension InkOSCore {
     }
     let chapterNumber = context.nextChapterNum
     let key = generationKey(bookID, chapterNumber)
-    if generationJobs[key]?.isActive == true {
+    if hasActiveGenerationJob(bookID: bookID) {
       throw InkOSCoreError("该书已有生成任务正在运行", statusCode: 409)
     }
     let startedAt = isoTimestamp()
@@ -241,9 +244,13 @@ extension InkOSCore {
     mode: String
   ) async throws -> ProcessingResponse {
     let chapter = try await fetchChapter(bookID: bookID, number: number)
+    _ = try validateDerivativePreparationForWriting(
+      bookID: bookID,
+      plan: await fetchLongFormPlan(bookID: bookID)
+    )
     let key = generationKey(bookID, number)
-    if generationJobs[key]?.isActive == true {
-      throw InkOSCoreError("该章节已有任务正在运行", statusCode: 409)
+    if hasActiveGenerationJob(bookID: bookID) {
+      throw InkOSCoreError("该书已有章节任务正在运行", statusCode: 409)
     }
     let startedAt = isoTimestamp()
     generationJobs[key] = try makeGenerationJob(
@@ -282,7 +289,6 @@ extension InkOSCore {
         chapterNumber: chapterNumber,
         plan: plan
       )
-      prefetchUpcomingBeatBatch(bookID: bookID, currentChapter: chapterNumber, plan: plan)
       generationJobs[key] = try makeGenerationJob(
         bookID: bookID,
         chapterNumber: chapterNumber,
@@ -385,27 +391,70 @@ extension InkOSCore {
         beat: beat
       )
       let initialAttempt = reviewAttemptRecord(review, attempt: 1)
+      if review.protocolFailure {
+        let reviewObject = reviewRecord(
+          review,
+          status: "protocol_error",
+          attempts: [initialAttempt]
+        )
+        try withChapterPersistenceTransaction(bookID: bookID, chapterNumber: chapterNumber) {
+          try writeChapter(
+            bookID: bookID,
+            number: chapterNumber,
+            title: title,
+            content: content,
+            status: "revision_failed",
+            llmReview: reviewObject
+          )
+          try persistConsistencyDelta(
+            bookID: bookID,
+            chapterNumber: chapterNumber,
+            title: title,
+            summary: string(parsed["summary"], fallback: review.summary),
+            delta: rawDelta
+          )
+        }
+        generationJobs[key] = try makeGenerationJob(
+          bookID: bookID,
+          chapterNumber: chapterNumber,
+          title: title,
+          phase: "revision_failed",
+          message: "审核模型响应协议错误，已保留完整草稿，等待重新审核",
+          startedAt: startedAt,
+          finishedAt: isoTimestamp(),
+          error: review.summary,
+          liveText: generationJobs[key]?.liveText,
+          attempts: [initialAttempt]
+        )
+        recordDebug(scope: "review", message: "chapter.review.protocol_error", level: "error", data: [
+          "bookId": bookID,
+          "chapterNumber": chapterNumber,
+        ])
+        return
+      }
       if review.pass {
         let reviewObject = reviewRecord(
           review,
           status: "passed",
           attempts: [initialAttempt]
         )
-        try writeChapter(
-          bookID: bookID,
-          number: chapterNumber,
-          title: title,
-          content: content,
-          status: "pending_review",
-          llmReview: reviewObject
-        )
-        try persistConsistencyDelta(
-          bookID: bookID,
-          chapterNumber: chapterNumber,
-          title: title,
-          summary: string(parsed["summary"], fallback: review.summary),
-          delta: rawDelta
-        )
+        try withChapterPersistenceTransaction(bookID: bookID, chapterNumber: chapterNumber) {
+          try writeChapter(
+            bookID: bookID,
+            number: chapterNumber,
+            title: title,
+            content: content,
+            status: "pending_review",
+            llmReview: reviewObject
+          )
+          try persistConsistencyDelta(
+            bookID: bookID,
+            chapterNumber: chapterNumber,
+            title: title,
+            summary: string(parsed["summary"], fallback: review.summary),
+            delta: rawDelta
+          )
+        }
         let finished = isoTimestamp()
         generationJobs[key] = try makeGenerationJob(
           bookID: bookID,
@@ -432,21 +481,23 @@ extension InkOSCore {
         autoFixed: false,
         attempts: [initialAttempt]
       )
-      try writeChapter(
-        bookID: bookID,
-        number: chapterNumber,
-        title: title,
-        content: content,
-        status: "revision_failed",
-        llmReview: reviewObject
-      )
-      try persistConsistencyDelta(
-        bookID: bookID,
-        chapterNumber: chapterNumber,
-        title: title,
-        summary: string(parsed["summary"], fallback: review.summary),
-        delta: rawDelta
-      )
+      try withChapterPersistenceTransaction(bookID: bookID, chapterNumber: chapterNumber) {
+        try writeChapter(
+          bookID: bookID,
+          number: chapterNumber,
+          title: title,
+          content: content,
+          status: "revision_failed",
+          llmReview: reviewObject
+        )
+        try persistConsistencyDelta(
+          bookID: bookID,
+          chapterNumber: chapterNumber,
+          title: title,
+          summary: string(parsed["summary"], fallback: review.summary),
+          delta: rawDelta
+        )
+      }
       generationJobs[key] = try makeGenerationJob(
         bookID: bookID,
         chapterNumber: chapterNumber,
@@ -514,13 +565,16 @@ extension InkOSCore {
   }
 
   private func storedNativeReview(_ review: LLMReview?) -> NativeReview? {
-    guard let review, !review.isPassed, !review.issueList.isEmpty else { return nil }
+    guard let review, !review.isPassed,
+      review.isProtocolFailure || !review.issueList.isEmpty
+    else { return nil }
     return NativeReview(
       pass: false,
       model: review.model ?? "stored-review",
       summary: review.summary ?? "上一轮审核未通过",
       issues: review.issueList,
       revisionGuidance: review.revisionGuidance ?? "",
+      protocolFailure: review.isProtocolFailure,
       advisories: review.craftAdvisoryList
     )
   }
@@ -687,6 +741,16 @@ extension InkOSCore {
       if let review = outcome.review {
         attempts.append(reviewAttemptRecord(review, attempt: attemptNumber))
         lastReview = review
+        if review.protocolFailure {
+          finalizeReviewProtocolFailure(
+            bookID: bookID,
+            chapterNumber: chapter.number,
+            title: chapter.title,
+            attempts: attempts,
+            startedAt: startedAt
+          )
+          return
+        }
         if review.pass {
           generationJobs[key] = try? makeGenerationJob(
             bookID: bookID,
@@ -767,6 +831,16 @@ extension InkOSCore {
       if let review = outcome.review {
         attempts.append(reviewAttemptRecord(review, attempt: attemptNumber))
         lastReview = review
+        if review.protocolFailure {
+          finalizeReviewProtocolFailure(
+            bookID: bookID,
+            chapterNumber: chapter.number,
+            title: chapter.title,
+            attempts: attempts,
+            startedAt: startedAt
+          )
+          return
+        }
         if review.pass {
           generationJobs[key] = try? makeGenerationJob(
             bookID: bookID,
@@ -855,6 +929,16 @@ extension InkOSCore {
       if let review = outcome.review {
         attempts.append(reviewAttemptRecord(review, attempt: attemptNumber))
         lastReview = review
+        if review.protocolFailure {
+          finalizeReviewProtocolFailure(
+            bookID: bookID,
+            chapterNumber: chapter.number,
+            title: outcome.title,
+            attempts: attempts,
+            startedAt: startedAt
+          )
+          return
+        }
         if review.pass {
           finalizeRevisionSuccess(
             bookID: bookID,
@@ -1025,7 +1109,7 @@ extension InkOSCore {
   }
 
   private func shouldRevalidateStoredDraft(note: String, review: NativeReview) -> Bool {
-    guard review.model == "native-draft-validator" else { return false }
+    guard review.protocolFailure || review.model == "native-draft-validator" else { return false }
     let trimmed = note.trimmingCharacters(in: .whitespacesAndNewlines)
     let storedGuidance = review.revisionGuidance.trimmingCharacters(in: .whitespacesAndNewlines)
     if !storedGuidance.isEmpty, trimmed == storedGuidance { return true }
@@ -1092,35 +1176,37 @@ extension InkOSCore {
         beat: beat,
         excludingChapter: chapter.number
       )
-      try writeChapter(
-        bookID: bookID,
-        number: chapter.number,
-        title: chapter.title,
-        content: chapter.content,
-        status: review.pass ? "pending_review" : "revision_failed",
-        llmReview: reviewRecord(
-          review,
-          status: review.pass ? "passed" : "failed",
-          attempts: priorAttempts + [
-            reviewAttemptRecord(review, attempt: priorAttempts.count + 1),
-          ]
+      try withChapterPersistenceTransaction(bookID: bookID, chapterNumber: chapter.number) {
+        try writeChapter(
+          bookID: bookID,
+          number: chapter.number,
+          title: chapter.title,
+          content: chapter.content,
+          status: review.pass ? "pending_review" : "revision_failed",
+          llmReview: reviewRecord(
+            review,
+            status: persistedReviewStatus(review),
+            attempts: priorAttempts + [
+              reviewAttemptRecord(review, attempt: priorAttempts.count + 1),
+            ]
+          )
         )
-      )
-      didWriteChapter = true
-      try updateStateChapter(bookID: bookID, number: chapter.number) { record in
-        var history = record["revisionHistory"] as? [[String: Any]] ?? []
-        history.append([
-          "time": isoTimestamp(),
-          "note": note,
-          "type": "revalidation",
-          "oldContentLength": proseCount(chapter.content),
-          "newContentLength": proseCount(chapter.content),
-          "success": review.pass,
-          "reviseMode": "revalidation",
-        ])
-        record["revisionHistory"] = history
+        try updateStateChapter(bookID: bookID, number: chapter.number) { record in
+          var history = record["revisionHistory"] as? [[String: Any]] ?? []
+          history.append([
+            "time": isoTimestamp(),
+            "note": note,
+            "type": "revalidation",
+            "oldContentLength": proseCount(chapter.content),
+            "newContentLength": proseCount(chapter.content),
+            "success": review.pass,
+            "reviseMode": "revalidation",
+          ])
+          record["revisionHistory"] = history
+        }
+        _ = try synchronizeContinuityProjection(bookID: bookID)
       }
-      _ = try synchronizeContinuityProjection(bookID: bookID)
+      didWriteChapter = true
       return RevisionRoundOutcome(
         review: review,
         title: chapter.title,
@@ -1203,43 +1289,45 @@ extension InkOSCore {
         beat: beat,
         excludingChapter: chapter.number
       )
-      try writeChapter(
-        bookID: bookID,
-        number: chapter.number,
-        title: chapter.title,
-        content: chapter.content,
-        status: review.pass ? "pending_review" : "revision_failed",
-        llmReview: reviewRecord(
-          review,
-          status: review.pass ? "passed" : "failed",
-          autoFixed: true,
-          attempts: priorAttempts + [
-            reviewAttemptRecord(review, attempt: priorAttempts.count + 1),
-          ]
+      try withChapterPersistenceTransaction(bookID: bookID, chapterNumber: chapter.number) {
+        try writeChapter(
+          bookID: bookID,
+          number: chapter.number,
+          title: chapter.title,
+          content: chapter.content,
+          status: review.pass ? "pending_review" : "revision_failed",
+          llmReview: reviewRecord(
+            review,
+            status: persistedReviewStatus(review),
+            autoFixed: true,
+            attempts: priorAttempts + [
+              reviewAttemptRecord(review, attempt: priorAttempts.count + 1),
+            ]
+          )
         )
-      )
-      didWriteChapter = true
-      try persistConsistencyDelta(
-        bookID: bookID,
-        chapterNumber: chapter.number,
-        title: chapter.title,
-        summary: review.summary,
-        delta: repairedRaw
-      )
-      try updateStateChapter(bookID: bookID, number: chapter.number) { record in
-        var history = record["revisionHistory"] as? [[String: Any]] ?? []
-        history.append([
-          "time": isoTimestamp(),
-          "note": note,
-          "type": "delta_repair",
-          "oldContentLength": proseCount(chapter.content),
-          "newContentLength": proseCount(chapter.content),
-          "success": review.pass,
-          "reviseMode": "delta_repair",
-        ])
-        record["revisionHistory"] = history
+        try persistConsistencyDelta(
+          bookID: bookID,
+          chapterNumber: chapter.number,
+          title: chapter.title,
+          summary: review.summary,
+          delta: repairedRaw
+        )
+        try updateStateChapter(bookID: bookID, number: chapter.number) { record in
+          var history = record["revisionHistory"] as? [[String: Any]] ?? []
+          history.append([
+            "time": isoTimestamp(),
+            "note": note,
+            "type": "delta_repair",
+            "oldContentLength": proseCount(chapter.content),
+            "newContentLength": proseCount(chapter.content),
+            "success": review.pass,
+            "reviseMode": "delta_repair",
+          ])
+          record["revisionHistory"] = history
+        }
+        _ = try synchronizeContinuityProjection(bookID: bookID)
       }
-      _ = try synchronizeContinuityProjection(bookID: bookID)
+      didWriteChapter = true
       return RevisionRoundOutcome(
         review: review,
         title: chapter.title,
@@ -1420,6 +1508,13 @@ extension InkOSCore {
       }
       let beatSection = beat.map(beatBriefText)
         ?? "（本章没有节拍卡，按既有正文范围修订，不要扩大本章承载的剧情量）"
+      let derivative = try derivativeGenerationSections(
+        bookID: bookID,
+        chapterNumber: baseChapter.number,
+        beat: beat,
+        plan: plan,
+        fallbackQuery: "\(baseChapter.title)。\(baseChapter.content)"
+      )
       // Set when the previous round returned prose byte-identical to its input.
       // Restating the same request produces the same sample, so the retry has to
       // say plainly that nothing changed and name the concrete edit required.
@@ -1469,10 +1564,10 @@ extension InkOSCore {
         \(openHooksRegistryText(plan.continuity))
 
         【本章节拍卡】
-        \(beatSection)
+        \(beatSection)\(derivative.timeline)
 
         【全书约束与状态】
-        \(context)
+        \(context)\(derivative.source)
         \(previousTail.isEmpty ? "" : "\n        【上一章结尾（衔接参考，最后800字）】\n        \(previousTail)")
 
         【原章节】
@@ -1582,42 +1677,44 @@ extension InkOSCore {
         beat: beat,
         excludingChapter: baseChapter.number
       )
-      try writeChapter(
-        bookID: bookID,
-        number: baseChapter.number,
-        title: title,
-        content: content,
-        status: review.pass ? "pending_review" : "revision_failed",
-        llmReview: reviewRecord(
-          review,
-          status: review.pass ? "passed" : "failed",
-          autoFixed: isAutomaticRound ? true : nil,
-          attempts: priorAttempts + [reviewAttemptRecord(review, attempt: priorAttempts.count + 1)]
+      try withChapterPersistenceTransaction(bookID: bookID, chapterNumber: baseChapter.number) {
+        try writeChapter(
+          bookID: bookID,
+          number: baseChapter.number,
+          title: title,
+          content: content,
+          status: review.pass ? "pending_review" : "revision_failed",
+          llmReview: reviewRecord(
+            review,
+            status: persistedReviewStatus(review),
+            autoFixed: isAutomaticRound ? true : nil,
+            attempts: priorAttempts + [reviewAttemptRecord(review, attempt: priorAttempts.count + 1)]
+          )
         )
-      )
-      didWriteChapter = true
-      try persistConsistencyDelta(
-        bookID: bookID,
-        chapterNumber: baseChapter.number,
-        title: title,
-        summary: string(parsed["summary"], fallback: review.summary),
-        delta: rawDelta
-      )
-      try updateStateChapter(bookID: bookID, number: baseChapter.number) { record in
-        var history = record["revisionHistory"] as? [[String: Any]] ?? []
-        history.append([
-          "time": isoTimestamp(),
-          "note": note,
-          "type": mode,
-          "oldContentLength": proseCount(baseChapter.content),
-          "newContentLength": proseCount(content),
-          "success": review.pass,
-          "reviseMode": mode,
-          "round": round,
-        ])
-        record["revisionHistory"] = history
+        try persistConsistencyDelta(
+          bookID: bookID,
+          chapterNumber: baseChapter.number,
+          title: title,
+          summary: string(parsed["summary"], fallback: review.summary),
+          delta: rawDelta
+        )
+        try updateStateChapter(bookID: bookID, number: baseChapter.number) { record in
+          var history = record["revisionHistory"] as? [[String: Any]] ?? []
+          history.append([
+            "time": isoTimestamp(),
+            "note": note,
+            "type": mode,
+            "oldContentLength": proseCount(baseChapter.content),
+            "newContentLength": proseCount(content),
+            "success": review.pass,
+            "reviseMode": mode,
+            "round": round,
+          ])
+          record["revisionHistory"] = history
+        }
+        _ = try synchronizeContinuityProjection(bookID: bookID)
       }
-      _ = try synchronizeContinuityProjection(bookID: bookID)
+      didWriteChapter = true
       // Later beats were planned against the previous version of this chapter,
       // so they must be re-planned once its text changed. Cache cleanup only:
       // the draft is already persisted, so a failure here must not fail the round.
@@ -1650,6 +1747,32 @@ extension InkOSCore {
         persisted: didWriteChapter
       )
     }
+  }
+
+  /// Finalizes a chapter that passed re-review: the round already persisted the
+  /// draft, so this only marks the job ready for manual review.
+  private func finalizeReviewProtocolFailure(
+    bookID: String,
+    chapterNumber: Int,
+    title: String,
+    attempts: [[String: Any]],
+    startedAt: String
+  ) {
+    generationJobs[generationKey(bookID, chapterNumber)] = try? makeGenerationJob(
+      bookID: bookID,
+      chapterNumber: chapterNumber,
+      title: title,
+      phase: "revision_failed",
+      message: "审核模型响应协议错误，正文与一致性登记保持不变",
+      startedAt: startedAt,
+      finishedAt: isoTimestamp(),
+      error: "审核响应不符合协议，请重新提交审核",
+      attempts: attempts
+    )
+    recordDebug(scope: "review", message: "chapter.review.protocol_error.retained", level: "error", data: [
+      "bookId": bookID,
+      "chapterNumber": chapterNumber,
+    ])
   }
 
   /// Finalizes a chapter that passed re-review: the round already persisted the
@@ -1813,6 +1936,7 @@ extension InkOSCore {
       "model": review.model,
       "summary": review.summary,
       "issues": review.issues,
+      "protocolFailure": review.protocolFailure,
       "craftAdvisories": review.advisories,
       "revisionGuidance": review.revisionGuidance,
       "reviewedAt": isoTimestamp(),
@@ -1821,6 +1945,11 @@ extension InkOSCore {
     if let autoFixed { record["autoFixed"] = autoFixed }
     if let rewriteError, !rewriteError.isEmpty { record["rewriteError"] = rewriteError }
     return record
+  }
+
+  private func persistedReviewStatus(_ review: NativeReview) -> String {
+    if review.protocolFailure { return "protocol_error" }
+    return review.pass ? "passed" : "failed"
   }
 
   private func persistGeneratedDraftForRevision(
@@ -1898,11 +2027,12 @@ extension InkOSCore {
   private func reviewAttemptRecord(_ review: NativeReview, attempt: Int) -> [String: Any] {
     [
       "pass": review.pass,
-      "status": review.pass ? "passed" : "failed",
+      "status": review.protocolFailure ? "protocol_error" : (review.pass ? "passed" : "failed"),
       "attempt": attempt,
       "model": review.model,
       "summary": review.summary,
       "issues": review.issues,
+      "protocolFailure": review.protocolFailure,
       "revisionGuidance": review.revisionGuidance,
       "reviewedAt": isoTimestamp(),
     ]
@@ -1912,6 +2042,7 @@ extension InkOSCore {
     var record: [String: Any] = ["attempt": attempt]
     if let pass = stored.pass { record["pass"] = pass }
     if let status = stored.status { record["status"] = status }
+    if let protocolFailure = stored.protocolFailure { record["protocolFailure"] = protocolFailure }
     if let model = stored.model { record["model"] = model }
     if let summary = stored.summary { record["summary"] = summary }
     if let issues = stored.issues { record["issues"] = issues }
@@ -1966,6 +2097,9 @@ extension InkOSCore {
     let summary: String
     let issues: [String]
     let revisionGuidance: String
+    /// The reviewer failed its response contract, so the prose must be retained
+    /// and re-reviewed rather than rewritten on an invented finding.
+    var protocolFailure: Bool = false
 
     /// Craft findings that do not block delivery to manual review. They are
     /// recorded so the human reviewer and any later revision can act on them.
@@ -2027,6 +2161,13 @@ extension InkOSCore {
     let deltaText = String(deltaJSON.prefix(40_000))
     let projectedText = String(projectedJSON.prefix(80_000))
     let beatSection = beat.map(beatBriefText) ?? "（本章无节拍卡，跳过排期与节拍核对）"
+    let derivative = try derivativeGenerationSections(
+      bookID: bookID,
+      chapterNumber: chapterNumber,
+      beat: beat,
+      plan: plan,
+      fallbackQuery: "\(title)。\(content)"
+    )
     let prompt = """
       你要同时执行两类审核，并严格区分严重级别。
 
@@ -2040,6 +2181,7 @@ extension InkOSCore {
       正文不得用清单、备忘录、条目化盘点或资料登记块承担叙事。主角本人的账本记录也只能以动作与判断混合的方式呈现，不能以并列条目铺陈，出现记为 hard。
       第 1 至 3 章作为开篇段整体必须至少建立一次主角核心能力或金手指锚点：异常征兆、首次显现或章末触发均可。前章已经建立后，当前章无需重复；节拍卡明确禁止能力显现时，以禁止清单为准，不得为了重复锚点提前能力。仅在截至当前章整个开篇段仍完全没有锚点时记为 hard。
       环境状态与资源可用性必须前后一致：此前章节或本章前文确立的中断、不可用或耗尽状态（断信号、断电、断水、封路、资源耗尽、设施损坏等），后文不得在没有恢复、替代或解释的情况下当作可用。同章之内自相矛盾（如先说信号彻底没了、后文又收到群视频）同样记为 hard。
+      \(derivative.reviewRule)
       以上任一问题输出前缀 [hard]，并紧跟一个修复范围标签，二者只能选一个：
       [delta]：只需改候选 consistencyDelta 就能消除该问题，正文不必改动一个字。正文写对了、只是没登记进 Delta（如实体 attributes 为空、漏登 upsert、时间线 order 排序错误、删除目标不存在、type 取值不规范）都属于此类；即使你在描述中引用正文作为"应当登记什么"的依据，只要正文本身无需修改，就必须标 [delta]。
       [prose]：必须改动正文才能消除该问题（字数不足或超限、章末收尾方式违规、条目化叙事、节拍卡禁止内容、正文与既有设定直接冲突、正文数字与已登记消耗不符、正文写了无依据的细节）。
@@ -2057,10 +2199,10 @@ extension InkOSCore {
       \(craft)
 
       【本章节拍卡】
-      \(beatSection)
+      \(beatSection)\(derivative.timeline)
 
       【权威设定】
-      \(context)
+      \(context)\(derivative.source)
 
       【本章候选 consistencyDelta】
       \(deltaText)
@@ -2109,16 +2251,61 @@ extension InkOSCore {
         model: result.model,
         summary: "审核模型未返回合法 JSON，无法判定本章是否通过。",
         issues: [
-          "[hard] 审核响应异常：模型未返回合法 JSON（finishReason=\(result.finishReason ?? "未知")，输出 \(result.content.count) 字符）",
+          "[protocol] 审核响应异常：模型未返回合法 JSON（finishReason=\(result.finishReason ?? "未知")，输出 \(result.content.count) 字符）",
         ],
-        revisionGuidance: "重新提交审核；若持续失败请检查审核模型配置与输出长度上限。"
+        revisionGuidance: "保留当前正文，仅重新提交审核；若持续失败请检查审核模型配置与输出长度上限。",
+        protocolFailure: true
       )
     }
-    let allIssues = (object["issues"] as? [Any] ?? []).compactMap(reviewIssueText)
+    guard let requestedPass = object["pass"] as? Bool else {
+      recordDebug(scope: "review", message: "chapter.review.protocol_error", level: "error", data: [
+        "bookId": bookID,
+        "chapterNumber": chapterNumber,
+        "reason": "missing_or_invalid_pass",
+      ])
+      return NativeReview(
+        pass: false,
+        model: result.model,
+        summary: "审核响应缺少有效的 pass 字段，无法判定本章是否通过。",
+        issues: ["[protocol] 审核响应的 pass 必须是布尔值。"],
+        revisionGuidance: "保留当前正文，仅重新提交审核。",
+        protocolFailure: true
+      )
+    }
+    guard let rawIssueValues = object["issues"] as? [Any] else {
+      recordDebug(scope: "review", message: "chapter.review.protocol_error", level: "error", data: [
+        "bookId": bookID,
+        "chapterNumber": chapterNumber,
+        "reason": "missing_or_invalid_issues",
+      ])
+      return NativeReview(
+        pass: false,
+        model: result.model,
+        summary: "审核响应缺少合法的 issues 数组，无法判定本章是否通过。",
+        issues: ["[protocol] 审核响应的 issues 必须是数组。"],
+        revisionGuidance: "保留当前正文，仅重新提交审核。",
+        protocolFailure: true
+      )
+    }
+    let allIssues = rawIssueValues.compactMap(reviewIssueText)
+    guard allIssues.count == rawIssueValues.count else {
+      recordDebug(scope: "review", message: "chapter.review.protocol_error", level: "error", data: [
+        "bookId": bookID,
+        "chapterNumber": chapterNumber,
+        "reason": "invalid_issue_item",
+      ])
+      return NativeReview(
+        pass: false,
+        model: result.model,
+        summary: "审核响应包含无法识别的 issues 条目，无法判定本章是否通过。",
+        issues: ["[protocol] issues 中的每一项必须是字符串或带有 detail 的对象。"],
+        revisionGuidance: "保留当前正文，仅重新提交审核。",
+        protocolFailure: true
+      )
+    }
     let blocking = allIssues.filter(isBlockingIssue)
     let rawAdvisories = allIssues.filter { !isBlockingIssue($0) }
     let advisories = rawAdvisories.filter { !recommendsNoncanonicalEntityType($0) }
-    let requestedPass = (object["pass"] as? Bool) ?? false
     let rawGuidance = string(object["revisionGuidance"])
     let revisionGuidance = recommendsNoncanonicalEntityType(rawGuidance)
       ? (blocking + advisories).joined(separator: "\n")
@@ -2127,6 +2314,23 @@ extension InkOSCore {
       recordDebug(scope: "review", message: "chapter.craft_advisories", data: [
         "bookId": bookID, "chapterNumber": chapterNumber, "count": advisories.count,
       ])
+    }
+    if (requestedPass && !blocking.isEmpty) || (!requestedPass && blocking.isEmpty) {
+      recordDebug(scope: "review", message: "chapter.review.protocol_error", level: "error", data: [
+        "bookId": bookID,
+        "chapterNumber": chapterNumber,
+        "reason": "contradictory_pass_and_issues",
+        "pass": requestedPass,
+        "blockingCount": blocking.count,
+      ])
+      return NativeReview(
+        pass: false,
+        model: result.model,
+        summary: "审核响应的 pass 与 issues 相互矛盾，无法判定本章是否通过。",
+        issues: ["[protocol] pass 与硬问题列表不一致。"],
+        revisionGuidance: "保留当前正文，仅重新提交审核。",
+        protocolFailure: true
+      )
     }
     // `pass` is decided by the absence of [hard] findings, with one guard: a
     // response that claims failure while listing no findings at all is
@@ -2227,11 +2431,12 @@ extension InkOSCore {
     let craft = try craftDirectives(bookID: bookID, chapterNumber: chapterNumber)
     // Derivative-only: the story clock and the retrieved original passages. Empty
     // for an original book, so its prompt is unchanged by this feature.
-    let derivative = derivativeGenerationSections(
+    let derivative = try derivativeGenerationSections(
       bookID: bookID,
       chapterNumber: chapterNumber,
       beat: beat,
-      plan: plan
+      plan: plan,
+      fallbackQuery: guidance
     )
     return """
       你是原生 InkOS 长篇小说写作引擎。生成第\(chapterNumber)章完整正文。
@@ -2268,23 +2473,26 @@ extension InkOSCore {
 
   /// The story clock and retrieved original passages, for derivative books only.
   ///
-  /// Returns empty strings for an original book. Non-throwing: retrieval touches a
-  /// SQLite index that may not exist yet (the customer imported a source but has not
-  /// finished ingesting it), and a chapter must still be writable in that state — it
-  /// simply writes without source quotations rather than failing generation.
+  /// Returns empty strings for an original book. Derivative entry points first run
+  /// `validateDerivativePreparationForWriting`, so a missing or damaged index here
+  /// is a pipeline fault and must surface instead of silently producing an original
+  /// chapter without source evidence.
   private func derivativeGenerationSections(
     bookID: String,
     chapterNumber: Int,
     beat: ChapterBeat?,
-    plan: LongFormPlanResponse
-  ) -> (timeline: String, source: String) {
-    guard bookKind(bookID: bookID) == .derivative else { return ("", "") }
+    plan: LongFormPlanResponse,
+    fallbackQuery: String? = nil
+  ) throws -> (timeline: String, source: String, reviewRule: String) {
+    guard bookKind(bookID: bookID) == .derivative else { return ("", "", "") }
 
     var timelineSection = ""
+    let timeline = resolvedDerivativeTimeline(bookID: bookID, continuity: plan.continuity)
     let status = derivativeTimelineStatus(
       bookID: bookID,
       chapterNumber: chapterNumber,
-      continuity: plan.continuity
+      continuity: plan.continuity,
+      timeline: timeline
     )
     if let text = derivativeTimelineSection(status) {
       timelineSection = "\n\n【本章的原著时间进度】\n\(text)\n"
@@ -2293,22 +2501,44 @@ extension InkOSCore {
     }
 
     var sourceSection = ""
-    let keys = derivativeRetrievalKeys(beat: beat, plan: plan)
-    if !keys.isEmpty {
-      let query = derivativeRetrievalQuery(beat: beat)
-      if let text = try? derivativeSourceContext(
+    let keys = try derivativeRetrievalKeys(
+      bookID: bookID,
+      beat: beat,
+      narrativeText: fallbackQuery
+    )
+    let beatQuery = derivativeRetrievalQuery(beat: beat)
+    let fallback = fallbackQuery?
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    // Review and revision pass the actual prose as a fallback. Combine it with the
+    // beat instead of letting a normal non-empty beat suppress the text being
+    // checked; each side gets a bounded share so neither can crowd the other out.
+    let queryParts = [beatQuery, fallback]
+      .compactMap { value -> String? in
+        guard let value, !value.isEmpty else { return nil }
+        return boundedDerivativeRetrievalQuery(value)
+      }
+    let query = queryParts.isEmpty ? nil : queryParts.joined(separator: "。")
+    if !keys.isEmpty || query != nil {
+      let text = try derivativeSourceContext(
         bookID: bookID,
         keys: keys,
         query: query,
         limit: 8,
-        maxCharacters: 6_000
-      ) {
-        sourceSection = "\n\n【原著正典检索结果】\n"
-          + "以下是从原著原文检索到的相关段落，只作为事实依据，不要照抄其文字或把它当作本章剧情：\n"
-          + text
-      }
+        maxCharacters: 6_000,
+        maximumSourceChapter: derivativeRetrievalMaximumSourceChapter(
+          status: status,
+          timeline: timeline
+        )
+      )
+      sourceSection = "\n\n【原著正典检索结果】\n"
+        + "以下是从原著原文检索到的相关段落，只作为事实依据，不要照抄其文字或把它当作本章剧情：\n"
+        + text
     }
-    return (timelineSection, sourceSection)
+    let reviewRule = """
+
+      同人文额外硬规则：以【本章的原著时间进度】为准。待审正文若让“尚未发生”的原著事件提前发生，或让任何角色提前知晓、预言、议论其信息，必须输出 [hard][prose]；这不是补 Delta 可以修复的问题。原著检索段落只可核对已经发生的事实，不得把原文措辞或未检索到的细节当作本章正典。
+      """
+    return (timelineSection, sourceSection, reviewRule)
   }
 
   /// Retrieval keys for the chapter: the canon names the beat actually involves.
@@ -2319,9 +2549,17 @@ extension InkOSCore {
   /// Keys are intersected with registered canon entities so a name the derivative
   /// work invented is not searched for in a novel that has never heard of it; an
   /// invented name matches nothing and would only crowd out the real keys.
-  func derivativeRetrievalKeys(beat: ChapterBeat?, plan: LongFormPlanResponse) -> [String] {
-    guard let beat else { return [] }
-    let canonNames = Set(plan.continuity.entities.map { $0.name })
+  func derivativeRetrievalKeys(
+    bookID: String,
+    beat: ChapterBeat?,
+    narrativeText: String? = nil
+  ) throws -> [String] {
+    let manifest = try loadSourceManifest(bookID: bookID)
+    let progress = try loadCanonProgress(bookID: bookID, manifest: manifest)
+    // Only entities extracted from the original are valid lexical keys. The full
+    // projection also contains author overlay and derivative-chapter entities; an
+    // invented protagonist used as the sole key previously suppressed retrieval.
+    let canonNames = Set(progress.delta.upsert.entities.map(\.name))
     var keys: [String] = []
     var seen = Set<String>()
 
@@ -2336,8 +2574,10 @@ extension InkOSCore {
       keys.append(trimmed)
     }
 
-    for name in beat.focusCharacters {
-      append(name)
+    if let beat {
+      for name in beat.focusCharacters {
+        append(name)
+      }
     }
 
     // Beat generators do not always mirror every involved entity into
@@ -2345,16 +2585,28 @@ extension InkOSCore {
     // the goal, scenes or required events. Search those active beat fields for
     // registered canon names so the source passages relevant to the actual action
     // still reach the writing prompt.
-    let activeText = ([beat.goal, beat.openingHook]
-      + beat.scenes
-      + beat.requiredEvents
-      + [beat.endingHook, beat.setback, beat.notes])
-      .joined(separator: "\n")
-    for name in plan.continuity.entities.map(\.name) where activeText.contains(name) {
+    let activeText = beat.map {
+      ([$0.goal, $0.openingHook]
+        + $0.scenes
+        + $0.requiredEvents
+        + [$0.endingHook, $0.setback, $0.notes])
+        .joined(separator: "\n")
+    } ?? ""
+    let retrievalText = [activeText, narrativeText ?? ""].joined(separator: "\n")
+    for name in canonNames.sorted() where retrievalText.contains(name) {
       append(name)
       if keys.count >= 6 { break }
     }
     return keys
+  }
+
+  /// Keeps semantic queries small while retaining evidence from both ends of a
+  /// reviewed chapter. Lexical entity discovery still scans the full prose above.
+  func boundedDerivativeRetrievalQuery(_ text: String, limit: Int = 200) -> String {
+    guard limit > 1, text.count > limit else { return String(text.prefix(max(0, limit))) }
+    let headCount = (limit - 1) / 2
+    let tailCount = limit - 1 - headCount
+    return String(text.prefix(headCount)) + "…" + String(text.suffix(tailCount))
   }
 
   /// Free-text side of hybrid retrieval: what the chapter is about, so the semantic
@@ -2464,7 +2716,41 @@ extension InkOSCore {
     ], to: runtimeURL.appendingPathComponent(String(format: "chapter-%04d.consistency.json", chapterNumber)))
     let summariesURL = storyURL.appendingPathComponent("chapter_summaries.md")
     var summaries = (try? String(contentsOf: summariesURL, encoding: .utf8)) ?? "# 章节摘要\n"
-    summaries += "\n## 第\(chapterNumber)章 \(title)\n\(summary)\n"
+    let headerPattern = "^##\\s+第\(chapterNumber)章(?:\\s|$)"
+    let replacement = [
+      "## 第\(chapterNumber)章 \(title)",
+      summary.trimmingCharacters(in: .whitespacesAndNewlines),
+      "",
+    ]
+    let lines = summaries.components(separatedBy: "\n")
+    var rewritten: [String] = []
+    var inserted = false
+    var index = 0
+    while index < lines.count {
+      let line = lines[index]
+      if line.range(of: headerPattern, options: .regularExpression) != nil {
+        if !inserted {
+          rewritten.append(contentsOf: replacement)
+          inserted = true
+        }
+        index += 1
+        while index < lines.count,
+          lines[index].range(of: #"^##\s+"#, options: .regularExpression) == nil
+        {
+          index += 1
+        }
+        continue
+      }
+      rewritten.append(line)
+      index += 1
+    }
+    if !inserted {
+      while rewritten.last?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
+        rewritten.removeLast()
+      }
+      rewritten.append(contentsOf: ["", "## 第\(chapterNumber)章 \(title)", replacement[1]])
+    }
+    summaries = rewritten.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines) + "\n"
     try atomicWrite(summaries, to: summariesURL)
   }
 
@@ -3395,11 +3681,6 @@ extension InkOSCore {
     return "\(value.prefix(4))••••\(value.suffix(4))"
   }
 
-  /// Truncate continuity index by structure rather than raw character count.
-  /// The full JSON is often too large to fit, but slicing mid-string leaves
-  /// malformed JSON and hides the tail of the timeline. This keeps complete
-  /// entries, prioritizes recent timeline milestones, and adds a summary hint
-  /// when timeline is truncated so the model knows what order values are taken.
   /// Flat `ID | type | name` roster of every canon entity. Deliberately not
   /// truncated: it is small (one short line per entity) and dropping the tail
   /// would hide exactly the recently-introduced entities the next chapter is
@@ -3434,61 +3715,181 @@ extension InkOSCore {
     return rows + "\n（remove.hooks 中只能使用以上 hookId；不存在的 ID 会触发校验错误）"
   }
 
-  private func truncateContinuityIndex(
+  /// Truncate continuity index by structure rather than raw character count.
+  /// The full JSON is often too large to fit, but slicing mid-string leaves
+  /// malformed JSON and hides the tail of the timeline. This keeps complete
+  /// entries, prioritizes recent timeline milestones, and adds a summary hint
+  /// when timeline is truncated so the model knows what order values are taken.
+  func truncateContinuityIndex(
     _ continuity: LongFormContinuity,
     maxChars: Int
   ) -> String {
-    var compact = continuity
-    // Timeline is the biggest and most context-sensitive section. Keep recent
-    // milestones (high order values = recent story events) and drop old ones
-    // if the full list won't fit.
-    if !compact.timeline.isEmpty {
-      let sortedTimeline = compact.timeline.sorted { $0.order > $1.order }
-      var kept: [LongFormTimelineMilestone] = []
-      var dryRun = compact
-      for milestone in sortedTimeline {
-        dryRun.timeline = kept + [milestone]
-        let candidate = (try? encoder.encode(dryRun)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
-        if candidate.count <= maxChars {
-          kept.append(milestone)
-        } else if kept.isEmpty {
-          // Even the first (most recent) milestone overflows; keep it anyway
-          // so the model has *something* rather than an empty timeline.
-          kept.append(milestone)
-          break
-        } else {
-          break
-        }
+    let limit = Swift.max(2, maxChars)
+    if let data = try? encoder.encode(continuity),
+      let full = String(data: data, encoding: .utf8),
+      full.count <= limit
+    {
+      return full
+    }
+    let keys = [
+      "immutableCanon", "worldRules", "entities",
+      "knowledgeBoundaries", "timeline", "hooks",
+    ]
+    let originalCounts: [String: Int] = [
+      "immutableCanon": continuity.immutableCanon.count,
+      "worldRules": continuity.worldRules.count,
+      "entities": continuity.entities.count,
+      "knowledgeBoundaries": continuity.knowledgeBoundaries.count,
+      "timeline": continuity.timeline.count,
+      "hooks": continuity.hooks.count,
+    ]
+    var arrays = Dictionary(uniqueKeysWithValues: keys.map { ($0, [[String: Any]]()) })
+    var omitted = originalCounts
+    var clippedFields = 0
+
+    func clip(_ value: String, to maximum: Int) -> String {
+      let singleLine = value.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      guard singleLine.count > maximum else { return singleLine }
+      clippedFields += 1
+      return String(singleLine.prefix(Swift.max(1, maximum - 1))) + "…"
+    }
+
+    let policy: [String: Any] = [
+      "requireContinuousVolumes": continuity.policy.requireContinuousVolumes,
+      "allowUnplannedEntities": continuity.policy.allowUnplannedEntities,
+      "requireConsistencyDelta": continuity.policy.requireConsistencyDelta,
+      "checkpointAtVolumeEnd": continuity.policy.checkpointAtVolumeEnd,
+    ]
+
+    func document() -> [String: Any] {
+      let omittedCounts = Dictionary(uniqueKeysWithValues: keys.map { ($0, omitted[$0] ?? 0) })
+      var value: [String: Any] = [
+        "policy": policy,
+        "_truncation": [
+          "truncated": omittedCounts.values.contains(where: { $0 > 0 }) || clippedFields > 0,
+          "omittedCounts": omittedCounts,
+          "clippedFields": clippedFields,
+          "note": "条目按完整 JSON 对象保留；实体优先，伏笔按到期顺序，时间线保留最近事件。",
+        ] as [String: Any],
+      ]
+      for key in keys { value[key] = arrays[key] ?? [] }
+      return value
+    }
+
+    func encodeDocument() -> String {
+      guard JSONSerialization.isValidJSONObject(document()),
+        let data = try? JSONSerialization.data(
+          withJSONObject: document(),
+          options: [.sortedKeys, .withoutEscapingSlashes]
+        ),
+        let text = String(data: data, encoding: .utf8)
+      else { return "{}" }
+      return text
+    }
+
+    func append(_ item: [String: Any], to key: String) {
+      arrays[key, default: []].append(item)
+      omitted[key, default: 0] = Swift.max(0, omitted[key, default: 0] - 1)
+      if encodeDocument().count > limit {
+        arrays[key]?.removeLast()
+        omitted[key, default: 0] += 1
       }
-      compact.timeline = kept.sorted { $0.order < $1.order }
     }
 
-    let encoded = (try? encoder.encode(compact)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-    guard encoded.count <= maxChars else {
-      // Still over budget even after timeline pruning. Fall back to character
-      // truncation but at least the timeline portion is structurally sound.
-      return String(encoded.prefix(maxChars))
+    // IDs, names and types are the minimum identity contract. Current mutable
+    // state is retained in small bounded fields when it fits.
+    for entity in continuity.entities.sorted(by: { $0.id < $1.id }) {
+      var item: [String: Any] = [
+        "id": entity.id,
+        "name": clip(entity.name, to: 100),
+        "type": entity.type,
+      ]
+      if let owner = entity.owner { item["owner"] = clip(owner, to: 80) }
+      if let location = entity.location { item["location"] = clip(location, to: 80) }
+      if !entity.attributes.isEmpty {
+        item["attributes"] = Dictionary(uniqueKeysWithValues: entity.attributes.keys.sorted().map {
+          ($0, clip(entity.attributes[$0] ?? "", to: 120))
+        })
+      }
+      if entity.immutableOwner { item["immutableOwner"] = true }
+      if entity.immutableLocation { item["immutableLocation"] = true }
+      if !entity.immutableAttributes.isEmpty {
+        item["immutableAttributes"] = entity.immutableAttributes
+      }
+      append(item, to: "entities")
     }
 
-    // If we pruned timeline, add a summary hint so the model knows the range.
-    if compact.timeline.count < continuity.timeline.count, !continuity.timeline.isEmpty {
-      let allOrders = continuity.timeline.map(\.order).sorted()
-      let keptOrders = compact.timeline.map(\.order).sorted()
-      let droppedCount = continuity.timeline.count - compact.timeline.count
-      let hint = """
-
-        <!--
-        注：完整时间线共 \(continuity.timeline.count) 条，此处仅保留最近 \(compact.timeline.count) 条以适应上下文预算。
-        已省略 \(droppedCount) 条早期事件。
-        order 值范围：最小 \(allOrders.first ?? 0)，最大 \(allOrders.last ?? 0)，当前可见 \(keptOrders.first ?? 0)–\(keptOrders.last ?? 0)。
-        如需新增时间线条目，建议 order 从 \((allOrders.last ?? 0) + 1) 开始递增，避免与已有条目冲突。
-        -->
-        """
-      let withHint = encoded + hint
-      return withHint.count <= maxChars ? withHint : encoded
+    let hooks = continuity.hooks.sorted {
+      let leftDue = $0.resolveByChapter ?? Int.max
+      let rightDue = $1.resolveByChapter ?? Int.max
+      if leftDue != rightDue { return leftDue < rightDue }
+      if $0.openFromChapter != $1.openFromChapter { return $0.openFromChapter > $1.openFromChapter }
+      return $0.hookId < $1.hookId
+    }
+    for hook in hooks {
+      var item: [String: Any] = [
+        "hookId": hook.hookId,
+        "description": clip(hook.description, to: 220),
+        "openFromChapter": hook.openFromChapter,
+      ]
+      if let value = hook.resolveByChapter { item["resolveByChapter"] = value }
+      if let value = hook.requiredVolumeNumber { item["requiredVolumeNumber"] = value }
+      append(item, to: "hooks")
     }
 
-    return encoded
+    for milestone in continuity.timeline.sorted(by: { $0.order > $1.order }) {
+      var item: [String: Any] = [
+        "id": milestone.id,
+        "order": milestone.order,
+        "label": clip(milestone.label, to: 220),
+        "earliestChapter": milestone.earliestChapter,
+        "latestChapter": milestone.latestChapter,
+        "immutable": milestone.immutable,
+      ]
+      if let value = milestone.sourceDay { item["sourceDay"] = value }
+      if let value = milestone.sourceChapter { item["sourceChapter"] = value }
+      append(item, to: "timeline")
+    }
+
+    for boundary in continuity.knowledgeBoundaries.sorted(by: { $0.factId < $1.factId }) {
+      var item: [String: Any] = [
+        "factId": boundary.factId,
+        "statement": clip(boundary.statement, to: 220),
+        "allowedKnowers": boundary.allowedKnowers,
+        "forbiddenKnowers": boundary.forbiddenKnowers,
+        "availableFromChapter": boundary.availableFromChapter,
+      ]
+      if let value = boundary.revealByChapter { item["revealByChapter"] = value }
+      if !boundary.markers.isEmpty { item["markers"] = boundary.markers }
+      append(item, to: "knowledgeBoundaries")
+    }
+
+    for rule in continuity.worldRules.sorted(by: { $0.id < $1.id }) {
+      append([
+        "id": rule.id,
+        "statement": clip(rule.statement, to: 240),
+        "immutable": rule.immutable,
+      ], to: "worldRules")
+    }
+    for canon in continuity.immutableCanon.sorted(by: { $0.id < $1.id }) {
+      var item: [String: Any] = [
+        "id": canon.id,
+        "category": canon.category,
+        "statement": clip(canon.statement, to: 240),
+      ]
+      if let value = canon.value { item["value"] = clip(value, to: 120) }
+      if !canon.aliases.isEmpty { item["aliases"] = canon.aliases }
+      append(item, to: "immutableCanon")
+    }
+
+    let encoded = encodeDocument()
+    if encoded.count <= limit { return encoded }
+    // `storyContext` grants at least 2,000 characters, so this is only reachable
+    // from a direct diagnostic call with an extremely small budget. Keep the
+    // contract that every return value is complete JSON even then.
+    let minimal = "{\"_truncation\":{\"truncated\":true}}"
+    return minimal.count <= limit ? minimal : "{}"
   }
 }
 

@@ -66,7 +66,9 @@ extension InkOSCore {
     let current = try readLongFormPlan(at: planURL)
     let projectionURL = try continuityProjectionURL(bookID: bookID)
     let existing = try loadContinuityProjection(at: projectionURL)
-    var base = existing?.baseContinuity ?? current.continuity
+    var base = sanitizedContinuityNarrativeFields(
+      existing?.baseContinuity ?? current.continuity
+    )
     base.policy.requireConsistencyDelta = true
     let chapters = try approvedContinuityDeltas(bookID: bookID)
     var projected = base
@@ -77,7 +79,9 @@ extension InkOSCore {
         source: "第\(chapter.chapterNumber)章"
       )
     }
-    let overlay = existing?.manualOverlay ?? ContinuityDelta()
+    let overlay = sanitizedContinuityDeltaNarrativeFields(
+      existing?.manualOverlay ?? ContinuityDelta()
+    )
     try applyContinuityDelta(overlay, to: &projected, source: "人工连续性覆盖", allowImmutableChanges: true)
     projected.policy.requireConsistencyDelta = true
     projected = try projected.validated(
@@ -186,7 +190,8 @@ extension InkOSCore {
 
   func normalizedConsistencyDelta(
     _ raw: [String: Any],
-    chapterNumber: Int
+    chapterNumber: Int,
+    allowSourceCoordinates: Bool = false
   ) throws -> ContinuityDelta {
     let upsertSource = raw["upsert"] as? [String: Any] ?? raw
     let removeSource = raw["remove"] as? [String: Any] ?? [:]
@@ -213,7 +218,12 @@ extension InkOSCore {
       try normalizedKnowledge($0.element, chapterNumber: chapterNumber, index: $0.offset)
     }
     delta.upsert.timeline = try anyArray(upsertSource["timeline"]).enumerated().map {
-      try normalizedTimeline($0.element, chapterNumber: chapterNumber, index: $0.offset)
+      try normalizedTimeline(
+        $0.element,
+        chapterNumber: chapterNumber,
+        index: $0.offset,
+        allowSourceCoordinates: allowSourceCoordinates
+      )
     }
     delta.upsert.hooks = try anyArray(upsertSource["hooks"]).enumerated().map {
       try normalizedHook($0.element, chapterNumber: chapterNumber, index: $0.offset)
@@ -368,6 +378,26 @@ extension InkOSCore {
       projection.baseContinuity = LongFormContinuity(
         policy: projection.baseContinuity.policy
       )
+    }
+  }
+
+  /// Rebuilds the source-owned layer in one projection mutation. Checkpoint
+  /// migration must not expose an empty base between a separate clear and merge.
+  @discardableResult
+  func replaceCanonBaseContinuity(
+    bookID: String,
+    delta: ContinuityDelta,
+    source: String
+  ) throws -> LongFormPlanResponse {
+    try mutateContinuityProjection(bookID: bookID) { projection, _ in
+      var replacement = LongFormContinuity(policy: projection.baseContinuity.policy)
+      try self.applyContinuityDelta(
+        delta,
+        to: &replacement,
+        source: source,
+        allowImmutableChanges: true
+      )
+      projection.baseContinuity = replacement
     }
   }
 
@@ -857,8 +887,12 @@ extension InkOSCore {
   }
 
   private func normalizedCanon(_ value: Any, chapterNumber: Int, index: Int) throws -> LongFormImmutableCanon {
-    let object = value as? [String: Any] ?? [:]
-    let statement = normalizedText(object["statement"] ?? object["value"] ?? value)
+    let object = modelObject(value)
+    let statement = normalizedNarrativeText(
+      object["statement"] ?? object["content"] ?? object["text"] ?? object["summary"]
+        ?? object["value"] ?? value,
+      preferredKeys: ["statement", "content", "text", "summary", "value"]
+    )
     guard !statement.isEmpty else { throw malformedDelta("不可变事实", index) }
     let id = normalizedText(object["id"]).continuityNonEmpty ?? stableContinuityID("canon", statement)
     let allowed = Set(["character", "world", "timeline", "entity", "object", "knowledge", "other"])
@@ -867,14 +901,20 @@ extension InkOSCore {
       id: id,
       category: allowed.contains(category) ? category : "other",
       statement: statement,
-      value: normalizedText(object["value"]).continuityNonEmpty,
+      value: normalizedNarrativeText(
+        object["value"],
+        preferredKeys: ["value", "content", "text", "summary"]
+      ).continuityNonEmpty,
       aliases: stringList(object["aliases"])
     )
   }
 
   private func normalizedWorldRule(_ value: Any, chapterNumber: Int, index: Int) throws -> LongFormWorldRule {
-    let object = value as? [String: Any] ?? [:]
-    let statement = normalizedText(object["statement"] ?? value)
+    let object = modelObject(value)
+    let statement = normalizedNarrativeText(
+      object["statement"] ?? object["content"] ?? object["text"] ?? object["rule"] ?? value,
+      preferredKeys: ["statement", "rule", "content", "text", "summary", "value"]
+    )
     guard !statement.isEmpty else { throw malformedDelta("世界规则", index) }
     return LongFormWorldRule(
       id: normalizedText(object["id"]).continuityNonEmpty ?? stableContinuityID("rule", statement),
@@ -889,8 +929,11 @@ extension InkOSCore {
     index: Int,
     defaultType: String
   ) throws -> LongFormEntity {
-    let object = value as? [String: Any] ?? [:]
-    let name = normalizedText(object["name"] ?? value)
+    let object = modelObject(value)
+    let name = normalizedNarrativeText(
+      object["name"] ?? object["label"] ?? object["title"] ?? value,
+      preferredKeys: ["name", "label", "title", "content", "text"]
+    )
     guard !name.isEmpty else { throw malformedDelta("实体", index) }
     let suppliedType = normalizedText(object["type"]).lowercased()
     let typeAliases = [
@@ -947,8 +990,11 @@ extension InkOSCore {
   }
 
   private func normalizedKnowledge(_ value: Any, chapterNumber: Int, index: Int) throws -> LongFormKnowledgeBoundary {
-    let object = value as? [String: Any] ?? [:]
-    let statement = normalizedText(object["statement"] ?? value)
+    let object = modelObject(value)
+    let statement = normalizedNarrativeText(
+      object["statement"] ?? object["boundary"] ?? object["content"] ?? object["text"] ?? value,
+      preferredKeys: ["statement", "boundary", "content", "text", "summary", "value"]
+    )
     guard !statement.isEmpty else { throw malformedDelta("知识边界", index) }
     var allowed = stringList(object["allowedKnowers"])
     if allowed.isEmpty, object.isEmpty, let separator = statement.firstIndex(of: "：") {
@@ -1001,9 +1047,18 @@ extension InkOSCore {
     )
   }
 
-  private func normalizedTimeline(_ value: Any, chapterNumber: Int, index: Int) throws -> LongFormTimelineMilestone {
-    let object = value as? [String: Any] ?? [:]
-    let label = normalizedText(object["label"] ?? object["statement"] ?? value)
+  private func normalizedTimeline(
+    _ value: Any,
+    chapterNumber: Int,
+    index: Int,
+    allowSourceCoordinates: Bool
+  ) throws -> LongFormTimelineMilestone {
+    let object = modelObject(value)
+    let label = normalizedNarrativeText(
+      object["label"] ?? object["statement"] ?? object["event"] ?? object["content"]
+        ?? object["text"] ?? object["summary"] ?? value,
+      preferredKeys: ["label", "statement", "event", "content", "text", "summary", "value"]
+    )
     guard !label.isEmpty else { throw malformedDelta("时间线", index) }
     return LongFormTimelineMilestone(
       id: normalizedText(object["id"]).continuityNonEmpty ?? stableContinuityID("timeline", label),
@@ -1016,14 +1071,18 @@ extension InkOSCore {
       // unplaced event is reported as unplaced rather than guessed onto the axis.
       // This is the only entry point for the source's own clock, so canon
       // extraction depends on it reading these keys.
-      sourceDay: integer(object["sourceDay"]),
-      sourceChapter: integer(object["sourceChapter"])
+      sourceDay: allowSourceCoordinates ? integer(object["sourceDay"]) : nil,
+      sourceChapter: allowSourceCoordinates ? integer(object["sourceChapter"]) : nil
     )
   }
 
   private func normalizedHook(_ value: Any, chapterNumber: Int, index: Int) throws -> LongFormHookPlan {
-    let object = value as? [String: Any] ?? [:]
-    let description = normalizedText(object["description"] ?? object["statement"] ?? value)
+    let object = modelObject(value)
+    let description = normalizedNarrativeText(
+      object["description"] ?? object["statement"] ?? object["content"] ?? object["text"]
+        ?? object["event"] ?? object["summary"] ?? value,
+      preferredKeys: ["description", "statement", "content", "text", "event", "summary", "value"]
+    )
     guard !description.isEmpty else { throw malformedDelta("伏笔", index) }
     return LongFormHookPlan(
       hookId: normalizedText(object["hookId"] ?? object["id"]).continuityNonEmpty
@@ -1060,6 +1119,150 @@ extension InkOSCore {
 
   private func stringList(_ value: Any?) -> [String] {
     anyArray(value).compactMap { normalizedText($0).continuityNonEmpty }
+  }
+
+  private func modelObject(_ value: Any) -> [String: Any] {
+    if let object = value as? [String: Any] { return object }
+    guard let text = value as? String,
+      let data = text.data(using: .utf8),
+      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return [:] }
+    return object
+  }
+
+  /// Extracts prose from the small wrapper objects models often emit in place of a
+  /// schema string. Persisting the wrapper itself made labels look like
+  /// `{"event":"...","id":"..."}` in every later prompt and changed stable IDs.
+  /// Unknown containers deliberately flatten to empty so required-field validation
+  /// reports a retryable Delta error instead of accepting metadata as narrative.
+  func normalizedNarrativeText(
+    _ value: Any?,
+    preferredKeys: [String]
+  ) -> String {
+    guard let value, !(value is NSNull) else { return "" }
+    if let text = value as? String {
+      let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !trimmed.isEmpty else { return "" }
+      if let data = trimmed.data(using: .utf8),
+        let decoded = try? JSONSerialization.jsonObject(with: data),
+        decoded is [String: Any] || decoded is [Any]
+      {
+        let unwrapped = normalizedNarrativeText(decoded, preferredKeys: preferredKeys)
+        if !unwrapped.isEmpty { return unwrapped }
+      }
+      return trimmed
+    }
+    if let number = value as? NSNumber { return number.stringValue }
+    if let object = value as? [String: Any] {
+      let keys = preferredKeys + ["content", "event", "text", "summary", "boundary", "value"]
+      var seen = Set<String>()
+      for key in keys where seen.insert(key).inserted {
+        let text = normalizedNarrativeText(object[key], preferredKeys: preferredKeys)
+        if !text.isEmpty { return text }
+      }
+      return ""
+    }
+    if let array = value as? [Any] {
+      return array
+        .map { normalizedNarrativeText($0, preferredKeys: preferredKeys) }
+        .filter { !$0.isEmpty }
+        .joined(separator: "；")
+    }
+    return ""
+  }
+
+  func sanitizedContinuityDeltaNarrativeFields(_ delta: ContinuityDelta) -> ContinuityDelta {
+    var sanitized = delta
+    sanitized.upsert.immutableCanon = delta.upsert.immutableCanon.map { item in
+      LongFormImmutableCanon(
+        id: item.id,
+        category: item.category,
+        statement: normalizedNarrativeText(
+          item.statement,
+          preferredKeys: ["statement", "content", "text", "summary", "value"]
+        ),
+        value: item.value.map {
+          normalizedNarrativeText($0, preferredKeys: ["value", "content", "text", "summary"])
+        },
+        aliases: item.aliases
+      )
+    }
+    sanitized.upsert.worldRules = delta.upsert.worldRules.map { item in
+      LongFormWorldRule(
+        id: item.id,
+        statement: normalizedNarrativeText(
+          item.statement,
+          preferredKeys: ["statement", "rule", "content", "text", "summary", "value"]
+        ),
+        immutable: item.immutable
+      )
+    }
+    sanitized.upsert.knowledgeBoundaries = delta.upsert.knowledgeBoundaries.map { item in
+      LongFormKnowledgeBoundary(
+        factId: item.factId,
+        statement: normalizedNarrativeText(
+          item.statement,
+          preferredKeys: ["statement", "boundary", "content", "text", "summary", "value"]
+        ),
+        allowedKnowers: item.allowedKnowers,
+        forbiddenKnowers: item.forbiddenKnowers,
+        availableFromChapter: item.availableFromChapter,
+        revealByChapter: item.revealByChapter,
+        markers: item.markers
+      )
+    }
+    sanitized.upsert.timeline = delta.upsert.timeline.map { item in
+      LongFormTimelineMilestone(
+        id: item.id,
+        order: item.order,
+        label: normalizedNarrativeText(
+          item.label,
+          preferredKeys: ["label", "statement", "event", "content", "text", "summary", "value"]
+        ),
+        earliestChapter: item.earliestChapter,
+        latestChapter: item.latestChapter,
+        immutable: item.immutable,
+        sourceDay: item.sourceDay,
+        sourceChapter: item.sourceChapter
+      )
+    }
+    sanitized.upsert.hooks = delta.upsert.hooks.map { item in
+      LongFormHookPlan(
+        hookId: item.hookId,
+        description: normalizedNarrativeText(
+          item.description,
+          preferredKeys: ["description", "statement", "content", "text", "event", "summary", "value"]
+        ),
+        openFromChapter: item.openFromChapter,
+        resolveByChapter: item.resolveByChapter,
+        requiredVolumeNumber: item.requiredVolumeNumber
+      )
+    }
+    return sanitized
+  }
+
+  private func sanitizedContinuityNarrativeFields(
+    _ continuity: LongFormContinuity
+  ) -> LongFormContinuity {
+    let delta = sanitizedContinuityDeltaNarrativeFields(ContinuityDelta(
+      upsert: ContinuityDeltaItems(
+        immutableCanon: continuity.immutableCanon,
+        worldRules: continuity.worldRules,
+        entities: continuity.entities,
+        knowledgeBoundaries: continuity.knowledgeBoundaries,
+        timeline: continuity.timeline,
+        hooks: continuity.hooks
+      )
+    ))
+    return LongFormContinuity(
+      immutableCanon: delta.upsert.immutableCanon,
+      worldRules: delta.upsert.worldRules,
+      entities: delta.upsert.entities,
+      knowledgeBoundaries: delta.upsert.knowledgeBoundaries,
+      timeline: delta.upsert.timeline,
+      hooks: delta.upsert.hooks,
+      policy: continuity.policy
+    )
   }
 
   /// Flattens one field of model-supplied JSON into text.

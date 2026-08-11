@@ -33,12 +33,34 @@ struct SourceManifest: Codable, Equatable, Sendable {
   /// of identical bytes is a no-op, so a stray second import cannot wipe
   /// extraction progress.
   let sourceDigest: String
+  /// SHA-256 of the normalized UTF-8 text stored in `original.txt`. The supplied
+  /// byte digest cannot prove that a decoded/normalized copy belongs to this
+  /// manifest, especially for GB18030 and CRLF inputs.
+  let contentDigest: String?
   let detectedEncoding: String
   let characterCount: Int
   let chapterCount: Int
   let splitStrategy: SourceSplitStrategy
   let chapters: [SourceChapter]
+  /// Hash of the splitter version and every chapter boundary. The source byte
+  /// digest alone is insufficient: tightening a heading rule can change offsets
+  /// while the imported file remains byte-for-byte identical.
+  let layoutDigest: String?
   let ingestedAt: String
+
+  static let currentVersion = 2
+}
+
+private struct SourceLayoutFingerprint: Encodable {
+  let version: Int
+  let splitStrategy: SourceSplitStrategy
+  let chapters: [SourceChapter]
+}
+
+private struct PendingSourceReset: Codable {
+  let version: Int
+  let sourceDigest: String
+  let createdAt: String
 
   static let currentVersion = 1
 }
@@ -154,9 +176,17 @@ extension InkOSCore {
 extension InkOSCore {
   /// Heading forms seen in Chinese web novels and their translations. Anchored to
   /// line start so a mid-sentence "第三章" reference is not mistaken for a heading.
+  ///
+  /// `幕` is intentionally stricter than `章`: a prose paragraph often starts
+  /// with "第一幕依旧……" / "第二幕则……", while an actual act heading has no
+  /// suffix or separates its title with whitespace or punctuation. `卷` is a
+  /// structural label rather than a chapter and stays inside the adjacent chapter
+  /// body; indexing it as a chapter creates a manifest entry with no passage when
+  /// the next real chapter heading immediately follows.
   private static let sourceHeadingPattern = try? NSRegularExpression(
     pattern: #"(?m)^[ \t　]{0,8}("#
-      + #"第[〇零一二三四五六七八九十百千万\d]{1,12}[章回节卷折幕][^\n]{0,60}"#
+      + #"第[〇零一二三四五六七八九十百千万\d]{1,12}[章回节折][^\n]{0,60}"#
+      + #"|第[〇零一二三四五六七八九十百千万\d]{1,12}幕(?:[ \t　]+[^\n]{1,60}|[：:·—－-][^\n]{1,60}|[ \t　]*)"#
       + #"|[Cc]hapter[ \t]+\d{1,6}[^\n]{0,60}"#
       + #"|[序尾终][章幕][^\n]{0,60}"#
       + #"|楔子[^\n]{0,60}"#
@@ -219,8 +249,14 @@ extension InkOSCore {
       let bodyStart = heading.end
       let bodyEnd = position + 1 < headings.count ? headings[position + 1].start : ns.length
       guard bodyEnd > bodyStart else { continue }
+      let body = ns.substring(with: NSRange(location: bodyStart, length: bodyEnd - bodyStart))
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      // Structural headings can be adjacent (for example a volume line followed
+      // immediately by a chapter). Never persist a chapter that cannot produce a
+      // searchable passage.
+      guard !body.isEmpty else { continue }
       chapters.append(SourceChapter(
-        index: position + 1,
+        index: chapters.lazy.filter { $0.index > 0 }.count + 1,
         title: heading.title,
         offset: bodyStart,
         length: bodyEnd - bodyStart
@@ -285,6 +321,7 @@ extension InkOSCore {
 ///   `UNINDEXED` metadata, is queried alone, and results are merged in Swift.
 final class SourceSearchIndex {
   private var handle: OpaquePointer?
+  static let fingerprintSchemaVersion = "1"
 
   /// Callers pass `NLTokenizer`-segmented text for `segmented`; the class does not
   /// segment, so it stays free of NaturalLanguage state.
@@ -296,8 +333,63 @@ final class SourceSearchIndex {
     let segmented: String
   }
 
+  struct Integrity {
+    let expectedChapterIndices: Set<Int>
+    let indexedChapterIndices: Set<Int>
+    let passageCount: Int
+    let trigramCount: Int
+    let segmentedCount: Int
+    let trigramKeyMismatches: Int
+    let segmentedKeyMismatches: Int
+    let fingerprintMismatches: [String]
+
+    var missingChapterIndices: [Int] {
+      expectedChapterIndices.subtracting(indexedChapterIndices).sorted()
+    }
+
+    var unexpectedChapterIndices: [Int] {
+      indexedChapterIndices.subtracting(expectedChapterIndices).sorted()
+    }
+
+    var isComplete: Bool {
+      !expectedChapterIndices.isEmpty
+        && missingChapterIndices.isEmpty
+        && unexpectedChapterIndices.isEmpty
+        && passageCount > 0
+        && passageCount == trigramCount
+        && passageCount == segmentedCount
+        && trigramKeyMismatches == 0
+        && segmentedKeyMismatches == 0
+        && fingerprintMismatches.isEmpty
+    }
+
+    var diagnostic: String {
+      var parts: [String] = []
+      if !missingChapterIndices.isEmpty {
+        parts.append("缺少章节 " + missingChapterIndices.prefix(12).map(String.init).joined(separator: ","))
+      }
+      if !unexpectedChapterIndices.isEmpty {
+        parts.append("多余章节 " + unexpectedChapterIndices.prefix(12).map(String.init).joined(separator: ","))
+      }
+      if passageCount != trigramCount || passageCount != segmentedCount {
+        parts.append("段落表/FTS 行数 \(passageCount)/\(trigramCount)/\(segmentedCount)")
+      }
+      if trigramKeyMismatches > 0 || segmentedKeyMismatches > 0 {
+        parts.append("FTS 键不一致 \(trigramKeyMismatches)/\(segmentedKeyMismatches)")
+      }
+      if !fingerprintMismatches.isEmpty {
+        parts.append("索引指纹不一致 " + fingerprintMismatches.joined(separator: ","))
+      }
+      return parts.isEmpty ? "索引没有可检索段落" : parts.joined(separator: "；")
+    }
+  }
+
   init(path: String, reset: Bool) throws {
-    if reset { try? FileManager.default.removeItem(at: URL(fileURLWithPath: path)) }
+    if reset {
+      for suffix in ["", "-wal", "-shm"] {
+        try? FileManager.default.removeItem(at: URL(fileURLWithPath: path + suffix))
+      }
+    }
     guard sqlite3_open_v2(
       path, &handle,
       SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil
@@ -354,6 +446,167 @@ final class SourceSearchIndex {
 
   func beginTransaction() throws { try execute("BEGIN IMMEDIATE;") }
   func commitTransaction() throws { try execute("COMMIT;") }
+
+  func checkpoint() throws { try execute("PRAGMA wal_checkpoint(TRUNCATE);") }
+
+  func setSourceFingerprint(
+    sourceDigest: String,
+    layoutDigest: String,
+    contentDigest: String
+  ) throws {
+    let values = [
+      ("schemaVersion", Self.fingerprintSchemaVersion),
+      ("sourceDigest", sourceDigest),
+      ("layoutDigest", layoutDigest),
+      ("contentDigest", contentDigest),
+    ]
+    for (key, value) in values {
+      var statement: OpaquePointer?
+      guard sqlite3_prepare_v2(handle, """
+        INSERT INTO meta(key, value) VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+        """, -1, &statement, nil) == SQLITE_OK else {
+        throw InkOSCoreError("原著索引指纹准备失败", statusCode: 500)
+      }
+      defer { sqlite3_finalize(statement) }
+      sqlite3_bind_text(statement, 1, key, -1, sqliteTransient)
+      sqlite3_bind_text(statement, 2, value, -1, sqliteTransient)
+      guard sqlite3_step(statement) == SQLITE_DONE else {
+        throw InkOSCoreError("原著索引指纹写入失败", statusCode: 500)
+      }
+    }
+  }
+
+  private func metadataValue(_ key: String) throws -> String? {
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(
+      handle,
+      "SELECT value FROM meta WHERE key = ?;",
+      -1,
+      &statement,
+      nil
+    ) == SQLITE_OK else {
+      throw InkOSCoreError("原著索引指纹读取失败", statusCode: 500)
+    }
+    defer { sqlite3_finalize(statement) }
+    sqlite3_bind_text(statement, 1, key, -1, sqliteTransient)
+    guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+    return sqlite3_column_text(statement, 0).map { String(cString: $0) }
+  }
+
+  /// Verifies that every manifest chapter has at least one passage and that the
+  /// semantic table and both FTS mirrors contain exactly the same passage keys.
+  /// Vector coverage alone cannot detect an old bad split: 22,257/22,257 vectors
+  /// can still omit three manifest chapters and look complete.
+  func integrity(
+    expectedChapterIndices: Set<Int>,
+    sourceDigest: String,
+    layoutDigest: String,
+    contentDigest: String
+  ) throws -> Integrity {
+    func scalar(_ sql: String, failure: String) throws -> Int {
+      var statement: OpaquePointer?
+      guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK else {
+        throw InkOSCoreError(failure, statusCode: 500)
+      }
+      defer { sqlite3_finalize(statement) }
+      guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+      return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    var chapterStatement: OpaquePointer?
+    guard sqlite3_prepare_v2(
+      handle,
+      "SELECT DISTINCT chapterIndex FROM passages ORDER BY chapterIndex;",
+      -1,
+      &chapterStatement,
+      nil
+    ) == SQLITE_OK else {
+      throw InkOSCoreError("原著检索索引章节检查失败", statusCode: 500)
+    }
+    defer { sqlite3_finalize(chapterStatement) }
+    var indexedChapterIndices = Set<Int>()
+    while sqlite3_step(chapterStatement) == SQLITE_ROW {
+      indexedChapterIndices.insert(Int(sqlite3_column_int64(chapterStatement, 0)))
+    }
+
+    let passageCount = try scalar(
+      "SELECT COUNT(*) FROM passages;",
+      failure: "原著段落索引计数失败"
+    )
+    let trigramCount = try scalar(
+      "SELECT COUNT(*) FROM body_tri;",
+      failure: "原著 trigram 索引计数失败"
+    )
+    let segmentedCount = try scalar(
+      "SELECT COUNT(*) FROM body_seg;",
+      failure: "原著分词索引计数失败"
+    )
+    let passagesMissingFromTrigram = try scalar(
+      """
+      SELECT COUNT(*) FROM (
+        SELECT chapterIndex, paragraphIndex FROM passages
+        EXCEPT
+        SELECT CAST(chapterIndex AS INTEGER), CAST(paragraphIndex AS INTEGER) FROM body_tri
+      );
+      """,
+      failure: "原著 trigram 索引键检查失败"
+    )
+    let trigramMissingFromPassages = try scalar(
+      """
+      SELECT COUNT(*) FROM (
+        SELECT CAST(chapterIndex AS INTEGER), CAST(paragraphIndex AS INTEGER) FROM body_tri
+        EXCEPT
+        SELECT chapterIndex, paragraphIndex FROM passages
+      );
+      """,
+      failure: "原著 trigram 索引键检查失败"
+    )
+    let passagesMissingFromSegmented = try scalar(
+      """
+      SELECT COUNT(*) FROM (
+        SELECT chapterIndex, paragraphIndex FROM passages
+        EXCEPT
+        SELECT CAST(chapterIndex AS INTEGER), CAST(paragraphIndex AS INTEGER) FROM body_seg
+      );
+      """,
+      failure: "原著分词索引键检查失败"
+    )
+    let segmentedMissingFromPassages = try scalar(
+      """
+      SELECT COUNT(*) FROM (
+        SELECT CAST(chapterIndex AS INTEGER), CAST(paragraphIndex AS INTEGER) FROM body_seg
+        EXCEPT
+        SELECT chapterIndex, paragraphIndex FROM passages
+      );
+      """,
+      failure: "原著分词索引键检查失败"
+    )
+    let trigramKeyMismatches = passagesMissingFromTrigram + trigramMissingFromPassages
+    let segmentedKeyMismatches = passagesMissingFromSegmented + segmentedMissingFromPassages
+    var fingerprintMismatches: [String] = []
+    let expectedFingerprint = [
+      ("schemaVersion", Self.fingerprintSchemaVersion),
+      ("sourceDigest", sourceDigest),
+      ("layoutDigest", layoutDigest),
+      ("contentDigest", contentDigest),
+    ]
+    for (key, expected) in expectedFingerprint {
+      if try metadataValue(key) != expected {
+        fingerprintMismatches.append(key)
+      }
+    }
+    return Integrity(
+      expectedChapterIndices: expectedChapterIndices,
+      indexedChapterIndices: indexedChapterIndices,
+      passageCount: passageCount,
+      trigramCount: trigramCount,
+      segmentedCount: segmentedCount,
+      trigramKeyMismatches: trigramKeyMismatches,
+      segmentedKeyMismatches: segmentedKeyMismatches,
+      fingerprintMismatches: fingerprintMismatches
+    )
+  }
 
   /// Inserts one passage into both FTS tables plus the `passages` row that the
   /// semantic pass later fills with a vector. `body_tri` gets raw text for
@@ -472,15 +725,27 @@ final class SourceSearchIndex {
   /// product, and a 5 500-passage novel is 2.8 M multiply-adds per query —
   /// microseconds. An approximate index would add a dependency and a build step
   /// to save time that is not being spent.
-  func semanticSearch(query: [Float], limit: Int) throws -> [SourcePassage] {
+  func semanticSearch(
+    query: [Float],
+    limit: Int,
+    maximumSourceChapter: Int? = nil
+  ) throws -> [SourcePassage] {
     var statement: OpaquePointer?
     guard sqlite3_prepare_v2(handle, """
       SELECT chapterIndex, chapterTitle, paragraphIndex, text, vector FROM passages
-      WHERE vector IS NOT NULL;
+      WHERE vector IS NOT NULL
+        AND (? IS NULL OR chapterIndex <= ?);
       """, -1, &statement, nil) == SQLITE_OK else {
       throw InkOSCoreError("原著语义检索准备失败", statusCode: 500)
     }
     defer { sqlite3_finalize(statement) }
+    if let maximumSourceChapter {
+      sqlite3_bind_int64(statement, 1, sqlite3_int64(maximumSourceChapter))
+      sqlite3_bind_int64(statement, 2, sqlite3_int64(maximumSourceChapter))
+    } else {
+      sqlite3_bind_null(statement, 1)
+      sqlite3_bind_null(statement, 2)
+    }
     var scored: [SourcePassage] = []
     while sqlite3_step(statement) == SQLITE_ROW {
       guard let blob = sqlite3_column_blob(statement, 4) else { continue }
@@ -525,7 +790,12 @@ final class SourceSearchIndex {
   ///
   /// FTS5 refuses `MATCH` and `bm25()` against an aliased table
   /// (`no such column: f`), so the table is named in full on both sides.
-  private func query(table: String, expression: String, limit: Int) throws -> [SourcePassage] {
+  private func query(
+    table: String,
+    expression: String,
+    limit: Int,
+    maximumSourceChapter: Int?
+  ) throws -> [SourcePassage] {
     let sql = """
       SELECT \(table).chapterIndex, \(table).chapterTitle, \(table).paragraphIndex,
              COALESCE(p.text, \(table).text) AS body, bm25(\(table)) AS score
@@ -533,7 +803,9 @@ final class SourceSearchIndex {
       LEFT JOIN passages AS p
         ON p.chapterIndex = \(table).chapterIndex
        AND p.paragraphIndex = \(table).paragraphIndex
-      WHERE \(table) MATCH ? ORDER BY score LIMIT ?;
+      WHERE \(table) MATCH ?
+        AND (? IS NULL OR \(table).chapterIndex <= ?)
+      ORDER BY score LIMIT ?;
       """
     var statement: OpaquePointer?
     guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -541,7 +813,14 @@ final class SourceSearchIndex {
     }
     defer { sqlite3_finalize(statement) }
     sqlite3_bind_text(statement, 1, expression, -1, sqliteTransient)
-    sqlite3_bind_int(statement, 2, Int32(limit))
+    if let maximumSourceChapter {
+      sqlite3_bind_int64(statement, 2, sqlite3_int64(maximumSourceChapter))
+      sqlite3_bind_int64(statement, 3, sqlite3_int64(maximumSourceChapter))
+    } else {
+      sqlite3_bind_null(statement, 2)
+      sqlite3_bind_null(statement, 3)
+    }
+    sqlite3_bind_int(statement, 4, Int32(limit))
     var results: [SourcePassage] = []
     while sqlite3_step(statement) == SQLITE_ROW {
       let title = sqlite3_column_text(statement, 1).map { String(cString: $0) } ?? ""
@@ -563,12 +842,18 @@ final class SourceSearchIndex {
   func search(
     triExpression: String?,
     segExpression: String?,
-    limit: Int
+    limit: Int,
+    maximumSourceChapter: Int? = nil
   ) throws -> [SourcePassage] {
     var merged: [String: SourcePassage] = [:]
     for (table, expression) in [("body_tri", triExpression), ("body_seg", segExpression)] {
       guard let expression, !expression.isEmpty else { continue }
-      for hit in try query(table: table, expression: expression, limit: limit) {
+      for hit in try query(
+        table: table,
+        expression: expression,
+        limit: limit,
+        maximumSourceChapter: maximumSourceChapter
+      ) {
         let key = "\(hit.chapterIndex)#\(hit.paragraphIndex)"
         if let existing = merged[key] {
           // Both halves now read their prose from `passages` via `query`, so the
@@ -609,6 +894,121 @@ extension InkOSCore {
     try existingBookURL(bookID).appendingPathComponent("source", isDirectory: true)
   }
 
+  private func sourceLayoutDigest(
+    strategy: SourceSplitStrategy,
+    chapters: [SourceChapter]
+  ) throws -> String {
+    let fingerprint = SourceLayoutFingerprint(
+      version: SourceManifest.currentVersion,
+      splitStrategy: strategy,
+      chapters: chapters
+    )
+    let digestEncoder = JSONEncoder()
+    digestEncoder.outputFormatting = [.sortedKeys]
+    let data = try digestEncoder.encode(fingerprint)
+    return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+  }
+
+  private func sourceContentDigest(_ text: String) -> String {
+    SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
+  }
+
+  private func expectedSourceChapterIndices(_ manifest: SourceManifest) throws -> Set<Int> {
+    guard manifest.version == SourceManifest.currentVersion,
+      let persistedLayoutDigest = manifest.layoutDigest,
+      persistedLayoutDigest == (try sourceLayoutDigest(
+        strategy: manifest.splitStrategy,
+        chapters: manifest.chapters
+      ))
+    else {
+      throw InkOSCoreError("原著切章清单版本已过期，请重新导入原著", statusCode: 409)
+    }
+
+    let indices = manifest.chapters.map(\.index)
+    let unique = Set(indices)
+    let numbered = indices.filter { $0 > 0 }.sorted()
+    let expectedNumbered = manifest.chapterCount > 0
+      ? Array(1...manifest.chapterCount)
+      : []
+    guard unique.count == indices.count,
+      numbered == expectedNumbered,
+      indices.allSatisfy({ $0 >= 0 }),
+      manifest.chapters.allSatisfy({ chapter in
+        chapter.offset >= 0
+          && chapter.length > 0
+          && chapter.offset <= manifest.characterCount
+          && chapter.length <= manifest.characterCount - chapter.offset
+      })
+    else {
+      throw InkOSCoreError("原著切章清单不完整，请重新导入原著", statusCode: 409)
+    }
+    return unique
+  }
+
+  private func sourceSearchIndexIntegrity(
+    bookID: String,
+    manifest: SourceManifest
+  ) throws -> SourceSearchIndex.Integrity {
+    try sourceSearchIndexIntegrity(
+      sourceURL: try sourceDirectoryURL(bookID),
+      manifest: manifest
+    )
+  }
+
+  private func sourceSearchIndexIntegrity(
+    sourceURL: URL,
+    manifest: SourceManifest
+  ) throws -> SourceSearchIndex.Integrity {
+    let expected = try expectedSourceChapterIndices(manifest)
+    let databaseURL = sourceURL.appendingPathComponent("passages.sqlite")
+    let originalURL = sourceURL.appendingPathComponent("original.txt")
+    guard fileManager.fileExists(atPath: databaseURL.path),
+      let originalText = try? String(contentsOf: originalURL, encoding: .utf8)
+    else {
+      throw InkOSCoreError("原著检索索引缺失，请重新导入原著", statusCode: 409)
+    }
+    let storedContentDigest = sourceContentDigest(originalText)
+    guard let manifestContentDigest = manifest.contentDigest,
+      manifestContentDigest == storedContentDigest
+    else {
+      throw InkOSCoreError("原著正文与清单指纹不一致，请重新导入原著", statusCode: 409)
+    }
+    let index = try SourceSearchIndex(path: databaseURL.path, reset: false)
+    defer { index.close() }
+    return try index.integrity(
+      expectedChapterIndices: expected,
+      sourceDigest: manifest.sourceDigest,
+      layoutDigest: manifest.layoutDigest ?? "",
+      contentDigest: manifestContentDigest
+    )
+  }
+
+  @discardableResult
+  func validateSourceSearchIndex(
+    bookID: String,
+    manifest: SourceManifest
+  ) throws -> SourceSearchIndex.Integrity {
+    try validateSourceSearchIndex(
+      sourceURL: try sourceDirectoryURL(bookID),
+      manifest: manifest
+    )
+  }
+
+  @discardableResult
+  private func validateSourceSearchIndex(
+    sourceURL: URL,
+    manifest: SourceManifest
+  ) throws -> SourceSearchIndex.Integrity {
+    let integrity = try sourceSearchIndexIntegrity(sourceURL: sourceURL, manifest: manifest)
+    guard integrity.isComplete else {
+      throw InkOSCoreError(
+        "原著检索索引不完整（\(integrity.diagnostic)），请重新导入原著",
+        statusCode: 409
+      )
+    }
+    return integrity
+  }
+
   /// Imports an original work: detects encoding, splits chapters, stores a
   /// normalized UTF-8 copy, and builds the BM25 index.
   ///
@@ -616,7 +1016,11 @@ extension InkOSCore {
   /// second import of the same file returns the existing manifest untouched
   /// rather than rebuilding and discarding progress.
   @discardableResult
-  func importDerivativeSource(bookID: String, from fileURL: URL) throws -> SourceManifest {
+  func importDerivativeSource(
+    bookID: String,
+    from fileURL: URL,
+    testingFailureAfterInstalledFiles: Int? = nil
+  ) throws -> SourceManifest {
     let data = try Data(contentsOf: fileURL)
     guard !data.isEmpty else {
       throw InkOSCoreError("原著文件为空", statusCode: 400)
@@ -629,11 +1033,14 @@ extension InkOSCore {
       SourceManifest.self,
       from: Data(contentsOf: manifestURL)
     )
+    if let existingManifest {
+      try completePendingSourceReset(bookID: bookID, manifest: existingManifest)
+    }
 
     if let existing = existingManifest,
       existing.sourceDigest == digest,
       existing.version == SourceManifest.currentVersion,
-      fileManager.fileExists(atPath: sourceURL.appendingPathComponent("passages.sqlite").path)
+      (try? sourceSearchIndexIntegrity(bookID: bookID, manifest: existing).isComplete) == true
     {
       recordDebug(scope: "derivative", message: "source.unchanged", data: [
         "bookId": bookID,
@@ -653,12 +1060,10 @@ extension InkOSCore {
       throw InkOSCoreError("原著文本无法切分出章节", statusCode: 400)
     }
 
-    try fileManager.createDirectory(at: sourceURL, withIntermediateDirectories: true)
-    try atomicWrite(text, to: sourceURL.appendingPathComponent("original.txt"))
-
     let manifest = SourceManifest(
       version: SourceManifest.currentVersion,
       sourceDigest: digest,
+      contentDigest: sourceContentDigest(text),
       detectedEncoding: decoded.encoding,
       characterCount: (text as NSString).length,
       // A retained preface uses source index 0. It is searchable but is not one of
@@ -666,27 +1071,133 @@ extension InkOSCore {
       chapterCount: split.chapters.filter { $0.index > 0 }.count,
       splitStrategy: split.strategy,
       chapters: split.chapters,
+      layoutDigest: try sourceLayoutDigest(strategy: split.strategy, chapters: split.chapters),
       ingestedAt: isoTimestamp()
     )
-    try buildSourceSearchIndex(bookID: bookID, text: text, chapters: split.chapters)
 
-    // A new source digest invalidates more than the cursor: completed batches have
-    // already been merged into `baseContinuity`. Leaving that layer in place would
-    // mix facts from two originals even though `loadCanonProgress` correctly starts
-    // the new source at chapter 1. The reset keeps author and chapter layers intact.
-    if fileManager.fileExists(atPath: manifestURL.path),
-      existingManifest?.sourceDigest != digest
-    {
-      _ = try clearSourceCanonBaseContinuity(bookID: bookID)
-      try? fileManager.removeItem(at: sourceURL.appendingPathComponent("canon-progress.json"))
-      try? fileManager.removeItem(at: sourceURL.appendingPathComponent("preparation.json"))
-      recordDebug(scope: "derivative", message: "source.canon_reset", data: [
-        "bookId": bookID,
-        "previousDigest": existingManifest?.sourceDigest ?? "unreadable",
-        "sourceDigest": digest,
-      ])
+    // Build the three mutually dependent artifacts away from the live source
+    // directory. Nothing below can expose a half-built SQLite file to retrieval.
+    let sourceParent = sourceURL.deletingLastPathComponent()
+    let transactionID = UUID().uuidString
+    let stagingURL = sourceParent.appendingPathComponent(
+      ".source-import-\(transactionID)",
+      isDirectory: true
+    )
+    try fileManager.createDirectory(at: stagingURL, withIntermediateDirectories: true)
+    defer {
+      try? fileManager.removeItem(at: stagingURL)
     }
-    try atomicWrite(try encoder.encode(manifest), to: manifestURL)
+    try atomicWrite(text, to: stagingURL.appendingPathComponent("original.txt"))
+    try buildSourceSearchIndex(
+      sourceURL: stagingURL,
+      text: text,
+      chapters: split.chapters,
+      manifest: manifest
+    )
+    try atomicWrite(
+      try encoder.encode(manifest),
+      to: stagingURL.appendingPathComponent("manifest.json")
+    )
+    _ = try validateSourceSearchIndex(sourceURL: stagingURL, manifest: manifest)
+
+    let hadSourceDirectory = fileManager.fileExists(atPath: sourceURL.path)
+    let sourceChanged = hadSourceDirectory && existingManifest?.sourceDigest != digest
+    if hadSourceDirectory {
+      // The source directory also owns the author-configured timeline and the
+      // resumable extraction/preparation state. Assemble the complete next
+      // generation before the directory exchange; never copy SQLite sidecars.
+      let replacedNames: Set<String> = [
+        "original.txt", "manifest.json", "passages.sqlite",
+        "passages.sqlite-wal", "passages.sqlite-shm",
+      ]
+      for item in try fileManager.contentsOfDirectory(
+        at: sourceURL,
+        includingPropertiesForKeys: nil
+      ) {
+        let name = item.lastPathComponent
+        guard !replacedNames.contains(name) else { continue }
+        if sourceChanged && ["canon-progress.json", "preparation.json"].contains(name) {
+          continue
+        }
+        try fileManager.copyItem(at: item, to: stagingURL.appendingPathComponent(name))
+      }
+      if sourceChanged {
+        let pending = PendingSourceReset(
+          version: PendingSourceReset.currentVersion,
+          sourceDigest: digest,
+          createdAt: isoTimestamp()
+        )
+        try atomicWrite(
+          encoder.encode(pending),
+          to: stagingURL.appendingPathComponent("source-reset-pending.json")
+        )
+      }
+    }
+
+    let bookURL = try existingBookURL(bookID)
+    let projectionURL = try continuityProjectionURL(bookID: bookID)
+    let planURL = bookURL.appendingPathComponent("long-form-plan.json")
+    let projectionSnapshot = try? Data(contentsOf: projectionURL)
+    let planSnapshot = try? Data(contentsOf: planURL)
+    let checkpointSnapshots = (try? snapshotVolumeCheckpoints(bookID: bookID)) ?? [:]
+
+    var didExchangeSourceDirectory = false
+    do {
+      if testingFailureAfterInstalledFiles == 1 {
+        throw InkOSCoreError("原著导入测试故障注入", statusCode: 500)
+      }
+      try exchangeStagedSourceDirectory(
+        stagingURL: stagingURL,
+        sourceURL: sourceURL,
+        sourceExists: hadSourceDirectory
+      )
+      didExchangeSourceDirectory = true
+      if testingFailureAfterInstalledFiles == 2 {
+        throw InkOSCoreError("原著导入测试故障注入", statusCode: 500)
+      }
+      _ = try validateSourceSearchIndex(sourceURL: sourceURL, manifest: manifest)
+
+      // A new source digest invalidates more than the cursor: completed batches
+      // already live in `baseContinuity`. The reset keeps author/chapter layers and
+      // the author's textual timeline anchor, but clears source-bound coordinates.
+      if sourceChanged {
+        try completePendingSourceReset(bookID: bookID, manifest: manifest)
+        recordDebug(scope: "derivative", message: "source.canon_reset", data: [
+          "bookId": bookID,
+          "previousDigest": existingManifest?.sourceDigest ?? "unreadable",
+          "sourceDigest": digest,
+        ])
+      }
+    } catch {
+      restoreFile(projectionURL, snapshot: projectionSnapshot)
+      restoreFile(planURL, snapshot: planSnapshot)
+      restoreVolumeCheckpoints(bookID: bookID, snapshots: checkpointSnapshots)
+      do {
+        if hadSourceDirectory, didExchangeSourceDirectory {
+          // After a successful exchange, staging names the old generation. Swap
+          // it back atomically; before the exchange it still names the new one.
+          if fileManager.fileExists(atPath: stagingURL.path),
+            fileManager.fileExists(atPath: sourceURL.path)
+          {
+            try exchangeStagedSourceDirectory(
+              stagingURL: stagingURL,
+              sourceURL: sourceURL,
+              sourceExists: true
+            )
+          }
+        } else if !hadSourceDirectory, didExchangeSourceDirectory,
+          fileManager.fileExists(atPath: sourceURL.path)
+        {
+          try fileManager.removeItem(at: sourceURL)
+        }
+      } catch let rollbackError {
+        throw InkOSCoreError(
+          "原著导入失败，旧版本回滚也失败：\(rollbackError.localizedDescription)",
+          statusCode: 500
+        )
+      }
+      throw error
+    }
     recordDebug(scope: "derivative", message: "source.imported", data: [
       "bookId": bookID,
       "encoding": decoded.encoding,
@@ -697,14 +1208,73 @@ extension InkOSCore {
     return manifest
   }
 
+  private func exchangeStagedSourceDirectory(
+    stagingURL: URL,
+    sourceURL: URL,
+    sourceExists: Bool
+  ) throws {
+    let result: Int32
+    if sourceExists {
+      result = stagingURL.path.withCString { staging in
+        sourceURL.path.withCString { source in
+          renamex_np(staging, source, UInt32(RENAME_SWAP))
+        }
+      }
+    } else {
+      result = stagingURL.path.withCString { staging in
+        sourceURL.path.withCString { source in
+          Darwin.rename(staging, source)
+        }
+      }
+    }
+    guard result == 0 else {
+      throw InkOSCoreError(
+        "原著目录提交失败：\(String(cString: strerror(errno)))",
+        statusCode: 500
+      )
+    }
+  }
+
+  /// Finishes the idempotent half of a source replacement. The marker is stored
+  /// inside the new directory before its atomic exchange, so a process exit after
+  /// the exchange cannot permanently pair new prose with old source canon.
+  func completePendingSourceReset(bookID: String, manifest: SourceManifest) throws {
+    let markerURL = try sourceDirectoryURL(bookID)
+      .appendingPathComponent("source-reset-pending.json")
+    guard fileManager.fileExists(atPath: markerURL.path) else { return }
+    let marker: PendingSourceReset
+    do {
+      marker = try decoder.decode(PendingSourceReset.self, from: Data(contentsOf: markerURL))
+    } catch {
+      throw InkOSCoreError("原著换源事务标记损坏，请重新导入原著", statusCode: 503)
+    }
+    guard marker.version == PendingSourceReset.currentVersion,
+      marker.sourceDigest == manifest.sourceDigest
+    else {
+      throw InkOSCoreError("原著换源事务与当前清单不一致，请重新导入原著", statusCode: 409)
+    }
+    _ = try clearSourceCanonBaseContinuity(bookID: bookID)
+    var timeline = loadDerivativeTimeline(bookID: bookID)
+    timeline.anchorMilestoneID = nil
+    timeline.anchorSourceChapter = nil
+    _ = try saveDerivativeTimeline(bookID: bookID, timeline)
+    for name in ["canon-progress.json", "preparation.json"] {
+      let url = try sourceDirectoryURL(bookID).appendingPathComponent(name)
+      if fileManager.fileExists(atPath: url.path) {
+        try fileManager.removeItem(at: url)
+      }
+    }
+    try fileManager.removeItem(at: markerURL)
+  }
+
   /// Builds the FTS index at paragraph granularity, merging runs of short lines
   /// so a passage carries enough context to be usable in a prompt.
   private func buildSourceSearchIndex(
-    bookID: String,
+    sourceURL: URL,
     text: String,
-    chapters: [SourceChapter]
+    chapters: [SourceChapter],
+    manifest: SourceManifest
   ) throws {
-    let sourceURL = try sourceDirectoryURL(bookID)
     let index = try SourceSearchIndex(
       path: sourceURL.appendingPathComponent("passages.sqlite").path,
       reset: true
@@ -712,6 +1282,11 @@ extension InkOSCore {
     defer { index.close() }
     let ns = text as NSString
     try index.beginTransaction()
+    try index.setSourceFingerprint(
+      sourceDigest: manifest.sourceDigest,
+      layoutDigest: manifest.layoutDigest ?? "",
+      contentDigest: sourceContentDigest(text)
+    )
     for chapter in chapters {
       let body = ns.substring(with: NSRange(location: chapter.offset, length: chapter.length))
       for (position, passage) in mergedParagraphs(body).enumerated() {
@@ -725,6 +1300,7 @@ extension InkOSCore {
       }
     }
     try index.commitTransaction()
+    try index.checkpoint()
   }
 
   /// Groups lines into passages of roughly `minimum` characters. Dialogue-heavy
@@ -751,13 +1327,16 @@ extension InkOSCore {
   func searchDerivativeSource(
     bookID: String,
     keys: [String],
-    limit: Int = 8
+    limit: Int = 8,
+    maximumSourceChapter: Int? = nil
   ) throws -> [SourcePassage] {
     let sourceURL = try sourceDirectoryURL(bookID)
     let databaseURL = sourceURL.appendingPathComponent("passages.sqlite")
     guard fileManager.fileExists(atPath: databaseURL.path) else {
       throw InkOSCoreError("尚未导入原著，无法检索", statusCode: 404)
     }
+    let manifest = try loadSourceManifest(bookID: bookID)
+    _ = try validateSourceSearchIndex(bookID: bookID, manifest: manifest)
     let expressions = sourceMatchExpressions(keys)
     guard expressions.tri != nil || expressions.seg != nil else { return [] }
     let index = try SourceSearchIndex(path: databaseURL.path, reset: false)
@@ -765,7 +1344,8 @@ extension InkOSCore {
     return try index.search(
       triExpression: expressions.tri,
       segExpression: expressions.seg,
-      limit: limit
+      limit: limit,
+      maximumSourceChapter: maximumSourceChapter
     )
   }
 
@@ -946,6 +1526,8 @@ extension InkOSCore {
   /// interrupted pass continues where it stopped and a completed pass is a no-op.
   @discardableResult
   func embedDerivativeSource(bookID: String, batchSize: Int = 200) throws -> SourceEmbeddingStatus {
+    let manifest = try loadSourceManifest(bookID: bookID)
+    _ = try validateSourceSearchIndex(bookID: bookID, manifest: manifest)
     let index = try SourceSearchIndex(path: try sourceIndexURL(bookID).path, reset: false)
     defer { index.close() }
     guard #available(macOS 14.0, *) else {
@@ -1005,6 +1587,8 @@ extension InkOSCore {
   }
 
   func derivativeSourceEmbeddingStatus(bookID: String) throws -> SourceEmbeddingStatus {
+    let manifest = try loadSourceManifest(bookID: bookID)
+    _ = try validateSourceSearchIndex(bookID: bookID, manifest: manifest)
     let index = try SourceSearchIndex(path: try sourceIndexURL(bookID).path, reset: false)
     defer { index.close() }
     let coverage = try index.vectorCoverage()
@@ -1084,14 +1668,20 @@ extension InkOSCore {
     bookID: String,
     keys: [String],
     query: String? = nil,
-    limit: Int = 8
+    limit: Int = 8,
+    maximumSourceChapter: Int? = nil
   ) throws -> [SourceRetrievalHit] {
     let databaseURL = try sourceIndexURL(bookID)
     // Fuse from a deeper pool than we return: a passage ranked 15th lexically and
     // 3rd semantically should be able to win, and it cannot if the pool is the
     // same size as the output.
     let pool = Swift.max(limit * 4, 20)
-    let lexical = try searchDerivativeSource(bookID: bookID, keys: keys, limit: pool)
+    let lexical = try searchDerivativeSource(
+      bookID: bookID,
+      keys: keys,
+      limit: pool,
+      maximumSourceChapter: maximumSourceChapter
+    )
     let semanticQuery = (query ?? keys.joined(separator: "，"))
       .trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -1121,7 +1711,11 @@ extension InkOSCore {
         let vector = try embedder.vector(for: semanticQuery)
         let index = try SourceSearchIndex(path: databaseURL.path, reset: false)
         defer { index.close() }
-        semantic = try index.semanticSearch(query: vector, limit: pool)
+        semantic = try index.semanticSearch(
+          query: vector,
+          limit: pool,
+          maximumSourceChapter: maximumSourceChapter
+        )
       } catch {
         recordDebug(
           scope: "derivative",
@@ -1183,9 +1777,16 @@ extension InkOSCore {
     keys: [String],
     query: String? = nil,
     limit: Int = 8,
-    maxCharacters: Int = 6_000
+    maxCharacters: Int = 6_000,
+    maximumSourceChapter: Int? = nil
   ) throws -> String {
-    let hits = try retrieveDerivativeContext(bookID: bookID, keys: keys, query: query, limit: limit)
+    let hits = try retrieveDerivativeContext(
+      bookID: bookID,
+      keys: keys,
+      query: query,
+      limit: limit,
+      maximumSourceChapter: maximumSourceChapter
+    )
     guard !hits.isEmpty else { return "（原著检索无命中，本章不得引用未检索到的原著细节）" }
     var sections: [String] = []
     var used = 0

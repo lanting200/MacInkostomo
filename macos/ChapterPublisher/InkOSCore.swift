@@ -29,8 +29,15 @@ actor InkOSCore {
   let settingsBackupsURL: URL
 
   var generationJobs: [String: GenerationJob] = [:]
-  /// Beat-batch start chapters currently being planned in the background.
-  var beatPrefetchInFlight: Set<Int> = []
+  /// Book-scoped beat-batch starts currently being planned in the background.
+  /// A numeric start alone collides when two books prefetch the same chapter.
+  var beatPrefetchInFlight: Set<String> = []
+  /// Monotonic invalidation epochs for in-flight beat batches. The planner yields
+  /// to the LLM, so a late response must not restore beats removed while it was
+  /// waiting. This is intentionally process-local: the persisted beat file is
+  /// the source of truth across launches, while the epoch only fences actors
+  /// already running in this process.
+  var beatEpochs: [String: Int] = [:]
   var creationJobs: [String: CreationJob] = [:]
   var fanqieCSRFTokenValue: String?
   var fanqieCSRFTokenExpiresAt: Date?
@@ -146,12 +153,28 @@ actor InkOSCore {
 
   func approveChapter(bookID: String, number: Int) async throws -> ChapterDetail {
     let bookDirectory = try existingBookURL(bookID)
+    if hasActiveGenerationJob(bookID: bookID) {
+      throw InkOSCoreError("该书已有章节任务正在运行，请等待任务结束后再审核", statusCode: 409)
+    }
     let indexURL = bookDirectory.appendingPathComponent("chapters/index.json")
     var index = try readArray(indexURL)
     guard let offset = index.firstIndex(where: { integer($0["number"]) == number }) else {
       throw InkOSCoreError("章节不存在", statusCode: 404)
     }
-    let currentPlan = try synchronizeContinuityProjection(bookID: bookID)
+    let wasApproved = ["approved", "published"].contains(string(index[offset]["status"]))
+    if !wasApproved {
+      guard string(index[offset]["status"]) == "pending_review" else {
+        throw InkOSCoreError("本章尚未进入待人工审核状态", statusCode: 409)
+      }
+      let llmReview = index[offset]["llmReview"] as? [String: Any]
+      guard string(llmReview?["status"]) == "passed" else {
+        throw InkOSCoreError("本章尚未通过独立模型审核", statusCode: 409)
+      }
+    }
+    let currentPlan = try validateDerivativePreparationForWriting(
+      bookID: bookID,
+      plan: synchronizeContinuityProjection(bookID: bookID)
+    )
     try validateChapterSequence(
       bookID: bookID,
       chapterNumber: number,
@@ -182,6 +205,8 @@ actor InkOSCore {
     let planSnapshot = try? Data(contentsOf: planURL)
     let projectionURL = try continuityProjectionURL(bookID: bookID)
     let projectionSnapshot = try? Data(contentsOf: projectionURL)
+    let beatsURL = try chapterBeatsURL(bookID: bookID)
+    let beatsSnapshot = try? Data(contentsOf: beatsURL)
     let checkpointSnapshots = try snapshotVolumeCheckpoints(bookID: bookID)
     let now = isoTimestamp()
     do {
@@ -193,11 +218,19 @@ actor InkOSCore {
         chapter["updatedAt"] = now
       }
       _ = try synchronizeContinuityProjection(bookID: bookID)
+      // A first approval changes the authoritative continuity seen by every later
+      // beat. Keep the approved chapter's beat for audit, but discard all future
+      // beats in the same transaction. Repeating an already-completed approval is
+      // idempotent and must not erase later planning.
+      if !wasApproved {
+        _ = try await invalidateChapterBeats(bookID: bookID, fromChapter: number + 1)
+      }
     } catch {
       restoreFile(indexURL, snapshot: indexSnapshot)
       restoreFile(stateURL, snapshot: stateSnapshot)
       restoreFile(planURL, snapshot: planSnapshot)
       restoreFile(projectionURL, snapshot: projectionSnapshot)
+      restoreFile(beatsURL, snapshot: beatsSnapshot)
       restoreVolumeCheckpoints(bookID: bookID, snapshots: checkpointSnapshots)
       recordDebug(scope: "continuity", message: "continuity.approval.rolled_back", level: "error", data: [
         "bookId": bookID,
@@ -213,6 +246,12 @@ actor InkOSCore {
     // real post-approval situation instead of the creation-time placeholder.
     if let plan = try? synchronizeContinuityProjection(bookID: bookID) {
       refreshRuntimeStateFiles(bookID: bookID, plan: plan)
+      // Planning ahead is useful only after the chapter that closes the current
+      // batch has been approved. This uses the post-approval projection and runs
+      // after stale future beats were removed above.
+      if !wasApproved {
+        prefetchUpcomingBeatBatch(bookID: bookID, currentChapter: number, plan: plan)
+      }
     }
     return try await fetchChapter(bookID: bookID, number: number)
   }
@@ -407,40 +446,128 @@ actor InkOSCore {
     let bookDirectory = try existingBookURL(bookID)
     let chaptersURL = bookDirectory.appendingPathComponent("chapters", isDirectory: true)
     try fileManager.createDirectory(at: chaptersURL, withIntermediateDirectories: true)
-    for old in try directoryContents(chaptersURL) where old.lastPathComponent.hasPrefix(String(format: "%04d_", number)) {
-      try? fileManager.removeItem(at: old)
-    }
-    let safeTitle = sanitizeFilename(title.isEmpty ? "第\(number)章" : title)
-    let chapterURL = chaptersURL.appendingPathComponent(String(format: "%04d_%@.md", number, safeTitle))
-    try atomicWrite("# 第\(number)章 \(title)\n\n\(content.trimmingCharacters(in: .whitespacesAndNewlines))\n", to: chapterURL)
-
     let indexURL = chaptersURL.appendingPathComponent("index.json")
-    var index = fileManager.fileExists(atPath: indexURL.path) ? try readArray(indexURL) : []
-    let now = isoTimestamp()
-    var entry: [String: Any] = [
-      "number": number,
-      "title": title,
-      "status": status,
-      "wordCount": proseCount(content),
-      "createdAt": now,
-      "updatedAt": now,
-      "auditIssues": [],
-      "lengthWarnings": [],
-    ]
-    if let llmReview { entry["llmReview"] = llmReview }
-    if let offset = index.firstIndex(where: { integer($0["number"]) == number }) {
-      entry["createdAt"] = index[offset]["createdAt"] ?? now
-      index[offset] = index[offset].merging(entry) { _, new in new }
-    } else {
-      index.append(entry)
+    let prefix = String(format: "%04d_", number)
+    let oldChapterFiles = try directoryContents(chaptersURL)
+      .filter { $0.lastPathComponent.hasPrefix(prefix) }
+      .map { url -> (URL, Data) in
+        (url, try Data(contentsOf: url))
+      }
+    let indexSnapshot = try? Data(contentsOf: indexURL)
+    let stateSnapshot = try? Data(contentsOf: stateURL)
+
+    do {
+      for old in try directoryContents(chaptersURL) where old.lastPathComponent.hasPrefix(prefix) {
+        try fileManager.removeItem(at: old)
+      }
+      let safeTitle = sanitizeFilename(title.isEmpty ? "第\(number)章" : title)
+      let chapterURL = chaptersURL.appendingPathComponent(
+        String(format: "%04d_%@.md", number, safeTitle)
+      )
+      try atomicWrite(
+        "# 第\(number)章 \(title)\n\n\(content.trimmingCharacters(in: .whitespacesAndNewlines))\n",
+        to: chapterURL
+      )
+
+      var index = fileManager.fileExists(atPath: indexURL.path) ? try readArray(indexURL) : []
+      let now = isoTimestamp()
+      var entry: [String: Any] = [
+        "number": number,
+        "title": title,
+        "status": status,
+        "wordCount": proseCount(content),
+        "createdAt": now,
+        "updatedAt": now,
+        "auditIssues": [],
+        "lengthWarnings": [],
+      ]
+      if let llmReview { entry["llmReview"] = llmReview }
+      if let offset = index.firstIndex(where: { integer($0["number"]) == number }) {
+        entry["createdAt"] = index[offset]["createdAt"] ?? now
+        index[offset] = index[offset].merging(entry) { _, new in new }
+      } else {
+        index.append(entry)
+      }
+      index.sort { (integer($0["number"]) ?? 0) < (integer($1["number"]) ?? 0) }
+      try writeJSON(index, to: indexURL)
+      try updateStateChapter(bookID: bookID, number: number) { chapter in
+        chapter.merge(entry) { _, new in new }
+        chapter["content"] = content
+        chapter["reviewNotes"] = chapter["reviewNotes"] ?? ""
+        chapter["revisionHistory"] = chapter["revisionHistory"] ?? []
+      }
+    } catch {
+      if let current = try? directoryContents(chaptersURL) {
+        for url in current where url.lastPathComponent.hasPrefix(prefix) {
+          try? fileManager.removeItem(at: url)
+        }
+      }
+      for (url, data) in oldChapterFiles {
+        try? atomicWrite(data, to: url)
+      }
+      restoreFile(indexURL, snapshot: indexSnapshot)
+      restoreFile(stateURL, snapshot: stateSnapshot)
+      recordDebug(scope: "storage", message: "chapter.write.rolled_back", level: "error", data: [
+        "bookId": bookID,
+        "chapterNumber": number,
+        "error": error.localizedDescription,
+      ])
+      throw error
     }
-    index.sort { (integer($0["number"]) ?? 0) < (integer($1["number"]) ?? 0) }
-    try writeJSON(index, to: indexURL)
-    try updateStateChapter(bookID: bookID, number: number) { chapter in
-      chapter.merge(entry) { _, new in new }
-      chapter["content"] = content
-      chapter["reviewNotes"] = chapter["reviewNotes"] ?? ""
-      chapter["revisionHistory"] = chapter["revisionHistory"] ?? []
+  }
+
+  /// Commits the files that describe one chapter as a single logical update.
+  /// Each individual file uses an atomic replacement, but a failure between two
+  /// replacements would otherwise leave a new body paired with an old Delta or
+  /// projection. The generation/revision callers wrap their synchronous write,
+  /// Delta, history, and projection steps in this transaction.
+  @discardableResult
+  func withChapterPersistenceTransaction<T>(
+    bookID: String,
+    chapterNumber: Int,
+    _ body: () throws -> T
+  ) throws -> T {
+    let bookDirectory = try existingBookURL(bookID)
+    let chaptersURL = bookDirectory.appendingPathComponent("chapters", isDirectory: true)
+    let prefix = String(format: "%04d_", chapterNumber)
+    let oldChapterFiles = try directoryContents(chaptersURL)
+      .filter { $0.lastPathComponent.hasPrefix(prefix) }
+      .map { url in (url, try Data(contentsOf: url)) }
+    let runtimeURL = bookDirectory.appendingPathComponent("story/runtime", isDirectory: true)
+    let trackedURLs: [URL] = [
+      chaptersURL.appendingPathComponent("index.json"),
+      stateURL,
+      runtimeURL.appendingPathComponent(String(format: "chapter-%04d.consistency.json", chapterNumber)),
+      bookDirectory.appendingPathComponent("story/chapter_summaries.md"),
+      bookDirectory.appendingPathComponent("long-form-plan.json"),
+      runtimeURL.appendingPathComponent("continuity-projection.json"),
+    ]
+    let fileSnapshots = try trackedURLs.map { url -> (URL, Data?) in
+      (url, fileManager.fileExists(atPath: url.path) ? try Data(contentsOf: url) : nil)
+    }
+    let checkpointSnapshots = try snapshotVolumeCheckpoints(bookID: bookID)
+
+    do {
+      return try body()
+    } catch {
+      if let current = try? directoryContents(chaptersURL) {
+        for url in current where url.lastPathComponent.hasPrefix(prefix) {
+          try? fileManager.removeItem(at: url)
+        }
+      }
+      for (url, data) in oldChapterFiles {
+        try? atomicWrite(data, to: url)
+      }
+      for (url, snapshot) in fileSnapshots {
+        restoreFile(url, snapshot: snapshot)
+      }
+      restoreVolumeCheckpoints(bookID: bookID, snapshots: checkpointSnapshots)
+      recordDebug(scope: "storage", message: "chapter.commit.rolled_back", level: "error", data: [
+        "bookId": bookID,
+        "chapterNumber": chapterNumber,
+        "error": error.localizedDescription,
+      ])
+      throw error
     }
   }
 
@@ -588,6 +715,10 @@ actor InkOSCore {
 
   func generationKey(_ bookID: String, _ chapterNumber: Int) -> String {
     "\(bookID)#\(chapterNumber)"
+  }
+
+  func hasActiveGenerationJob(bookID: String) -> Bool {
+    generationJobs.values.contains { $0.bookId == bookID && $0.isActive }
   }
 
   func makeGenerationJob(

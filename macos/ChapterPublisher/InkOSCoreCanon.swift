@@ -33,7 +33,18 @@ struct SourceCanonProgress: Codable, Equatable, Sendable {
   /// means the original was replaced, so the checkpoint describes a book that no
   /// longer exists and is discarded instead of being extended.
   let sourceDigest: String
+  /// Splitter-version plus chapter-boundary digest from `SourceManifest`. The
+  /// original bytes can stay identical while a corrected heading rule changes
+  /// chapter offsets, so `sourceDigest` alone cannot validate a checkpoint.
+  var sourceLayoutDigest: String?
   let chapterCount: Int
+  /// `chapterCount` deliberately excludes index 0, so the preface needs an
+  /// independent checkpoint bit. Optional keeps v1 progress decodable: loading a
+  /// legacy checkpoint derives the value from its completed batch ranges.
+  var prefaceExtracted: Bool?
+  /// Version of the global source-time normalization applied to `delta.timeline`.
+  /// Old checkpoints omitted it and may contain batch-local day-zero values.
+  var sourceCoordinatesVersion: Int?
   /// 1-based index of the first chapter not yet extracted. Equal to
   /// `chapterCount + 1` once the pass is complete.
   var nextChapterIndex: Int
@@ -45,8 +56,9 @@ struct SourceCanonProgress: Codable, Equatable, Sendable {
   var updatedAt: String
 
   static let currentVersion = 1
+  static let currentSourceCoordinatesVersion = 1
 
-  var isComplete: Bool { nextChapterIndex > chapterCount }
+  var isComplete: Bool { (prefaceExtracted ?? true) && nextChapterIndex > chapterCount }
 }
 
 /// Extraction status for the UI.
@@ -142,29 +154,87 @@ extension InkOSCore {
     guard fileManager.fileExists(atPath: url.path) else {
       throw InkOSCoreError("请先导入原著文件", statusCode: 404)
     }
-    do { return try decoder.decode(SourceManifest.self, from: Data(contentsOf: url)) }
+    do {
+      let manifest = try decoder.decode(SourceManifest.self, from: Data(contentsOf: url))
+      try completePendingSourceReset(bookID: bookID, manifest: manifest)
+      return manifest
+    }
     catch { throw InkOSCoreError("原著清单格式错误：\(error.localizedDescription)", statusCode: 503) }
   }
 
   func loadCanonProgress(bookID: String, manifest: SourceManifest) throws -> SourceCanonProgress {
     let url = try canonProgressURL(bookID)
-    if let existing = try? decoder.decode(SourceCanonProgress.self, from: Data(contentsOf: url)),
-      existing.version == SourceCanonProgress.currentVersion,
-      existing.sourceDigest == manifest.sourceDigest
-    {
-      return existing
+    func freshProgress(settingsDigest: String? = nil) -> SourceCanonProgress {
+      SourceCanonProgress(
+        version: SourceCanonProgress.currentVersion,
+        bookId: bookID,
+        sourceDigest: manifest.sourceDigest,
+        sourceLayoutDigest: manifest.layoutDigest,
+        chapterCount: manifest.chapterCount,
+        prefaceExtracted: !manifest.chapters.contains { $0.index == 0 },
+        sourceCoordinatesVersion: SourceCanonProgress.currentSourceCoordinatesVersion,
+        nextChapterIndex: 1,
+        batches: [],
+        delta: ContinuityDelta(),
+        settingsDigest: settingsDigest,
+        updatedAt: isoTimestamp()
+      )
     }
-    return SourceCanonProgress(
-      version: SourceCanonProgress.currentVersion,
-      bookId: bookID,
-      sourceDigest: manifest.sourceDigest,
-      chapterCount: manifest.chapterCount,
-      nextChapterIndex: 1,
-      batches: [],
-      delta: ContinuityDelta(),
-      settingsDigest: nil,
-      updatedAt: isoTimestamp()
-    )
+    if fileManager.fileExists(atPath: url.path) {
+      do {
+        var existing = try decoder.decode(
+          SourceCanonProgress.self,
+          from: Data(contentsOf: url)
+        )
+        let identityMatches = existing.version == SourceCanonProgress.currentVersion
+          && existing.sourceDigest == manifest.sourceDigest
+        // A v1 manifest has no layout digest. Keep it read-only until source
+        // readiness rejects that manifest and the user re-imports; clearing its
+        // canon merely by opening the workspace would be destructive. Once a
+        // current manifest exists, the layout digest becomes mandatory.
+        let currentLayoutMatches = manifest.version == SourceManifest.currentVersion
+          && manifest.layoutDigest != nil
+          && existing.sourceLayoutDigest == manifest.layoutDigest
+        if identityMatches,
+          manifest.version != SourceManifest.currentVersion || currentLayoutMatches
+        {
+          // v1 checkpoints did not track the retained index-0 preface. A completed
+          // range beginning at zero proves it landed; otherwise resume it before the
+          // numeric cursor, including a checkpoint that had already reached the end.
+          if existing.prefaceExtracted == nil {
+            let hasPreface = manifest.chapters.contains { $0.index == 0 }
+            existing.prefaceExtracted = !hasPreface || existing.batches.contains {
+              $0.startChapter == 0
+            }
+          }
+          return existing
+        }
+
+        // The source layer was extracted against different chapter boundaries.
+        // Replace it before saving the fresh cursor so an interruption can never
+        // leave the stale base paired with a checkpoint that starts at chapter 1.
+        let reset = freshProgress(settingsDigest: existing.settingsDigest)
+        _ = try replaceCanonBaseContinuity(
+          bookID: bookID,
+          delta: reset.delta,
+          source: "原著切章布局变化，正典游标失效"
+        )
+        try saveCanonProgress(reset)
+        recordDebug(scope: "canon", message: "canon.progress.layout_reset", data: [
+          "bookId": bookID,
+          "previousLayoutDigest": existing.sourceLayoutDigest ?? "legacy",
+          "sourceLayoutDigest": manifest.layoutDigest ?? "missing",
+        ])
+        return reset
+      } catch {
+        if let coreError = error as? InkOSCoreError { throw coreError }
+        throw InkOSCoreError(
+          "原著正典进度格式错误：\(error.localizedDescription)",
+          statusCode: 503
+        )
+      }
+    }
+    return freshProgress()
   }
 
   @discardableResult
@@ -174,6 +244,7 @@ extension InkOSCore {
     embedRequested: Bool
   ) throws -> DerivativePreparationIntent {
     let manifest = try loadSourceManifest(bookID: bookID)
+    _ = try validateSourceSearchIndex(bookID: bookID, manifest: manifest)
     let intent = DerivativePreparationIntent(
       version: DerivativePreparationIntent.currentVersion,
       sourceDigest: manifest.sourceDigest,
@@ -190,23 +261,46 @@ extension InkOSCore {
 
   func derivativePreparationSnapshot(bookID: String) throws -> DerivativePreparationSnapshot {
     let manifest = try loadSourceManifest(bookID: bookID)
+    _ = try validateSourceSearchIndex(bookID: bookID, manifest: manifest)
     let url = try derivativePreparationIntentURL(bookID)
-    let intent: DerivativePreparationIntent
-    do {
-      intent = try decoder.decode(DerivativePreparationIntent.self, from: Data(contentsOf: url))
-    } catch {
-      throw InkOSCoreError("原著准备记录缺失，请重新导入原著", statusCode: 404)
+    let storedIntent: DerivativePreparationIntent?
+    if fileManager.fileExists(atPath: url.path) {
+      do {
+        storedIntent = try decoder.decode(
+          DerivativePreparationIntent.self,
+          from: Data(contentsOf: url)
+        )
+      } catch {
+        throw InkOSCoreError(
+          "原著准备记录格式错误：\(error.localizedDescription)",
+          statusCode: 503
+        )
+      }
+    } else {
+      storedIntent = nil
     }
+    let intent = storedIntent ?? DerivativePreparationIntent(
+      version: DerivativePreparationIntent.currentVersion,
+      sourceDigest: manifest.sourceDigest,
+      // v1.2 以前没有 preparation.json。原文件、游标和索引都还在，只有
+      // 作者原始输入无法还原；用空设置恢复可续跑的正典与语义索引，而不是
+      // 要求再次选择一份已经完整导入的巨型原著。
+      settingsText: "",
+      embedRequested: true,
+      updatedAt: manifest.ingestedAt
+    )
     guard intent.version == DerivativePreparationIntent.currentVersion,
       intent.sourceDigest == manifest.sourceDigest
     else {
       throw InkOSCoreError("原著准备记录已过期，请重新导入原著", statusCode: 409)
     }
 
-    let progress = try loadCanonProgress(bookID: bookID, manifest: manifest)
+    let progress = try repairedCanonProgress(bookID: bookID, manifest: manifest)
     let canon = canonStatus(progress)
     let settings = intent.settingsText.trimmingCharacters(in: .whitespacesAndNewlines)
-    let overlayComplete = settings.isEmpty || progress.settingsDigest == stableTextDigest(settings)
+    let overlayComplete = storedIntent == nil
+      || settings.isEmpty
+      || progress.settingsDigest == stableTextDigest(settings)
     let embedding = try derivativeSourceEmbeddingStatus(bookID: bookID)
     // On macOS 13 the semantic model is unavailable by definition. The lexical
     // index was already built during import, so there is no unfinished work to
@@ -221,6 +315,48 @@ extension InkOSCore {
       overlayComplete: overlayComplete,
       embeddingComplete: embeddingComplete
     )
+  }
+
+  /// Writing a derivative chapter before source preparation is complete silently
+  /// turns it into an original chapter: no full canon, no semantic index, and often
+  /// no timeline origin. Entry points call this before they start an async job so the
+  /// customer gets a stable 409 instead of a draft produced from partial evidence.
+  @discardableResult
+  func validateDerivativePreparationForWriting(
+    bookID: String,
+    plan: LongFormPlanResponse
+  ) throws -> LongFormPlanResponse {
+    guard bookKind(bookID: bookID) == .derivative else { return plan }
+    let snapshot = try derivativePreparationSnapshot(bookID: bookID)
+    guard snapshot.canon.isComplete else {
+      throw InkOSCoreError(
+        "原著正典尚未准备完成（已处理 \(snapshot.canon.extractedChapters)/\(snapshot.canon.chapterCount) 章），请先继续原著准备",
+        statusCode: 409
+      )
+    }
+    guard snapshot.overlayComplete else {
+      throw InkOSCoreError("作者设定尚未登记完成，请先继续原著准备", statusCode: 409)
+    }
+    guard snapshot.embeddingComplete else {
+      throw InkOSCoreError(
+        "原著语义索引尚未完成（\(snapshot.embedding.embedded)/\(snapshot.embedding.total) 段），请先继续原著准备",
+        statusCode: 409
+      )
+    }
+    // Reading the preparation snapshot can migrate a legacy canon checkpoint and
+    // replace the source-owned projection. Use the post-migration plan for both
+    // anchor validation and the chapter operation that follows this gate.
+    let synchronizedPlan = try synchronizeContinuityProjection(bookID: bookID)
+    let timeline = resolvedDerivativeTimeline(
+      bookID: bookID,
+      continuity: synchronizedPlan.continuity
+    )
+    guard timeline.isConfigured,
+      hasResolvedDerivativeSourceAnchor(timeline, continuity: synchronizedPlan.continuity)
+    else {
+      throw InkOSCoreError("原著时间锚点尚未绑定，请先完成正典抽取并确认开篇时间", statusCode: 409)
+    }
+    return synchronizedPlan
   }
 
   /// Groups the remaining chapters into batches under the character budget.
@@ -253,6 +389,34 @@ extension InkOSCore {
     if !current.isEmpty {
       plans.append(SourceCanonBatchPlan(index: indexOffset + plans.count + 1, chapters: current))
     }
+    return plans
+  }
+
+  /// Plans the retained preface independently from the numeric resume cursor.
+  ///
+  /// A legacy checkpoint can have `nextChapterIndex == 58` while index 0 was never
+  /// extracted. Putting both into one character-budget pass would create a batch
+  /// whose byte range runs from the preface through chapter 58, silently re-reading
+  /// all 57 completed chapters. The preface is therefore always its own batch and
+  /// the numeric plans continue from the stored cursor.
+  func planPendingCanonBatches(
+    manifest: SourceManifest,
+    progress: SourceCanonProgress
+  ) -> [SourceCanonBatchPlan] {
+    var plans: [SourceCanonBatchPlan] = []
+    if !(progress.prefaceExtracted ?? false),
+      let preface = manifest.chapters.first(where: { $0.index == 0 })
+    {
+      plans.append(SourceCanonBatchPlan(
+        index: progress.batches.count + 1,
+        chapters: [preface]
+      ))
+    }
+    plans.append(contentsOf: planCanonBatches(
+      chapters: manifest.chapters.filter { $0.index > 0 },
+      from: progress.nextChapterIndex,
+      indexOffset: progress.batches.count + plans.count
+    ))
     return plans
   }
 
@@ -455,7 +619,8 @@ extension InkOSCore {
     maxBatches: Int = 0
   ) async throws -> SourceCanonStatus {
     let manifest = try loadSourceManifest(bookID: bookID)
-    var progress = try loadCanonProgress(bookID: bookID, manifest: manifest)
+    _ = try validateSourceSearchIndex(bookID: bookID, manifest: manifest)
+    var progress = try repairedCanonProgress(bookID: bookID, manifest: manifest)
     guard !progress.isComplete else {
       recordDebug(scope: "canon", message: "canon.extract.already_complete", data: [
         "bookId": bookID, "chapterCount": manifest.chapterCount,
@@ -474,11 +639,7 @@ extension InkOSCore {
     }
     let ns = text as NSString
 
-    var plans = planCanonBatches(
-      chapters: manifest.chapters,
-      from: progress.nextChapterIndex,
-      indexOffset: progress.batches.count
-    )
+    var plans = planPendingCanonBatches(manifest: manifest, progress: progress)
     if maxBatches > 0, plans.count > maxBatches {
       plans = Array(plans.prefix(maxBatches))
     }
@@ -536,7 +697,11 @@ extension InkOSCore {
           // `chapterNumber: 1` supplies the defaults for any chapter field the
           // model omitted; `canonicalizedExtractionDelta` then overrides every
           // one of them, so the value only has to be in range.
-          let normalized = try normalizedConsistencyDelta(object, chapterNumber: 1)
+          let normalized = try normalizedConsistencyDelta(
+            object,
+            chapterNumber: 1,
+            allowSourceCoordinates: true
+          )
           extracted = canonicalizedExtractionDelta(
             normalized,
             sourceRange: (batch.startChapter, batch.endChapter),
@@ -560,7 +725,7 @@ extension InkOSCore {
         }
       }
 
-      guard let delta = extracted else {
+      guard var delta = extracted else {
         // The checkpoint already holds every completed batch, so surfacing the
         // failure here loses only this batch.
         try saveCanonProgress(progress)
@@ -570,9 +735,13 @@ extension InkOSCore {
         )
       }
 
-      progress.delta = mergedCanonDelta(progress.delta, delta)
-      progress.nextChapterIndex = batch.endChapter + 1
-      progress.batches.append(SourceCanonBatch(
+      let entityMerge = canonicalCanonEntities(
+        existing: progress.delta.upsert.entities,
+        additions: delta.upsert.entities
+      )
+      delta.upsert.entities = entityMerge.additions
+      let mergedDelta = mergedCanonDelta(progress.delta, delta)
+      let completedBatch = SourceCanonBatch(
         index: batch.index,
         startChapter: batch.startChapter,
         endChapter: batch.endChapter,
@@ -585,17 +754,26 @@ extension InkOSCore {
         hookCount: delta.upsert.hooks.count,
         model: model,
         completedAt: isoTimestamp()
-      ))
-      progress.updatedAt = isoTimestamp()
-      try saveCanonProgress(progress)
+      )
 
-      // Merge after each batch, not once at the end: an interrupted long run
-      // should leave usable canon behind rather than a checkpoint nothing reads.
+      // Projection first, checkpoint second. If projection validation rejects this
+      // batch, the persisted cursor still points at it and a resume cannot skip
+      // canon that never landed. If the later checkpoint write fails, re-applying
+      // the keyed delta is idempotent.
       plan = try mergeCanonIntoBaseContinuity(
         bookID: bookID,
         delta: delta,
         source: "原著正典抽取（第\(batch.startChapter)-\(batch.endChapter)章）"
       )
+      progress.delta = mergedDelta
+      progress.nextChapterIndex = Swift.max(progress.nextChapterIndex, batch.endChapter + 1)
+      if batch.chapters.contains(where: { $0.index == 0 }) {
+        progress.prefaceExtracted = true
+      }
+      progress.batches.append(completedBatch)
+      progress.updatedAt = isoTimestamp()
+      try saveCanonProgress(progress)
+      recordCanonEntityTypeConflicts(entityMerge.typeConflicts, bookID: bookID, batch: batch.index)
       recordDebug(scope: "canon", message: "canon.extract.batch", data: [
         "bookId": bookID,
         "batch": batch.index,
@@ -624,7 +802,8 @@ extension InkOSCore {
       throw InkOSCoreError("设定文本为空", statusCode: 400)
     }
     let manifest = try loadSourceManifest(bookID: bookID)
-    var progress = try loadCanonProgress(bookID: bookID, manifest: manifest)
+    _ = try validateSourceSearchIndex(bookID: bookID, manifest: manifest)
+    var progress = try repairedCanonProgress(bookID: bookID, manifest: manifest)
     let digest = stableTextDigest(trimmed)
     guard progress.settingsDigest != digest else {
       return canonStatus(progress)
@@ -698,10 +877,78 @@ extension InkOSCore {
 
   func derivativeCanonStatus(bookID: String) throws -> SourceCanonStatus {
     let manifest = try loadSourceManifest(bookID: bookID)
-    return canonStatus(try loadCanonProgress(bookID: bookID, manifest: manifest))
+    _ = try validateSourceSearchIndex(bookID: bookID, manifest: manifest)
+    return canonStatus(try repairedCanonProgress(bookID: bookID, manifest: manifest))
   }
 
   // MARK: - Internals
+
+  /// Repairs legacy checkpoint semantics before status or resume uses them.
+  /// Projection replacement lands first; an interruption before the progress write
+  /// simply reruns the same keyed, idempotent repair on the next call.
+  private func repairedCanonProgress(
+    bookID: String,
+    manifest: SourceManifest
+  ) throws -> SourceCanonProgress {
+    var progress = try loadCanonProgress(bookID: bookID, manifest: manifest)
+    let entityMerge = canonicalCanonEntities(
+      existing: progress.delta.upsert.entities,
+      additions: []
+    )
+    let entitiesChanged = entityMerge.entities != progress.delta.upsert.entities
+    let coordinatesChanged = progress.sourceCoordinatesVersion
+      != SourceCanonProgress.currentSourceCoordinatesVersion
+    guard entitiesChanged || coordinatesChanged else { return progress }
+
+    progress.delta.upsert.entities = entityMerge.entities
+    var clearedSourceDays = 0
+    if coordinatesChanged {
+      let configured = loadDerivativeTimeline(bookID: bookID)
+      let anchorLabel = configured.anchorLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+      let matchedAnchor = progress.delta.upsert.timeline.first { milestone in
+        guard !anchorLabel.isEmpty else { return false }
+        return milestone.label == anchorLabel
+          || milestone.label.contains(anchorLabel)
+          || anchorLabel.contains(milestone.label)
+      }
+      let anchorChapter = configured.anchorSourceChapter ?? matchedAnchor?.sourceChapter
+      let anchorBatch = anchorChapter.flatMap { chapter in
+        progress.batches.first { $0.startChapter <= chapter && chapter <= $0.endChapter }
+      }
+      progress.delta.upsert.timeline = progress.delta.upsert.timeline.map { item in
+        let keepDay = item.sourceChapter.map { chapter in
+          guard let anchorBatch else { return false }
+          return anchorBatch.startChapter <= chapter && chapter <= anchorBatch.endChapter
+        } ?? false
+        if item.sourceDay != nil, !keepDay { clearedSourceDays += 1 }
+        return LongFormTimelineMilestone(
+          id: item.id,
+          order: item.order,
+          label: item.label,
+          earliestChapter: item.earliestChapter,
+          latestChapter: item.latestChapter,
+          immutable: item.immutable,
+          sourceDay: keepDay ? item.sourceDay : nil,
+          sourceChapter: item.sourceChapter
+        )
+      }
+      progress.sourceCoordinatesVersion = SourceCanonProgress.currentSourceCoordinatesVersion
+    }
+    progress.updatedAt = isoTimestamp()
+    _ = try replaceCanonBaseContinuity(
+      bookID: bookID,
+      delta: progress.delta,
+      source: "原著正典旧 checkpoint 修复"
+    )
+    try saveCanonProgress(progress)
+    recordCanonEntityTypeConflicts(entityMerge.typeConflicts, bookID: bookID, batch: nil)
+    recordDebug(scope: "canon", message: "canon.progress.migrated", data: [
+      "bookId": bookID,
+      "entitiesDeduplicated": entitiesChanged,
+      "sourceDaysCleared": clearedSourceDays,
+    ])
+    return progress
+  }
 
   private func canonStatus(_ progress: SourceCanonProgress) -> SourceCanonStatus {
     SourceCanonStatus(
@@ -731,16 +978,19 @@ extension InkOSCore {
     try atomicWrite(encoder.encode(progress), to: url)
   }
 
-  /// Unions two extraction deltas, keyed by the same identity the continuity
-  /// merge uses. Later batches win on collision, matching upsert semantics.
+  /// Unions two extraction deltas. Most fact kinds are keyed by their stable IDs;
+  /// entities additionally use a normalized name because extraction models often
+  /// rename `ENT-*` across batches for the same person or object.
   func mergedCanonDelta(_ base: ContinuityDelta, _ addition: ContinuityDelta) -> ContinuityDelta {
     var merged = base
     merged.upsert.immutableCanon = mergeByKey(
       merged.upsert.immutableCanon, addition.upsert.immutableCanon, key: \.id)
     merged.upsert.worldRules = mergeByKey(
       merged.upsert.worldRules, addition.upsert.worldRules, key: \.id)
-    merged.upsert.entities = mergeByKey(
-      merged.upsert.entities, addition.upsert.entities, key: \.id)
+    merged.upsert.entities = canonicalCanonEntities(
+      existing: merged.upsert.entities,
+      additions: addition.upsert.entities
+    ).entities
     merged.upsert.knowledgeBoundaries = mergeByKey(
       merged.upsert.knowledgeBoundaries, addition.upsert.knowledgeBoundaries, key: \.factId)
     merged.upsert.timeline = mergeByKey(
@@ -768,6 +1018,165 @@ extension InkOSCore {
       }
     }
     return result
+  }
+
+  private struct CanonEntityTypeConflict {
+    let name: String
+    let canonicalID: String
+    let canonicalType: String
+    let discardedID: String
+    let discardedType: String
+  }
+
+  private struct CanonEntityMerge {
+    let entities: [LongFormEntity]
+    /// Canonical entities touched by the incoming batch, with their stable IDs.
+    let additions: [LongFormEntity]
+    let typeConflicts: [CanonEntityTypeConflict]
+  }
+
+  /// Collapses same-name source entities without relying on the model to keep an
+  /// arbitrary generated ID stable. The first recorded canonical entry owns both
+  /// the ID and the type; later evidence can fill missing attributes but cannot
+  /// turn an object into a character (or vice versa).
+  private func canonicalCanonEntities(
+    existing: [LongFormEntity],
+    additions: [LongFormEntity]
+  ) -> CanonEntityMerge {
+    var entities: [LongFormEntity] = []
+    var namePositions: [String: Int] = [:]
+    var idPositions: [String: Int] = [:]
+    var touched: [String: Int] = [:]
+    var conflicts: [CanonEntityTypeConflict] = []
+
+    func merge(_ canonical: LongFormEntity, _ candidate: LongFormEntity) -> LongFormEntity {
+      var attributes = canonical.attributes
+      for (key, value) in candidate.attributes where !value.isEmpty {
+        attributes[key] = value
+      }
+      return LongFormEntity(
+        id: canonical.id,
+        name: canonical.name,
+        type: canonical.type,
+        owner: candidate.owner ?? canonical.owner,
+        location: candidate.location ?? canonical.location,
+        attributes: attributes,
+        immutableOwner: canonical.immutableOwner || candidate.immutableOwner,
+        immutableLocation: canonical.immutableLocation || candidate.immutableLocation,
+        immutableAttributes: Array(Set(canonical.immutableAttributes + candidate.immutableAttributes)).sorted()
+      )
+    }
+
+    // A model can reuse an ID for an unrelated name. Keep the requested prefix
+    // so the remap is inspectable, but never use a random suffix: a later resume
+    // must produce the same identity from the same ordered canon evidence.
+    func freeEntityID(basedOn requested: String) -> String {
+      let base = requested.isEmpty ? "ENT" : requested
+      guard idPositions[base] != nil else { return base }
+      var suffix = 2
+      while idPositions["\(base)-\(suffix)"] != nil {
+        suffix += 1
+      }
+      return "\(base)-\(suffix)"
+    }
+
+    func absorb(_ candidate: LongFormEntity, isAddition: Bool) {
+      let name = normalizedCanonEntityName(candidate.name)
+      // Names are the primary identity for canon. Empty names are not useful
+      // identities, so they fall through to the ID-only path instead of merging
+      // every malformed nameless model object together.
+      if !name.isEmpty, let nameIndex = namePositions[name] {
+        let canonical = entities[nameIndex]
+        if canonical.type != candidate.type {
+          conflicts.append(CanonEntityTypeConflict(
+            name: canonical.name,
+            canonicalID: canonical.id,
+            canonicalType: canonical.type,
+            discardedID: candidate.id,
+            discardedType: candidate.type
+          ))
+        }
+        entities[nameIndex] = merge(canonical, candidate)
+        // Do not overwrite an unrelated holder's ID with an alias to this name.
+        // Future different-name evidence using that ID must be remapped too.
+        if isAddition { touched[canonical.id] = nameIndex }
+        return
+      }
+
+      if name.isEmpty, let idIndex = idPositions[candidate.id] {
+        let canonical = entities[idIndex]
+        if canonical.type != candidate.type {
+          conflicts.append(CanonEntityTypeConflict(
+            name: canonical.name,
+            canonicalID: canonical.id,
+            canonicalType: canonical.type,
+            discardedID: candidate.id,
+            discardedType: candidate.type
+          ))
+        }
+        entities[idIndex] = merge(canonical, candidate)
+        if isAddition { touched[canonical.id] = idIndex }
+        return
+      }
+
+      if idPositions[candidate.id] != nil {
+        // The requested ID is already owned by a different name. Preserve both
+        // entities and assign the newcomer a deterministic free ID.
+        let remappedID = freeEntityID(basedOn: candidate.id)
+        let remapped = candidate.reidentified(as: remappedID)
+        let newIndex = entities.count
+        entities.append(remapped)
+        if !name.isEmpty { namePositions[name] = newIndex }
+        idPositions[remappedID] = newIndex
+        if isAddition { touched[remappedID] = newIndex }
+        return
+      }
+
+      let newIndex = entities.count
+      entities.append(candidate)
+      if !name.isEmpty { namePositions[name] = newIndex }
+      idPositions[candidate.id] = newIndex
+      if isAddition { touched[candidate.id] = newIndex }
+    }
+
+    for entity in existing { absorb(entity, isAddition: false) }
+    for entity in additions { absorb(entity, isAddition: true) }
+    let normalizedAdditions = touched.values.sorted().map { entities[$0] }
+    return CanonEntityMerge(
+      entities: entities,
+      additions: normalizedAdditions,
+      typeConflicts: conflicts
+    )
+  }
+
+  private func normalizedCanonEntityName(_ value: String) -> String {
+    value.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+      .components(separatedBy: .whitespacesAndNewlines)
+      .joined()
+  }
+
+  private func recordCanonEntityTypeConflicts(
+    _ conflicts: [CanonEntityTypeConflict],
+    bookID: String,
+    batch: Int?
+  ) {
+    for conflict in conflicts {
+      var data: [String: Any] = [
+        "bookId": bookID,
+        "name": conflict.name,
+        "canonicalID": conflict.canonicalID,
+        "canonicalType": conflict.canonicalType,
+        "discardedID": conflict.discardedID,
+        "discardedType": conflict.discardedType,
+      ]
+      if let batch { data["batch"] = batch }
+      recordDebug(
+        scope: "canon",
+        message: "canon.entity.type_conflict",
+        level: "warning",
+        data: data
+      )
+    }
   }
 
   private func stableTextDigest(_ text: String) -> String {

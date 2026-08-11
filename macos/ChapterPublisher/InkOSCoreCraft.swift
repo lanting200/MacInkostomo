@@ -6,6 +6,11 @@ import Foundation
 extension InkOSCore {
   static let chapterBeatPlanVersion = 1
   static let chapterBeatBatchSize = 10
+  /// The beat planner needs unresolved hooks, but an unbounded list eventually
+  /// crowds the batch prompt out of its fixed context budget.
+  static let chapterBeatOpenHookLimit = 24
+  static let chapterBeatOpenHooksMaxCharacters = 4_800
+  static let chapterBeatOpenHookDescriptionMaxCharacters = 180
 
   /// Non-removable craft rules. The editable per-book file can extend these but
   /// never replace them, because these are the constraints that keep a chapter
@@ -123,8 +128,13 @@ extension InkOSCore {
     }
     plan.updatedAt = isoTimestamp()
     try atomicWrite(encoder.encode(plan), to: try chapterBeatsURL(bookID: bookID))
+    // Fence every batch request that was already inside the LLM. The file write
+    // and epoch bump happen in one actor turn, so a request cannot observe the
+    // new plan and still commit an old response between the two operations.
+    beatEpochs[bookID, default: 0] += 1
     recordDebug(scope: "craft", message: "chapter_beats.invalidated", data: [
       "bookId": bookID, "fromChapter": fromChapter, "removedBeats": removedBeats,
+      "epoch": beatEpochs[bookID, default: 0],
     ])
     return plan
   }
@@ -137,18 +147,28 @@ extension InkOSCore {
     plan: LongFormPlanResponse
   ) async throws -> ChapterBeat {
     let stored = try loadChapterBeatPlan(bookID: bookID)
-    if let existing = stored.beat(for: chapterNumber) {
+    let epoch = beatEpochs[bookID, default: 0]
+    // A beat without a batch at the current plan revision is legacy/stale data.
+    // Do not let it bypass regeneration merely because its chapter number exists.
+    let currentRevisionBatches = stored.batches.filter { $0.planRevision == plan.revision }
+    let currentRevisionBeatNumbers = Set(currentRevisionBatches.flatMap { batch -> [Int] in
+      guard batch.startChapter <= batch.endChapter else { return [] }
+      return Array(batch.startChapter...batch.endChapter)
+    })
+    if let existing = stored.beat(for: chapterNumber),
+       currentRevisionBeatNumbers.contains(chapterNumber) {
       return existing
     }
     let range = beatBatchRange(
       chapterNumber: chapterNumber,
       plan: plan,
-      existingBeats: Set(stored.beats.map(\.number))
+      existingBeats: Set(stored.beats.map(\.number)).intersection(currentRevisionBeatNumbers)
     )
     let generated = try await generateChapterBeatBatch(
       bookID: bookID,
       range: range,
-      plan: plan
+      plan: plan,
+      beatEpoch: epoch
     )
     guard let beat = generated.beats.first(where: { $0.number == chapterNumber }) else {
       throw InkOSCoreError("节拍卡生成结果缺少第 \(chapterNumber) 章", statusCode: 502)
@@ -175,17 +195,18 @@ extension InkOSCore {
       plan: plan,
       existingBeats: existingBeats
     )
-    guard currentChapter >= current.end - 2 else { return }
+    guard currentChapter == current.end else { return }
     let nextStart = current.end + 1
     guard nextStart <= plan.plan.targetChapters else { return }
-    guard !beatPrefetchInFlight.contains(nextStart) else { return }
+    let prefetchKey = "\(bookID)#\(nextStart)"
+    guard !beatPrefetchInFlight.contains(prefetchKey) else { return }
     guard !existingBeats.contains(nextStart) else { return }
-    beatPrefetchInFlight.insert(nextStart)
+    beatPrefetchInFlight.insert(prefetchKey)
     recordDebug(scope: "craft", message: "chapter_beats.prefetch.started", data: [
       "bookId": bookID, "fromChapter": nextStart,
     ])
     Task {
-      defer { beatPrefetchInFlight.remove(nextStart) }
+      defer { beatPrefetchInFlight.remove(prefetchKey) }
       do {
         let freshPlan = try synchronizeContinuityProjection(bookID: bookID)
         _ = try await ensureChapterBeat(bookID: bookID, chapterNumber: nextStart, plan: freshPlan)
@@ -234,8 +255,12 @@ extension InkOSCore {
   private func generateChapterBeatBatch(
     bookID: String,
     range: (start: Int, end: Int, volume: Int),
-    plan: LongFormPlanResponse
+    plan: LongFormPlanResponse,
+    beatEpoch: Int
   ) async throws -> ChapterBeatPlan {
+    guard beatEpochs[bookID, default: 0] == beatEpoch else {
+      throw InkOSCoreError("章节节拍卡已被重新规划，本次结果已作废，请重试", statusCode: 409)
+    }
     let prompt = try chapterBeatPrompt(bookID: bookID, range: range, plan: plan)
     // Streamed, and not for a live preview — the transport itself is the fix.
     // `k3` is a reasoning model: on a non-streaming request the relay sends
@@ -303,12 +328,14 @@ extension InkOSCore {
         _ = try await generateChapterBeatBatch(
           bookID: bookID,
           range: (start: range.start, end: firstHalfEnd, volume: range.volume),
-          plan: plan
+          plan: plan,
+          beatEpoch: beatEpoch
         )
         return try await generateChapterBeatBatch(
           bookID: bookID,
           range: (start: firstHalfEnd + 1, end: range.end, volume: range.volume),
-          plan: plan
+          plan: plan,
+          beatEpoch: beatEpoch
         )
       }
       let detail = truncated
@@ -318,6 +345,18 @@ extension InkOSCore {
         "节拍卡生成不完整，缺少第 \(missing.map(String.init).joined(separator: "、")) 章。\(detail)",
         statusCode: 502
       )
+    }
+
+    // The actor yields while the model plans this batch. Approval, source
+    // replacement, or settings edits can rebuild continuity in that interval;
+    // persisting a response built from the old projection would poison every
+    // later chapter in the batch.
+    let currentPlan = try synchronizeContinuityProjection(bookID: bookID)
+    guard currentPlan.revision == plan.revision else {
+      throw InkOSCoreError("长篇规划已更新，本次节拍卡结果已作废，请重试", statusCode: 409)
+    }
+    guard beatEpochs[bookID, default: 0] == beatEpoch else {
+      throw InkOSCoreError("章节节拍卡已被重新规划，本次结果已作废，请重试", statusCode: 409)
     }
 
     var stored = try loadChapterBeatPlan(bookID: bookID)
@@ -468,11 +507,11 @@ extension InkOSCore {
     var sections = ""
     if let openingText = derivativeTimelineSection(opening) {
       sections += "\n\n【本批次起点的原著时间进度】\n\(openingText)"
-      if closing.storyDay != opening.storyDay {
-        sections += "\n\n【本批次终点的原著时间进度】\n第 \(range.end) 章预计距开篇 "
-          + "\(closing.elapsedDays) 天。本批次任何一章都不得触及上面"
-          + "「尚未发生」列表中的内容。"
-      }
+      sections += derivativeBeatClosingSection(
+        opening: opening,
+        closing: closing,
+        endChapter: range.end
+      ) ?? ""
     }
 
     let intro = "\n本书是\(titleText)的同人作品：客户设定决定主角和主线，"
@@ -911,10 +950,66 @@ extension InkOSCore {
     return beats.map(beatBriefText).joined(separator: "\n\n")
   }
 
-  private func openHooksText(_ continuity: LongFormContinuity, upTo chapter: Int) -> String {
-    let hooks = continuity.hooks.filter { $0.openFromChapter <= chapter }
+  func openHooksText(_ continuity: LongFormContinuity, upTo chapter: Int) -> String {
+    let hooks = continuity.hooks
+      .filter { $0.openFromChapter <= chapter }
+      .sorted { lhs, rhs in
+        // A missed deadline is the most urgent planning input. Among hooks with
+        // the same urgency, recent openings are more likely to drive this batch.
+        let lhsDeadline = lhs.resolveByChapter ?? Int.max
+        let rhsDeadline = rhs.resolveByChapter ?? Int.max
+        if lhsDeadline != rhsDeadline { return lhsDeadline < rhsDeadline }
+        if lhs.openFromChapter != rhs.openFromChapter {
+          return lhs.openFromChapter > rhs.openFromChapter
+        }
+        return lhs.hookId < rhs.hookId
+      }
     guard !hooks.isEmpty else { return "（无）" }
-    return hooks.sorted { $0.openFromChapter < $1.openFromChapter }.map(hookLine).joined(separator: "\n")
+
+    var lines: [String] = []
+    var usedCharacters = 0
+    for hook in hooks {
+      guard lines.count < Self.chapterBeatOpenHookLimit else { break }
+      let line = beatHookLine(hook)
+      let separator = lines.isEmpty ? 0 : 1
+      guard usedCharacters + separator + line.count <= Self.chapterBeatOpenHooksMaxCharacters else {
+        break
+      }
+      lines.append(line)
+      usedCharacters += separator + line.count
+    }
+
+    var omitted = hooks.count - lines.count
+    while omitted > 0 {
+      let notice = "（已省略另外 \(omitted) 条未回收伏笔，超出节拍卡上下文预算）"
+      let separator = lines.isEmpty ? 0 : 1
+      if usedCharacters + separator + notice.count <= Self.chapterBeatOpenHooksMaxCharacters {
+        lines.append(notice)
+        break
+      }
+      guard let removed = lines.popLast() else { break }
+      usedCharacters -= removed.count + (lines.isEmpty ? 0 : 1)
+      omitted += 1
+    }
+    return lines.joined(separator: "\n")
+  }
+
+  private func beatHookLine(_ hook: LongFormHookPlan) -> String {
+    let normalized = hook.description
+      .replacingOccurrences(of: "\r\n", with: " ")
+      .replacingOccurrences(of: "\n", with: " ")
+      .replacingOccurrences(of: "\r", with: " ")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let description: String
+    if normalized.count > Self.chapterBeatOpenHookDescriptionMaxCharacters {
+      description = String(normalized.prefix(Self.chapterBeatOpenHookDescriptionMaxCharacters)) + "…"
+    } else {
+      description = normalized
+    }
+    var parts = ["\(hook.hookId)", "开启于第\(hook.openFromChapter)章"]
+    if let deadline = hook.resolveByChapter { parts.append("要求第\(deadline)章前回收") }
+    if let volume = hook.requiredVolumeNumber { parts.append("归属第\(volume)卷") }
+    return "- \(description)（\(parts.joined(separator: "，"))）"
   }
 
   private func knownEntitiesText(_ continuity: LongFormContinuity, limit: Int) -> String {

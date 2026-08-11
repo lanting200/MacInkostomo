@@ -152,6 +152,7 @@ struct VolumeSummary: Codable, Identifiable, Hashable, Sendable {
 struct ReviewAttempt: Codable, Hashable, Sendable {
   let pass: Bool?
   let status: String?
+  let protocolFailure: Bool?
   let attempt: Int?
   let model: String?
   let summary: String?
@@ -168,6 +169,7 @@ struct LLMReview: Codable, Hashable, Sendable {
   let model: String?
   let summary: String?
   let issues: [String]?
+  let protocolFailure: Bool?
   /// Craft findings that did not block delivery to manual review.
   let craftAdvisories: [String]?
   let revisionGuidance: String?
@@ -179,6 +181,7 @@ struct LLMReview: Codable, Hashable, Sendable {
   var issueList: [String] { issues ?? [] }
   var craftAdvisoryList: [String] { craftAdvisories ?? [] }
   var isPassed: Bool { status == "passed" }
+  var isProtocolFailure: Bool { protocolFailure == true || status == "protocol_error" }
   var isBusy: Bool {
     ["inkos_writing", "inkos_revising", "reviewing", "fixing"].contains(status)
   }
@@ -1627,6 +1630,9 @@ struct DerivativeTimelineStatus: Codable, Equatable, Sendable {
   let elapsedDays: Int
   let anchorLabel: String
   let startDateLabel: String
+  /// Greatest original-work chapter among every event classified as past before
+  /// the prompt-facing list is truncated.
+  let latestPastSourceChapter: Int?
   /// Canon events at or before `storyDay`, most recent last.
   let past: [DerivativeTimelineEvent]
   /// Canon events after `storyDay`, nearest first. These must not be known to

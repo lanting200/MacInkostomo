@@ -1,5 +1,26 @@
 import Foundation
 import Darwin
+import SQLite3
+
+private func passedLLMReviewFixture(_ summary: String = "独立审核通过。") -> [String: Any] {
+  let reviewedAt = isoTimestamp()
+  return [
+    "status": "passed",
+    "model": "fixture-review",
+    "summary": summary,
+    "issues": [],
+    "reviewedAt": reviewedAt,
+    "attempts": [[
+      "pass": true,
+      "status": "passed",
+      "attempt": 1,
+      "model": "fixture-review",
+      "summary": summary,
+      "issues": [],
+      "reviewedAt": reviewedAt,
+    ]],
+  ]
+}
 
 actor NativeStreamCollector {
   private var updateCount = 0
@@ -28,6 +49,10 @@ private struct AutomatedRevisionStubResponse {
   /// Raw JSON body, bypassing the envelope below. Lets a fixture assert on an
   /// error shape the relay actually sends, such as `model_not_found`.
   let rawBody: String?
+  /// Hold this response after the request has been observed. This gives race
+  /// tests a deterministic window to invalidate beats while the planner is in
+  /// its suspended LLM call.
+  let waitForRelease: Bool
 
   init(
     content: String,
@@ -35,7 +60,8 @@ private struct AutomatedRevisionStubResponse {
     statusCode: Int = 200,
     finishReason: String = "stop",
     reasoningContent: String = "",
-    rawBody: String? = nil
+    rawBody: String? = nil,
+    waitForRelease: Bool = false
   ) {
     self.content = content
     self.stream = stream
@@ -43,6 +69,7 @@ private struct AutomatedRevisionStubResponse {
     self.finishReason = finishReason
     self.reasoningContent = reasoningContent
     self.rawBody = rawBody
+    self.waitForRelease = waitForRelease
   }
 }
 
@@ -52,6 +79,8 @@ private final class AutomatedRevisionLLMProtocol: URLProtocol {
   private static var servedCount = 0
   private static var maxTokensSeen: [Int?] = []
   private static var promptsSeen: [String] = []
+  private static let releaseCondition = NSCondition()
+  private static var blockedResponseReleased = false
 
   static func configure(_ queuedResponses: [AutomatedRevisionStubResponse]) {
     responseLock.lock()
@@ -60,6 +89,16 @@ private final class AutomatedRevisionLLMProtocol: URLProtocol {
     maxTokensSeen = []
     promptsSeen = []
     responseLock.unlock()
+    releaseCondition.lock()
+    blockedResponseReleased = false
+    releaseCondition.unlock()
+  }
+
+  static func releaseBlockedResponse() {
+    releaseCondition.lock()
+    blockedResponseReleased = true
+    releaseCondition.broadcast()
+    releaseCondition.unlock()
   }
 
   /// Number of requests the core has issued since the last `configure`, so a
@@ -102,6 +141,9 @@ private final class AutomatedRevisionLLMProtocol: URLProtocol {
     guard let response else {
       client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
       return
+    }
+    if response.waitForRelease {
+      Self.waitForBlockedResponseRelease()
     }
     // Transport mismatch is a failure, which makes every fixture's `stream`
     // flag an assertion about how the core calls out. All four intercepted
@@ -164,6 +206,14 @@ private final class AutomatedRevisionLLMProtocol: URLProtocol {
 
   override func stopLoading() {}
 
+  private static func waitForBlockedResponseRelease() {
+    releaseCondition.lock()
+    while !blockedResponseReleased {
+      releaseCondition.wait()
+    }
+    releaseCondition.unlock()
+  }
+
   private static func nextResponse() -> AutomatedRevisionStubResponse? {
     responseLock.lock()
     defer { responseLock.unlock() }
@@ -210,6 +260,17 @@ struct NativeCoreSmoke {
       isDirectory: true
     )
     defer { try? fileManager.removeItem(at: root) }
+
+    if ProcessInfo.processInfo.environment["MACINKOSTOMO_DERIVATIVE_ONLY"] == "1" {
+      try await assertDerivativeRetrievalWorks(root: root)
+      print("Native derivative ingest/retrieval smoke test passed")
+      return
+    }
+    if ProcessInfo.processInfo.environment["MACINKOSTOMO_BEAT_PREFETCH_ONLY"] == "1" {
+      try await assertInvalidationFencesInFlightBeatPrefetch(root: root)
+      print("Native beat-prefetch invalidation smoke test passed")
+      return
+    }
 
     let core = InkOSCore(rootURL: root)
     try await assertExplicitWorkspaceIsIsolated(root: root)
@@ -315,7 +376,8 @@ struct NativeCoreSmoke {
       number: 1,
       title: "旧格式迁移",
       content: chapterBody,
-      status: "pending_review"
+      status: "pending_review",
+      llmReview: passedLLMReviewFixture()
     )
     try await core.persistConsistencyDelta(
       bookID: books[0].id,
@@ -336,7 +398,31 @@ struct NativeCoreSmoke {
         "hooks": ["旧钥匙对应的门尚未出现"],
       ]
     )
+    let beatsURL = root.appendingPathComponent(
+      "book/books/\(books[0].id)/story/runtime/chapter-beats.json"
+    )
+    let seededBeats = ChapterBeatPlan(
+      bookId: books[0].id,
+      beats: (1...4).map {
+        ChapterBeat(number: $0, goal: "第\($0)章目标", scenes: ["第\($0)章场景"])
+      },
+      batches: [ChapterBeatBatch(
+        startChapter: 1,
+        endChapter: 4,
+        volumeNumber: 1,
+        planRevision: plan.revision,
+        generatedAt: isoTimestamp(),
+        model: "fixture"
+      )],
+      updatedAt: isoTimestamp()
+    )
+    try JSONEncoder().encode(seededBeats).write(to: beatsURL, options: .atomic)
     _ = try await core.approveChapter(bookID: books[0].id, number: 1)
+    let afterFirstApprovalBeats = try await core.fetchChapterBeats(bookID: books[0].id)
+    precondition(
+      afterFirstApprovalBeats.beats.map(\.number) == [1],
+      "首次批准必须保留当前节拍并清除未来节拍：\(afterFirstApprovalBeats.beats.map(\.number))"
+    )
     let migratedPlan = try await core.fetchLongFormPlan(bookID: books[0].id)
     precondition(migratedPlan.continuity.policy.requireConsistencyDelta)
     precondition(migratedPlan.continuity.immutableCanon.count == 1)
@@ -347,9 +433,15 @@ struct NativeCoreSmoke {
     precondition(migratedPlan.continuity.hooks.count == 1)
 
     let migratedRevision = migratedPlan.revision
+    try JSONEncoder().encode(seededBeats).write(to: beatsURL, options: .atomic)
     _ = try await core.approveChapter(bookID: books[0].id, number: 1)
     let duplicateApprovalPlan = try await core.fetchLongFormPlan(bookID: books[0].id)
     precondition(duplicateApprovalPlan.revision == migratedRevision)
+    let afterDuplicateApprovalBeats = try await core.fetchChapterBeats(bookID: books[0].id)
+    precondition(
+      afterDuplicateApprovalBeats.beats.map(\.number) == [1, 2, 3, 4],
+      "重复批准必须保持幂等，不得删除未来节拍：\(afterDuplicateApprovalBeats.beats.map(\.number))"
+    )
 
     try await assertSettingsRestoreKeepsRuntime(core: core, bookID: books[0].id, root: root)
 
@@ -358,7 +450,8 @@ struct NativeCoreSmoke {
       number: 1,
       title: "新格式替换",
       content: chapterBody,
-      status: "pending_review"
+      status: "pending_review",
+      llmReview: passedLLMReviewFixture()
     )
     try await core.persistConsistencyDelta(
       bookID: books[0].id,
@@ -412,7 +505,8 @@ struct NativeCoreSmoke {
       number: 2,
       title: "覆盖层重放",
       content: chapterBody,
-      status: "pending_review"
+      status: "pending_review",
+      llmReview: passedLLMReviewFixture()
     )
     try await core.persistConsistencyDelta(
       bookID: books[0].id,
@@ -431,7 +525,13 @@ struct NativeCoreSmoke {
         ],
       ]
     )
+    try JSONEncoder().encode(seededBeats).write(to: beatsURL, options: .atomic)
     _ = try await core.approveChapter(bookID: books[0].id, number: 2)
+    let afterSecondApprovalBeats = try await core.fetchChapterBeats(bookID: books[0].id)
+    precondition(
+      afterSecondApprovalBeats.beats.map(\.number) == [1, 2],
+      "新批准必须只保留当前及过去节拍：\(afterSecondApprovalBeats.beats.map(\.number))"
+    )
     let replayedPlan = try await core.fetchLongFormPlan(bookID: books[0].id)
     precondition(replayedPlan.continuity.entities.contains { $0.id == "manual-editor-note" })
     precondition(replayedPlan.continuity.entities.contains { $0.id == "entity-two" })
@@ -498,6 +598,10 @@ struct NativeCoreSmoke {
     precondition(!laterDirectives.contains("开篇章附加规则"))
     precondition(laterDirectives.contains("写法内核"))
 
+    // The approval idempotency fixture above deliberately leaves historical
+    // beats in place. Reset this independent craft fixture to its intended empty
+    // starting state.
+    _ = try await core.invalidateChapterBeats(bookID: books[0].id, fromChapter: 1)
     let beatPlanBefore = try await core.fetchChapterBeats(bookID: books[0].id)
     precondition(beatPlanBefore.beats.isEmpty)
     let sampleBeat = ChapterBeat(
@@ -676,7 +780,8 @@ struct NativeCoreSmoke {
       number: 3,
       title: "冲突回滚",
       content: chapterBody,
-      status: "pending_review"
+      status: "pending_review",
+      llmReview: passedLLMReviewFixture()
     )
     try await core.persistConsistencyDelta(
       bookID: books[0].id,
@@ -808,7 +913,8 @@ struct NativeCoreSmoke {
       number: 1,
       title: "第一卷检查点",
       content: chapterBody,
-      status: "pending_review"
+      status: "pending_review",
+      llmReview: passedLLMReviewFixture()
     )
     try await core.persistConsistencyDelta(
       bookID: policyBookID,
@@ -832,7 +938,8 @@ struct NativeCoreSmoke {
       number: 2,
       title: "第二卷顺序",
       content: chapterBody,
-      status: "pending_review"
+      status: "pending_review",
+      llmReview: passedLLMReviewFixture()
     )
     try await core.persistConsistencyDelta(
       bookID: policyBookID,
@@ -869,7 +976,8 @@ struct NativeCoreSmoke {
       number: 1,
       title: "第一卷检查点修订",
       content: chapterBody,
-      status: "pending_review"
+      status: "pending_review",
+      llmReview: passedLLMReviewFixture()
     )
     _ = try await core.fetchLongFormPlan(bookID: policyBookID)
     precondition(!fileManager.fileExists(atPath: firstCheckpointURL.path))
@@ -1859,9 +1967,169 @@ struct NativeCoreSmoke {
     try await assertDerivativeRetrievalWorks(root: root)
     try await assertCanonExtractionResumesAndOutranks(root: root)
     try await assertDerivativeTimelineGatesCanonEvents(root: root)
+    try await assertDerivativeBeatClosingCoversCappedFuture(root: root)
+    try await assertDerivativePromptCoverage(root: root)
+    try await assertDerivativePreparationGate(root: root)
     try await assertModelNullsDoNotCrashNormalization(root: root)
+    try await assertOpenHooksPromptBudgeting(root: root)
+    try await assertCompactContinuityContext(root: root)
+    try await assertInvalidationFencesInFlightBeatPrefetch(root: root)
 
     print("Native InkOSCore smoke test passed")
+  }
+
+  /// A background prefetch used to resurrect beats after approval or revision
+  /// invalidated them: the actor yielded in `requestLLM`, invalidation rewrote
+  /// chapter-beats.json, then the late model response loaded that fresh file and
+  /// appended its stale batch. Hold the response at that exact suspension point
+  /// and prove the invalidation epoch rejects the late commit.
+  private static func assertInvalidationFencesInFlightBeatPrefetch(root: URL) async throws {
+    let raceRoot = root.appendingPathComponent("beat-prefetch-invalidation", isDirectory: true)
+    let core = InkOSCore(rootURL: raceRoot)
+    let config: [String: Any] = [
+      "provider": "openai",
+      "model": "writer-test",
+      "reviewModel": "reviewer-test",
+      "baseUrl": "http://127.0.0.1:8765/v1",
+      "reviewBaseUrl": "http://127.0.0.1:8765/v1",
+      "apiKey": "test-key",
+      "reviewApiKey": "test-key",
+      "stream": false,
+      "thinkingBudget": 0,
+      "apiFormat": "chat",
+    ]
+    try JSONSerialization.data(withJSONObject: config)
+      .write(to: raceRoot.appendingPathComponent("data/inkos-config.json"), options: .atomic)
+
+    let creation = try await core.createBook(CreateBookRequest(
+      title: "节拍预取失效测试书",
+      language: "zh",
+      genre: "sci-fi",
+      platform: "tomato",
+      targetChapters: 20,
+      chapterWords: 1_000,
+      totalWords: "20000",
+      targetTotalWords: 20_000,
+      volumeCount: 1,
+      chapterWordTolerance: 10,
+      premise: "验证后台节拍预取不会覆盖显式失效操作。",
+      characters: "主角负责记录每一批节拍。",
+      protagonistProfile: "主角谨慎守序，压力下反复核对记录；缺陷是过度依赖旧计划。",
+      protagonistReviewed: true,
+      worldbuilding: "测试世界按章节顺序推进。",
+      outline: "二十章分成两批推进。",
+      volumePlan: "第一卷第1至20章。",
+      pacing: "每章推进一个测试目标。",
+      style: "简洁叙事。",
+      constraints: "不得跳过章节。"
+    ))
+    let plan = try await core.fetchLongFormPlan(bookID: creation.title)
+    let seeded = ChapterBeatPlan(
+      bookId: creation.title,
+      beats: (1...10).map {
+        ChapterBeat(number: $0, goal: "第\($0)章既有目标", scenes: ["第\($0)章既有场景"])
+      },
+      batches: [ChapterBeatBatch(
+        startChapter: 1,
+        endChapter: 10,
+        volumeNumber: 1,
+        planRevision: plan.revision,
+        generatedAt: isoTimestamp(),
+        model: "fixture"
+      )],
+      updatedAt: isoTimestamp()
+    )
+    let beatsURL = raceRoot.appendingPathComponent(
+      "book/books/\(creation.title)/story/runtime/chapter-beats.json"
+    )
+    try JSONEncoder().encode(seeded).write(to: beatsURL, options: .atomic)
+
+    let generatedBeats: [[String: Any]] = (11...20).map { number in
+      [
+        "number": number,
+        "volumeNumber": 1,
+        "goal": "第\(number)章预取目标",
+        "openingHook": "第\(number)章开场",
+        "scenes": ["第\(number)章场景"],
+        "requiredEvents": ["完成第\(number)章事件"],
+        "forbiddenElements": [],
+        "endingHook": "第\(number)章结尾",
+        "focusCharacters": ["主角"],
+        "newNamedCharacters": 0,
+        "timeSpan": "一天",
+        "storyDays": 1,
+        "setback": "计划受阻",
+        "notes": "测试",
+      ]
+    }
+    let response = String(
+      data: try JSONSerialization.data(withJSONObject: ["beats": generatedBeats]),
+      encoding: .utf8
+    )!
+
+    URLProtocol.registerClass(AutomatedRevisionLLMProtocol.self)
+    defer {
+      AutomatedRevisionLLMProtocol.releaseBlockedResponse()
+      URLProtocol.unregisterClass(AutomatedRevisionLLMProtocol.self)
+      AutomatedRevisionLLMProtocol.configure([])
+    }
+    AutomatedRevisionLLMProtocol.configure([
+      AutomatedRevisionStubResponse(
+        content: response,
+        stream: true,
+        waitForRelease: true
+      ),
+    ])
+
+    await core.prefetchUpcomingBeatBatch(
+      bookID: creation.title,
+      currentChapter: 10,
+      plan: plan
+    )
+    var requestStarted = false
+    for _ in 0..<200 {
+      if AutomatedRevisionLLMProtocol.requestCount() >= 1 {
+        requestStarted = true
+        break
+      }
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    precondition(requestStarted, "后台节拍预取未进入模型请求")
+
+    _ = try await core.invalidateChapterBeats(bookID: creation.title, fromChapter: 11)
+    AutomatedRevisionLLMProtocol.releaseBlockedResponse()
+
+    var prefetchFinished = false
+    for _ in 0..<200 {
+      let inFlight = await core.beatPrefetchInFlight
+      if inFlight.isEmpty {
+        prefetchFinished = true
+        break
+      }
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    precondition(prefetchFinished, "后台节拍预取未在预期时间内结束")
+
+    let after = try await core.fetchChapterBeats(bookID: creation.title)
+    precondition(
+      after.beats.map(\.number) == Array(1...10),
+      "失效后的旧预取结果不得写回：\(after.beats.map(\.number))"
+    )
+    precondition(
+      after.batches.count == 1 && after.batches[0].endChapter == 10,
+      "失效后的旧批次记录不得写回：\(after.batches)"
+    )
+    let events = try await core.fetchDebugEvents(limit: 200).events
+    precondition(
+      events.contains {
+        guard $0.message == "chapter_beats.prefetch.failed",
+              case .string(let error)? = $0.data["error"]
+        else { return false }
+        return error.contains("结果已作废")
+      },
+      "过期预取应记录为可诊断的失败"
+    )
+    print("Beat prefetch invalidation probe passed: stale response fenced before commit")
   }
 
   /// `MACINKOSTOMO_WORKSPACE=$(mktemp -d)` is the documented app-level test
@@ -2204,6 +2472,56 @@ struct NativeCoreSmoke {
       constraints: "不得与原著既有事实冲突"
     ))
 
+    // A line beginning with an ordinal act can still be ordinary narration.
+    // Volume labels are structural and must not become empty searchable chapters.
+    let deceptiveHeadings = """
+      第一章 初雨
+      雨声把屋檐压得很低。
+      第一幕依旧笼在雨里，没有一个人先开口。
+      第二幕则只是他的猜测，并非戏剧标题。
+      第三幕是多年后的回忆，此刻尚未发生。
+      第二章 渡口
+      船老大收起跳板，等潮水回落。
+      第七卷 倒吊人
+      第三章 药铺
+      药柜后只剩最后一包纱布。
+      """
+    let deceptiveSplit = await core.splitSourceChapters(deceptiveHeadings)
+    precondition(deceptiveSplit.strategy == .headings)
+    precondition(
+      deceptiveSplit.chapters.map(\.title) == ["第一章 初雨", "第二章 渡口", "第三章 药铺"],
+      "正文幕次或卷标题不得制造伪章节：\(deceptiveSplit.chapters.map(\.title))"
+    )
+    guard let firstDeceptiveChapter = deceptiveSplit.chapters.first else {
+      preconditionFailure("切章回归夹具缺少第一章")
+    }
+    let deceptiveFirstBody = (deceptiveHeadings as NSString).substring(with: NSRange(
+      location: firstDeceptiveChapter.offset,
+      length: firstDeceptiveChapter.length
+    ))
+    precondition(
+      deceptiveFirstBody.contains("第一幕依旧")
+        && deceptiveFirstBody.contains("第二幕则")
+        && deceptiveFirstBody.contains("第三幕是"),
+      "正文里的幕次句必须完整留在章节正文"
+    )
+
+    // Actual act headings remain supported when the title is visibly delimited,
+    // or when the heading consists solely of the ordinal plus 幕.
+    let validActHeadings = """
+      第一幕：骤雨
+      众人从长廊跑进门厅。
+      第二幕 转折
+      门外的脚步忽然停了。
+      第三幕
+      天亮前，信终于送到。
+      """
+    let validActSplit = await core.splitSourceChapters(validActHeadings)
+    precondition(
+      validActSplit.strategy == .headings && validActSplit.chapters.count == 3,
+      "带分隔符的合法幕标题仍应被识别：\(validActSplit.chapters.map(\.title))"
+    )
+
     // Three chapters of stand-in original prose. Chapter 2 is the retrieval
     // target for both the lexical and the paraphrase query; chapters 1 and 3 are
     // plausible distractors that share topic words but not the answer.
@@ -2230,12 +2548,150 @@ struct NativeCoreSmoke {
     let manifest = try await core.importDerivativeSource(bookID: creation.title, from: sourceFile)
     precondition(manifest.splitStrategy == .headings, "three headings must be used as boundaries")
     precondition(manifest.chapterCount == 3, "expected 3 chapters, got \(manifest.chapterCount)")
+    precondition(
+      manifest.version == SourceManifest.currentVersion && manifest.layoutDigest?.isEmpty == false,
+      "current manifests must bind canon progress to exact chapter boundaries"
+    )
     precondition(manifest.detectedEncoding.hasPrefix("utf-8"), manifest.detectedEncoding)
 
     // Re-import of identical bytes must not rebuild: extraction progress is
     // expensive and a stray second import must not discard it.
     let reimported = try await core.importDerivativeSource(bookID: creation.title, from: sourceFile)
     precondition(reimported.ingestedAt == manifest.ingestedAt, "identical bytes must be a no-op")
+
+    // A canon cursor with the same source bytes but a different chapter layout
+    // must lose only its source-owned layer. The author's overlay digest remains
+    // valid and the cursor restarts at chapter 1.
+    var staleDelta = ContinuityDelta()
+    staleDelta.upsert.entities = [LongFormEntity(
+      id: "ENT-stale-layout",
+      name: "旧切章实体",
+      type: "character"
+    )]
+    _ = try await core.mergeCanonIntoBaseContinuity(
+      bookID: creation.title,
+      delta: staleDelta,
+      source: "切章布局失效测试"
+    )
+    let staleProgress = SourceCanonProgress(
+      version: SourceCanonProgress.currentVersion,
+      bookId: creation.title,
+      sourceDigest: manifest.sourceDigest,
+      sourceLayoutDigest: "obsolete-layout",
+      chapterCount: manifest.chapterCount,
+      prefaceExtracted: true,
+      sourceCoordinatesVersion: SourceCanonProgress.currentSourceCoordinatesVersion,
+      nextChapterIndex: manifest.chapterCount + 1,
+      batches: [],
+      delta: staleDelta,
+      settingsDigest: "keep-author-overlay",
+      updatedAt: "2026-01-01T00:00:00Z"
+    )
+    try JSONEncoder().encode(staleProgress).write(
+      to: derivativeRoot.appendingPathComponent(
+        "book/books/\(creation.title)/source/canon-progress.json"
+      ),
+      options: .atomic
+    )
+    let resetStatus = try await core.derivativeCanonStatus(bookID: creation.title)
+    precondition(
+      resetStatus.extractedChapters == 0 && !resetStatus.isComplete,
+      "chapter-layout changes must restart canon extraction: \(resetStatus)"
+    )
+    let resetPlan = try await core.fetchLongFormPlan(bookID: creation.title)
+    precondition(
+      !resetPlan.continuity.entities.contains { $0.id == "ENT-stale-layout" },
+      "stale source canon must be removed when its layout changes"
+    )
+    let resetProgress = try await core.loadCanonProgress(bookID: creation.title, manifest: manifest)
+    precondition(resetProgress.sourceLayoutDigest == manifest.layoutDigest)
+    precondition(resetProgress.settingsDigest == "keep-author-overlay")
+
+    // Vector totals alone used to report this index as complete even after a bad
+    // heading left a manifest chapter with no passage. Corrupt one chapter in the
+    // temporary fixture and assert that the preparation snapshot rejects it.
+    let indexPath = derivativeRoot.appendingPathComponent(
+      "book/books/\(creation.title)/source/passages.sqlite"
+    ).path
+    try executeSQLite(indexPath, sql: "DELETE FROM passages WHERE chapterIndex = 2;")
+    var incompleteIndexRejected = false
+    do {
+      _ = try await core.derivativePreparationSnapshot(bookID: creation.title)
+    } catch {
+      incompleteIndexRejected = error.localizedDescription.contains("检索索引不完整")
+    }
+    precondition(incompleteIndexRejected, "缺 passage 的旧索引不得通过写作准备门禁")
+
+    // Selecting the same source again is no longer a no-op when its stored index
+    // is incomplete; it deterministically rebuilds all three SQLite tables.
+    _ = try await core.importDerivativeSource(bookID: creation.title, from: sourceFile)
+    let rebuiltStatus = try await core.derivativeSourceEmbeddingStatus(bookID: creation.title)
+    precondition(rebuiltStatus.total >= 3, "same-source re-import must rebuild missing passages")
+
+    // Equal chapter counts and passage keys do not prove that the database belongs
+    // to this manifest. A stale source fingerprint must fail the same readiness gate,
+    // then a same-source re-import must rebuild it without touching canon progress.
+    try executeSQLite(
+      indexPath,
+      sql: "UPDATE meta SET value = 'stale-source-digest' WHERE key = 'sourceDigest';"
+    )
+    var staleFingerprintRejected = false
+    do {
+      _ = try await core.derivativePreparationSnapshot(bookID: creation.title)
+    } catch {
+      staleFingerprintRejected = error.localizedDescription.contains("索引指纹不一致")
+    }
+    precondition(
+      staleFingerprintRejected,
+      "旧索引即使章节数和 passage key 完整，也不得通过 manifest 指纹门禁"
+    )
+    _ = try await core.importDerivativeSource(bookID: creation.title, from: sourceFile)
+    let fingerprintRebuilt = try await core.derivativeSourceEmbeddingStatus(
+      bookID: creation.title
+    )
+    precondition(fingerprintRebuilt.total == rebuiltStatus.total)
+
+    // Commit is deliberately interrupted after the new original and SQLite file
+    // land but before manifest.json. The old directory snapshot must restore all
+    // three as one generation; fingerprint validation proves the database was not
+    // left paired with either the replacement prose or its manifest.
+    let replacementText = original.replacingOccurrences(of: "渡口", with: "码头")
+    let rollbackFixture = derivativeRoot.appendingPathComponent("rollback-fixture.txt")
+    try Data(replacementText.utf8).write(to: rollbackFixture, options: .atomic)
+    var stagedCommitFailed = false
+    do {
+      _ = try await core.importDerivativeSource(
+        bookID: creation.title,
+        from: rollbackFixture,
+        testingFailureAfterInstalledFiles: 2
+      )
+    } catch {
+      stagedCommitFailed = error.localizedDescription.contains("测试故障注入")
+    }
+    precondition(stagedCommitFailed, "staging 提交故障必须进入回滚路径")
+    let sourceDirectory = derivativeRoot.appendingPathComponent(
+      "book/books/\(creation.title)/source",
+      isDirectory: true
+    )
+    let restoredManifest = try JSONDecoder().decode(
+      SourceManifest.self,
+      from: Data(contentsOf: sourceDirectory.appendingPathComponent("manifest.json"))
+    )
+    let restoredOriginal = try String(
+      contentsOf: sourceDirectory.appendingPathComponent("original.txt"),
+      encoding: .utf8
+    )
+    precondition(restoredManifest.sourceDigest == manifest.sourceDigest)
+    precondition(restoredOriginal == original)
+    _ = try await core.derivativeSourceEmbeddingStatus(bookID: creation.title)
+    let transactionDebris = try FileManager.default.contentsOfDirectory(
+      at: sourceDirectory.deletingLastPathComponent(),
+      includingPropertiesForKeys: nil
+    ).filter {
+      $0.lastPathComponent.hasPrefix(".source-import-")
+        || $0.lastPathComponent.hasPrefix(".source-rollback-")
+    }
+    precondition(transactionDebris.isEmpty, "staging/rollback 临时目录必须清理：\(transactionDebris)")
 
     // A GB18030 novel decoded as UTF-8 yields U+FFFD rather than throwing, so the
     // scorer — not a first-success loop — is what keeps the text intact.
@@ -2285,6 +2741,21 @@ struct NativeCoreSmoke {
       "retrieved text must not carry tokenizer spacing: \(ferryHit.text.prefix(40))"
     )
 
+    // The original is fully indexed before a derivative begins. A timeline-aware
+    // caller must be able to keep a later source chapter out of both FTS tables,
+    // rather than leaking that future passage into a writing prompt.
+    let beforeFerry = try await core.retrieveDerivativeContext(
+      bookID: creation.title,
+      keys: ["渡口"],
+      query: nil,
+      limit: 5,
+      maximumSourceChapter: 1
+    )
+    precondition(
+      beforeFerry.isEmpty,
+      "maximumSourceChapter must exclude lexical hits from future chapter 2: \(beforeFerry.map(\.chapterIndex))"
+    )
+
     // FTS5 operator words and quotes arrive from beat cards; they must be
     // neutralized as phrases rather than parsed as syntax.
     let hostile = try await core.retrieveDerivativeContext(
@@ -2318,6 +2789,18 @@ struct NativeCoreSmoke {
       precondition(
         paraphrase.allSatisfy { $0.lexicalRank == nil },
         "no key was supplied, so every hit must come from the semantic half alone"
+      )
+
+      let beforeFerrySemantic = try await core.retrieveDerivativeContext(
+        bookID: creation.title,
+        keys: [],
+        query: "明天早晨过河的班次名额有限，负责摆渡的人不肯通融",
+        limit: 3,
+        maximumSourceChapter: 1
+      )
+      precondition(
+        beforeFerrySemantic.allSatisfy { $0.chapterIndex <= 1 },
+        "maximumSourceChapter must exclude semantic future passages: \(beforeFerrySemantic.map(\.chapterIndex))"
       )
 
       // Keys absent from the source must return nothing rather than the semantic
@@ -2364,6 +2847,26 @@ struct NativeCoreSmoke {
     _ = try await core.deleteBook(id: creation.title)
   }
 
+  private static func executeSQLite(_ path: String, sql: String) throws {
+    var database: OpaquePointer?
+    guard sqlite3_open_v2(
+      path,
+      &database,
+      SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX,
+      nil
+    ) == SQLITE_OK else {
+      defer { sqlite3_close(database) }
+      throw InkOSCoreError("测试 SQLite 打开失败", statusCode: 500)
+    }
+    defer { sqlite3_close(database) }
+    var message: UnsafeMutablePointer<CChar>?
+    guard sqlite3_exec(database, sql, nil, nil, &message) == SQLITE_OK else {
+      let detail = message.map { String(cString: $0) } ?? "unknown"
+      sqlite3_free(message)
+      throw InkOSCoreError("测试 SQLite 执行失败：\(detail)", statusCode: 500)
+    }
+  }
+
   /// Canon extraction over an imported original: batching, checkpointed resume,
   /// per-batch failure containment, chapter renumbering, and overlay precedence.
   ///
@@ -2385,7 +2888,7 @@ struct NativeCoreSmoke {
       platform: "tomato",
       kind: .derivative,
       sourceTitle: "测试原著标题",
-      timelineAnchorLabel: "主线锚点事件",
+      timelineAnchorLabel: "序章锚点事件",
       timelineStartDayOffset: -30,
       targetChapters: 2,
       chapterWords: 1_000,
@@ -2426,8 +2929,8 @@ struct NativeCoreSmoke {
     // split them across three calls. A fixture small enough to fit one batch would
     // assert nothing about resume.
     let filler = String(repeating: "他沿着江堤往北走，雨一直没停。", count: 1_800)
-    let preface = "作者序言：" + String(
-      repeating: "这段前言应保留供检索，但不占正文章号。",
+    let preface = "作者序言：序章锚点事件发生。" + String(
+      repeating: "这段前言应保留供检索和正典抽取，但不占正文章号。",
       count: 12
     )
     let original = preface + "\n\n" + (1...3)
@@ -2452,8 +2955,8 @@ struct NativeCoreSmoke {
     let initialPreparation = try await core.derivativePreparationSnapshot(bookID: bookID)
     precondition(!initialPreparation.isComplete && !initialPreparation.overlayComplete)
 
-    // Batch planning is pure: assert it directly rather than inferring it from
-    // how many stub responses got consumed.
+    // Numeric chapter planning remains independent from the retained preface.
+    // The extraction calls below verify that index 0 is scheduled first.
     let plans = await core.planCanonBatches(chapters: manifest.chapters, from: 1)
     precondition(plans.count == 3, "每章都超过半个预算，应切成 3 批，实际 \(plans.count)")
     precondition(plans[0].chapters.count == 1 && plans[0].index == 1)
@@ -2466,20 +2969,75 @@ struct NativeCoreSmoke {
     precondition(resumed.count == 1, "从第 3 章续跑只应剩 1 批")
     precondition(resumed[0].index == 3, "续跑的批次号必须接着 checkpoint，不能从 1 重开")
 
+    // A v1 checkpoint may have advanced its numeric cursor without ever recording
+    // the retained index-0 preface. Resume must schedule that preface alone, then
+    // jump directly to the cursor instead of reading the skipped chapters again.
+    let legacyResume = SourceCanonProgress(
+      version: SourceCanonProgress.currentVersion,
+      bookId: bookID,
+      sourceDigest: manifest.sourceDigest,
+      sourceLayoutDigest: manifest.layoutDigest,
+      chapterCount: manifest.chapterCount,
+      prefaceExtracted: false,
+      sourceCoordinatesVersion: SourceCanonProgress.currentSourceCoordinatesVersion,
+      nextChapterIndex: 3,
+      batches: [],
+      delta: ContinuityDelta(),
+      settingsDigest: nil,
+      updatedAt: "2026-01-01T00:00:00Z"
+    )
+    let legacyPlans = await core.planPendingCanonBatches(
+      manifest: manifest,
+      progress: legacyResume
+    )
+    precondition(
+      legacyPlans.count == 2
+        && legacyPlans[0].chapters.map(\.index) == [0]
+        && legacyPlans[1].chapters.map(\.index) == [3],
+      "旧 checkpoint 恢复时卷首必须独立，且正文直接从游标续跑：\(legacyPlans)"
+    )
+
     URLProtocol.registerClass(AutomatedRevisionLLMProtocol.self)
     defer {
       URLProtocol.unregisterClass(AutomatedRevisionLLMProtocol.self)
       AutomatedRevisionLLMProtocol.configure([])
     }
 
+    let prefaceBatch = """
+      {"upsert":{
+        "entities":[{"id":"ENT-lin","name":"林辰","type":"character"}],
+        "timeline":[{"id":"TL-preface-anchor","label":"序章锚点事件发生","sourceDay":0,"sourceChapter":0}]}}
+      """
+    AutomatedRevisionLLMProtocol.configure([
+      AutomatedRevisionStubResponse(content: prefaceBatch, stream: false),
+    ])
+
+    let prefaceOnly = try await core.extractDerivativeCanon(bookID: bookID, maxBatches: 1)
+    precondition(
+      prefaceOnly.extractedChapters == 0 && !prefaceOnly.isComplete && prefaceOnly.batchCount == 1,
+      "卷首抽取只能推进卷首 checkpoint，不能虚增正文章节：\(prefaceOnly)"
+    )
+    let prefacePrompt = AutomatedRevisionLLMProtocol.observedPrompts().first ?? ""
+    precondition(prefacePrompt.contains("序章锚点事件"), "卷首锚点必须进入抽取提示词")
+    let afterPreface = try await core.fetchLongFormPlan(bookID: bookID)
+    guard let prefaceMilestone = afterPreface.continuity.timeline.first(where: { $0.id == "TL-preface-anchor" })
+    else { preconditionFailure("卷首锚点没有进入正典") }
+    precondition(
+      prefaceMilestone.sourceChapter == 0 && prefaceMilestone.sourceDay == 0,
+      "卷首锚点必须保留 sourceChapter=0 与全局 sourceDay：\(prefaceMilestone)"
+    )
+
     // The model answers in *source* chapter numbers throughout: chapter 180 for a
     // knowledge boundary, 240 for a hook, a timeline entry at order 7. All three
-    // are out of range for a 2-chapter derivative book.
+    // are out of range for a 2-chapter derivative book. It also gives 林辰 a new
+    // ID and a conflicting type: source extraction must retain ENT-lin/character.
     let batchOne = """
       {"upsert":{
         "immutableCanon":[{"id":"CANON-river","category":"world","statement":"江面在雨季会涨"}],
         "worldRules":[{"id":"RULE-ferry","statement":"渡船每日只发两班"}],
-        "entities":[{"id":"ENT-lin","name":"林辰","type":"character","owner":"甲"}],
+        "entities":[
+          {"id":"ENT-lin-renamed","name":" 林 辰 ","type":"object","owner":"甲"},
+          {"id":"ENT-lin","name":"船老大","type":"character","location":"渡口"}],
         "knowledgeBoundaries":[{"factId":"KNOW-seal","statement":"红戳的含义只有船老大知道",
           "allowedKnowers":["船老大"],"availableFromChapter":180,"revealByChapter":200}],
         "timeline":[{"id":"TL-flood","label":"江水第一次上涨","order":7,"sourceDay":0,
@@ -2491,16 +3049,16 @@ struct NativeCoreSmoke {
       AutomatedRevisionStubResponse(content: batchOne, stream: false),
     ])
 
-    // One batch only: the UI extracts incrementally, and the cap is what makes a
-    // partial run observable.
+    // One numeric batch only: the UI extracts incrementally, and the cap is what
+    // makes a partial run observable after the preface checkpoint has landed.
     let first = try await core.extractDerivativeCanon(bookID: bookID, maxBatches: 1)
     precondition(first.extractedChapters == 1, "应只抽完第 1 章，实际 \(first.extractedChapters)")
     precondition(!first.isComplete, "3 章里只抽了 1 章，不能报完成")
-    precondition(first.entityCount == 1 && first.canonCount == 1)
-    precondition(first.batchCount == 1)
+    precondition(first.entityCount == 2 && first.canonCount == 1)
+    precondition(first.batchCount == 2)
     let firstPrompt = AutomatedRevisionLLMProtocol.observedPrompts().first ?? ""
     precondition(firstPrompt.contains("原著《测试原著标题》"), "抽取提示词必须使用原著标题")
-    precondition(firstPrompt.contains("主线锚点事件"), "抽取提示词必须说明全局时间锚点")
+    precondition(firstPrompt.contains("序章锚点事件"), "抽取提示词必须说明全局时间锚点")
     precondition(
       firstPrompt.contains("不得把当前批次最早事件重置为第 0 天"),
       "sourceDay 不能在每个批次重新起算"
@@ -2534,6 +3092,29 @@ struct NativeCoreSmoke {
       milestone.sourceDay == nil,
       "不含全局锚点的批次即使输出 sourceDay 也必须丢弃"
     )
+    let linAfterFirst = afterFirst.continuity.entities.filter {
+      $0.name == "林辰" || $0.name == " 林 辰 "
+    }
+    precondition(
+      linAfterFirst.count == 1
+        && linAfterFirst[0].id == "ENT-lin"
+        && linAfterFirst[0].type == "character"
+        && linAfterFirst[0].owner == "甲",
+      "同名实体必须保留首个 canonical ID/type 并合并新属性：\(linAfterFirst)"
+    )
+    let boatAfterFirst = afterFirst.continuity.entities.filter { $0.name == "船老大" }
+    precondition(
+      boatAfterFirst.count == 1
+        && boatAfterFirst[0].id == "ENT-lin-2"
+        && boatAfterFirst[0].location == "渡口",
+      "同 ID、异名实体必须稳定重映射并保留为独立正典：\(boatAfterFirst)"
+    )
+    let debugURL = canonRoot.appendingPathComponent("data/debug/events.jsonl")
+    let debugText = try String(contentsOf: debugURL, encoding: .utf8)
+    precondition(
+      debugText.contains("canon.entity.type_conflict") && debugText.contains("ENT-lin-renamed"),
+      "类型冲突必须记录 warning/debug，不能静默生成第二实体"
+    )
 
     // A batch that never returns parseable JSON must not roll back the batch that
     // already landed. Both attempts are stubbed, so the pass exhausts its retries.
@@ -2564,7 +3145,8 @@ struct NativeCoreSmoke {
       "失败的一批不能回滚已完成的进度，实际 \(afterFailure.extractedChapters)"
     )
 
-    // Resume: the remaining two batches complete, and chapter 1 is not re-read.
+    // Resume: the remaining two numeric batches complete; neither preface nor
+    // chapter 1 is re-read.
     AutomatedRevisionLLMProtocol.configure([
       AutomatedRevisionStubResponse(
         content: """
@@ -2586,7 +3168,7 @@ struct NativeCoreSmoke {
       complete.extractedChapters == 3,
       "应抽完 3 章，实际 \(complete.extractedChapters)"
     )
-    precondition(complete.batchCount == 3, "批次数应为 3，实际 \(complete.batchCount)")
+    precondition(complete.batchCount == 4, "批次数应为卷首加 3 章，实际 \(complete.batchCount)")
     precondition(complete.entityCount == 3, "三批共 3 个实体，实际 \(complete.entityCount)")
     precondition(
       AutomatedRevisionLLMProtocol.requestCount() == 2,
@@ -2599,19 +3181,24 @@ struct NativeCoreSmoke {
     guard let anchored = afterResume.continuity.timeline.first(where: { $0.id == "TL-depart" })
     else { preconditionFailure("锚点批次的时间线没有进入正典") }
     precondition(
-      anchored.sourceDay == 0 && anchored.sourceChapter == 2,
-      "含全局锚点的批次应保留模型给出的全局 sourceDay/sourceChapter"
+      anchored.sourceDay == nil && anchored.sourceChapter == 2,
+      "不含卷首全局锚点的批次必须丢弃 sourceDay，但保留 sourceChapter"
+    )
+    let boatAfterResume = afterResume.continuity.entities.filter { $0.name == "船老大" }
+    precondition(
+      boatAfterResume.count == 1 && boatAfterResume[0].id == "ENT-lin-2",
+      "后续批次的同名实体必须继续命中已重映射的 canonical ID：\(boatAfterResume)"
     )
 
-    let retrievalKeys = await core.derivativeRetrievalKeys(
+    let retrievalKeys = try await core.derivativeRetrievalKeys(
+      bookID: bookID,
       beat: ChapterBeat(
         number: 1,
         goal: "林辰去药店老板处确认物资",
         scenes: ["船老大在渡口拦住林辰"],
         requiredEvents: ["药店老板交出清单"],
         focusCharacters: ["林辰"]
-      ),
-      plan: afterResume
+      )
     )
     precondition(
       retrievalKeys.contains("林辰")
@@ -2623,7 +3210,7 @@ struct NativeCoreSmoke {
     // A completed pass is a no-op and costs no calls.
     AutomatedRevisionLLMProtocol.configure([])
     let again = try await core.extractDerivativeCanon(bookID: bookID)
-    precondition(again.isComplete && again.batchCount == 3)
+    precondition(again.isComplete && again.batchCount == 4)
     precondition(
       AutomatedRevisionLLMProtocol.requestCount() == 0,
       "已完成的抽取不应再发请求"
@@ -2664,6 +3251,51 @@ struct NativeCoreSmoke {
       "正典完成且 overlay 已登记后，持久化准备状态应完整"
     )
 
+    // v1.2 books predate preparation.json. A missing file is recoverable from
+    // the source and checkpoint; an existing malformed file is data corruption.
+    let preparationURL = canonRoot.appendingPathComponent(
+      "book/books/\(bookID)/source/preparation.json"
+    )
+    let savedPreparation = try Data(contentsOf: preparationURL)
+    try fileManager.removeItem(at: preparationURL)
+    let legacyPreparation = try await core.derivativePreparationSnapshot(bookID: bookID)
+    precondition(
+      legacyPreparation.intent.settingsText.isEmpty
+        && legacyPreparation.intent.embedRequested
+        && legacyPreparation.overlayComplete,
+      "旧版缺失 preparation.json 时必须合成可续跑 intent：\(legacyPreparation)"
+    )
+    try Data("{".utf8).write(to: preparationURL, options: .atomic)
+    do {
+      _ = try await core.derivativePreparationSnapshot(bookID: bookID)
+      preconditionFailure("损坏的 preparation.json 必须报告格式错误")
+    } catch let error as InkOSCoreError {
+      precondition(
+        error.statusCode == 503 && error.message.contains("格式错误"),
+        "损坏准备记录应返回可诊断的 503：\(error)"
+      )
+    }
+    try savedPreparation.write(to: preparationURL, options: .atomic)
+
+    // A damaged canon checkpoint must stop preparation with a diagnostic. Treating
+    // it as a fresh pass would silently discard a long extraction and duplicate its
+    // already-projected facts.
+    let canonProgressURL = canonRoot.appendingPathComponent(
+      "book/books/\(bookID)/source/canon-progress.json"
+    )
+    let savedCanonProgress = try Data(contentsOf: canonProgressURL)
+    try Data("{".utf8).write(to: canonProgressURL, options: .atomic)
+    do {
+      _ = try await core.derivativeCanonStatus(bookID: bookID)
+      preconditionFailure("损坏的 canon-progress.json 必须报告格式错误")
+    } catch let error as InkOSCoreError {
+      precondition(
+        error.statusCode == 503 && error.message.contains("正典进度格式错误"),
+        "损坏正典进度应返回可诊断的 503：\(error)"
+      )
+    }
+    try savedCanonProgress.write(to: canonProgressURL, options: .atomic)
+
     // The override lives in `manualOverlay`, not in the extracted base: a later
     // re-extraction must not be able to win the owner back.
     let projectionURL = canonRoot.appendingPathComponent(
@@ -2696,9 +3328,25 @@ struct NativeCoreSmoke {
 
     // Re-importing the same original keeps the checkpoint; different bytes drop it,
     // because the progress describes a source that no longer exists.
+    let boundBeforeReplacement = await core.resolvedDerivativeTimeline(
+      bookID: bookID,
+      continuity: afterOverlay.continuity
+    )
+    precondition(
+      boundBeforeReplacement.anchorMilestoneID == "TL-preface-anchor"
+        && boundBeforeReplacement.anchorSourceChapter == 0,
+      "原著替换夹具需要先持久化已绑定锚点：\(boundBeforeReplacement)"
+    )
+    _ = try await core.saveDerivativeTimeline(bookID: bookID, boundBeforeReplacement)
     _ = try await core.importDerivativeSource(bookID: bookID, from: sourceFile)
     let afterSameImport = try await core.derivativeCanonStatus(bookID: bookID)
     precondition(afterSameImport.isComplete, "同字节重导入不应清掉抽取进度")
+    let unchangedTimeline = await core.loadDerivativeTimeline(bookID: bookID)
+    precondition(
+      unchangedTimeline.anchorMilestoneID == "TL-preface-anchor"
+        && unchangedTimeline.anchorSourceChapter == 0,
+      "同字节重导入不应清除有效锚点"
+    )
     let replacement = canonRoot.appendingPathComponent("canon-fixture-2.txt")
     try Data((original + "\n\n第4章 新增\n\n\(filler)").utf8).write(to: replacement, options: .atomic)
     _ = try await core.importDerivativeSource(bookID: bookID, from: replacement)
@@ -2716,8 +3364,36 @@ struct NativeCoreSmoke {
       afterReplacementPlan.continuity.entities.contains { $0.id == "ENT-lin" && $0.owner == "乙" },
       "换原著只能清 baseContinuity，作者 manualOverlay 必须保留"
     )
+    let clearedTimeline = await core.loadDerivativeTimeline(bookID: bookID)
+    precondition(
+      clearedTimeline.anchorMilestoneID == nil
+        && clearedTimeline.anchorSourceChapter == nil
+        && clearedTimeline.anchorLabel == "序章锚点事件"
+        && clearedTimeline.startDayOffset == -30,
+      "换源必须只清派生绑定并保留用户时间轴输入：\(clearedTimeline)"
+    )
+    var replacementContinuity = LongFormContinuity()
+    replacementContinuity.timeline = [
+      LongFormTimelineMilestone(
+        id: "TL-replacement-anchor",
+        order: 1,
+        label: "序章锚点事件重新发生",
+        earliestChapter: 1,
+        latestChapter: 1,
+        sourceChapter: 4
+      ),
+    ]
+    let replacementBinding = await core.resolvedDerivativeTimeline(
+      bookID: bookID,
+      continuity: replacementContinuity
+    )
+    precondition(
+      replacementBinding.anchorMilestoneID == "TL-replacement-anchor"
+        && replacementBinding.anchorSourceChapter == 4,
+      "清除旧绑定后应按保留的标签绑定新原著：\(replacementBinding)"
+    )
 
-    print("Canon extraction probe passed: 3 batches, resume + overlay precedence")
+    print("Canon extraction probe passed: preface + 3 batches, entity de-dup + resume + overlay precedence")
     _ = try await core.deleteBook(id: bookID)
   }
 
@@ -3047,6 +3723,497 @@ struct NativeCoreSmoke {
   /// classification. The assertions below pin all three buckets, the day summation that
   /// feeds them, and the source-chapter fallback that covers the (common) case of a
   /// source that never states a date.
+  /// Prompt integration for derivative writing. The source's second chapter is
+  /// deliberately future-only at derivative chapter 1, so the same assertion
+  /// covers timeline gating and the RAG upper bound in generation, revision and
+  /// independent review prompts.
+  private static func assertDerivativePromptCoverage(root: URL) async throws {
+    let promptRoot = root.appendingPathComponent("derivative-prompt-coverage", isDirectory: true)
+    let core = InkOSCore(rootURL: promptRoot)
+    let creation = try await core.createBook(CreateBookRequest(
+      title: "同人提示词链路测试书",
+      language: "zh",
+      genre: "fanfic",
+      platform: "tomato",
+      kind: .derivative,
+      sourceTitle: "提示词原著",
+      timelineAnchorLabel: "城门警讯",
+      timelineStartDayOffset: -1,
+      targetChapters: 1,
+      chapterWords: 1_000,
+      totalWords: "1000",
+      targetTotalWords: 1_000,
+      volumeCount: 1,
+      chapterWordTolerance: 10,
+      premise: "验证同人写作提示词的时间门与检索门。",
+      characters: "主角在原著事件前巡查城门。",
+      protagonistProfile: "主角谨慎，会在紧张时反复检查城门；缺陷是过度怀疑。",
+      protagonistReviewed: true,
+      worldbuilding: "城门外有旧驿道。",
+      outline: "第一章只巡查城门外。",
+      volumePlan: "第一卷第1章。",
+      pacing: "一章只推进一次巡查。",
+      style: "第三人称有限视角。",
+      constraints: "不得提前获知原著城门警讯。"
+    ))
+    let bookID = creation.title
+    let config: [String: Any] = [
+      "provider": "openai",
+      "model": "writer-test",
+      "reviewModel": "review-test",
+      "extractionModel": "extraction-test",
+      "baseUrl": "http://127.0.0.1:8765/v1",
+      "reviewBaseUrl": "http://127.0.0.1:8765/v1",
+      "apiKey": "test-key",
+      "reviewApiKey": "test-key",
+      "stream": false,
+      "thinkingBudget": 0,
+      "apiFormat": "chat",
+    ]
+    try JSONSerialization.data(withJSONObject: config)
+      .write(to: promptRoot.appendingPathComponent("data/inkos-config.json"), options: .atomic)
+
+    let pastMarker = "已发生独特原文必须注入"
+    let futureMarker = "未来独特原文禁止泄漏"
+    let original = """
+      第一章 城外巡查
+
+      原著守卫沿着城门外的旧驿道巡查，确认吊桥铁链没有松动。\(pastMarker)。
+
+      第二章 警讯
+
+      城门警讯在午夜响起。\(futureMarker)。原著守卫随后才知道密令内容。
+
+      第三章 余波
+
+      警讯之后，城门守军开始核对值夜名册。
+      """
+    let source = promptRoot.appendingPathComponent("prompt-fixture.txt")
+    try Data(original.utf8).write(to: source, options: .atomic)
+    let manifest = try await core.importDerivativeSource(bookID: bookID, from: source)
+    precondition(manifest.chapterCount == 3)
+    _ = try await core.saveDerivativePreparationIntent(
+      bookID: bookID,
+      settingsText: "衍生故事开篇只允许巡查旧驿道。",
+      embedRequested: false
+    )
+
+    URLProtocol.registerClass(AutomatedRevisionLLMProtocol.self)
+    defer {
+      URLProtocol.unregisterClass(AutomatedRevisionLLMProtocol.self)
+      AutomatedRevisionLLMProtocol.configure([])
+    }
+
+    let canon = """
+      {"upsert":{"entities":[{"id":"ENT-guard","name":"原著守卫","type":"character"}],"timeline":[{"id":"TL-gate-alert","label":"城门警讯","sourceDay":0,"sourceChapter":2}]}}
+      """
+    AutomatedRevisionLLMProtocol.configure([
+      AutomatedRevisionStubResponse(content: canon, stream: false),
+    ])
+    let canonStatus = try await core.extractDerivativeCanon(bookID: bookID)
+    precondition(canonStatus.isComplete, "短源文抽取必须完成")
+
+    AutomatedRevisionLLMProtocol.configure([
+      AutomatedRevisionStubResponse(content: "{\"upsert\":{}}", stream: false),
+    ])
+    _ = try await core.extractDerivativeSettingsOverlay(
+      bookID: bookID,
+      settingsText: "衍生故事开篇只允许巡查旧驿道。"
+    )
+    let preparation = try await core.derivativePreparationSnapshot(bookID: bookID)
+    precondition(preparation.isComplete, "写作前必须完成正典、设定与索引准备：\(preparation)")
+
+    let plan = try await core.fetchLongFormPlan(bookID: bookID)
+    var staleTimeline = await core.loadDerivativeTimeline(bookID: bookID)
+    staleTimeline.anchorMilestoneID = "TL-overlay-shadow"
+    staleTimeline.anchorSourceChapter = 999
+    _ = try await core.saveDerivativeTimeline(bookID: bookID, staleTimeline)
+
+    // A stale persisted chapter and a same-name author overlay are not proof that
+    // the current original contains the anchor. Preparation is otherwise complete,
+    // so this reaches the anchor gate rather than failing an earlier prerequisite.
+    let projectionURL = promptRoot.appendingPathComponent(
+      "book/books/\(bookID)/story/runtime/continuity-projection.json"
+    )
+    let planURL = promptRoot.appendingPathComponent("book/books/\(bookID)/long-form-plan.json")
+    let savedProjectionData = try Data(contentsOf: projectionURL)
+    let savedPlanData = try Data(contentsOf: planURL)
+    var overlayOnlyProjection = try JSONDecoder().decode(
+      ContinuityProjection.self,
+      from: savedProjectionData
+    )
+    overlayOnlyProjection.baseContinuity.timeline = []
+    overlayOnlyProjection.manualOverlay.upsert.timeline = [
+      LongFormTimelineMilestone(
+        id: "TL-overlay-shadow",
+        order: 1,
+        label: "城门警讯",
+        earliestChapter: 1,
+        latestChapter: 1
+      ),
+    ]
+    overlayOnlyProjection.continuity.timeline = overlayOnlyProjection.manualOverlay.upsert.timeline
+    try JSONEncoder().encode(overlayOnlyProjection).write(to: projectionURL, options: .atomic)
+    do {
+      try await core.validateDerivativePreparationForWriting(
+        bookID: bookID,
+        plan: plan
+      )
+      preconditionFailure("同名 overlay 与陈旧章号不得通过原著锚点门禁")
+    } catch let error as InkOSCoreError {
+      precondition(
+        error.statusCode == 409 && error.message.contains("时间锚点"),
+        "锚点门禁应指出当前原著没有匹配事件：\(error)"
+      )
+    }
+    try savedProjectionData.write(to: projectionURL, options: .atomic)
+    try savedPlanData.write(to: planURL, options: .atomic)
+    try await core.validateDerivativePreparationForWriting(bookID: bookID, plan: plan)
+    let reboundTimeline = await core.resolvedDerivativeTimeline(
+      bookID: bookID,
+      continuity: plan.continuity
+    )
+    precondition(
+      reboundTimeline.anchorMilestoneID == "TL-gate-alert"
+        && reboundTimeline.anchorSourceChapter == 2,
+      "陈旧绑定必须按当前原著标签重绑：\(reboundTimeline)"
+    )
+
+    let semanticOnlyBeat = ChapterBeat(
+      number: 1,
+      goal: "陌生人沿旧驿道检查吊桥铁链",
+      scenes: ["陌生人在城门外停下检查"],
+      requiredEvents: ["确认铁链未松动"],
+      endingHook: "远处传来未辨明的风声",
+      focusCharacters: ["衍生主角"],
+      timeSpan: "半夜",
+      setback: "风声让他误判动静",
+      notes: "不得出现警讯"
+    )
+    let semanticOnlyKeys = try await core.derivativeRetrievalKeys(
+      bookID: bookID,
+      beat: semanticOnlyBeat
+    )
+    precondition(
+      semanticOnlyKeys.isEmpty,
+      "本章没有原著实体时应只靠非空 query 触发检索：\(semanticOnlyKeys)"
+    )
+    let lateEntityText = String(repeating: "衍生角色沿路核对铁链。", count: 80)
+      + "直到章末，他才听到原著守卫的脚步声。"
+    let lateEntityKeys = try await core.derivativeRetrievalKeys(
+      bookID: bookID,
+      beat: semanticOnlyBeat,
+      narrativeText: lateEntityText
+    )
+    precondition(
+      lateEntityKeys == ["原著守卫"],
+      "审阅与修订必须扫描完整正文中的原著实体：\(lateEntityKeys)"
+    )
+    let boundedLateQuery = await core.boundedDerivativeRetrievalQuery(lateEntityText)
+    precondition(
+      boundedLateQuery.count == 200
+        && boundedLateQuery.hasPrefix("衍生角色")
+        && boundedLateQuery.hasSuffix("原著守卫的脚步声。"),
+      "语义检索查询应同时保留正文首尾"
+    )
+    let semanticOnlyPrompt = try await core.generationPrompt(
+      bookID: bookID,
+      chapterNumber: 1,
+      guidance: "沿旧驿道巡查，不得谈及警讯。",
+      beat: semanticOnlyBeat,
+      plan: plan
+    )
+    precondition(
+      semanticOnlyPrompt.contains("【原著正典检索结果】"),
+      "空 lexical key + 非空 query 仍必须触发检索段落"
+    )
+    precondition(!semanticOnlyPrompt.contains(futureMarker), "语义检索不得越过未来章节上界")
+
+    let beat = ChapterBeat(
+      number: 1,
+      goal: "原著守卫沿旧驿道检查吊桥铁链",
+      scenes: ["原著守卫在城门外停下检查"],
+      requiredEvents: ["确认铁链未松动"],
+      endingHook: "远处传来未辨明的风声",
+      focusCharacters: ["原著守卫"],
+      timeSpan: "半夜",
+      setback: "风声让他误判动静",
+      notes: "不得出现警讯"
+    )
+    let keys = try await core.derivativeRetrievalKeys(bookID: bookID, beat: beat)
+    precondition(keys == ["原著守卫"], "原著实体必须成为词法检索键：\(keys)")
+    let timeline = await core.resolvedDerivativeTimeline(bookID: bookID, continuity: plan.continuity)
+    let status = await core.derivativeTimelineStatus(
+      bookID: bookID,
+      chapterNumber: 1,
+      continuity: plan.continuity,
+      timeline: timeline
+    )
+    let retrievalMaximum = await core.derivativeRetrievalMaximumSourceChapter(
+      status: status,
+      timeline: timeline
+    )
+    precondition(retrievalMaximum == 1, "开篇早于第 2 章锚点时，检索必须截止第 1 章")
+
+    let generation = try await core.generationPrompt(
+      bookID: bookID,
+      chapterNumber: 1,
+      guidance: "沿旧驿道巡查，不得谈及警讯。",
+      beat: beat,
+      plan: plan
+    )
+    assertDerivativePromptSections(
+      generation,
+      pastMarker: pastMarker,
+      futureMarker: futureMarker,
+      label: "生成"
+    )
+
+    let emptyDelta: [String: Any] = [
+      "upsert": [
+        "immutableCanon": [], "worldRules": [], "entities": [],
+        "knowledgeBoundaries": [], "timeline": [], "hooks": [],
+      ],
+      "remove": [
+        "immutableCanon": [], "worldRules": [], "entities": [],
+        "knowledgeBoundaries": [], "timeline": [], "hooks": [],
+      ],
+    ]
+    let candidateDelta = try await core.normalizedConsistencyDelta(emptyDelta, chapterNumber: 1)
+    let draft = String(repeating: "他沿旧驿道摸过湿冷的铁链，手指发麻仍逐节确认，最后听见城墙上有人咳嗽。", count: 29)
+      + "直到末段，原著守卫才从驿道另一头现身。"
+
+    AutomatedRevisionLLMProtocol.configure([
+      AutomatedRevisionStubResponse(
+        content: "{\"pass\":true,\"summary\":\"通过\",\"issues\":[],\"revisionGuidance\":\"\"}",
+        stream: true
+      ),
+    ])
+    _ = try await core.reviewChapter(
+      bookID: bookID,
+      chapterNumber: 1,
+      title: "旧驿道",
+      content: draft,
+      candidateDelta: candidateDelta,
+      beat: beat
+    )
+    guard let reviewPrompt = AutomatedRevisionLLMProtocol.observedPrompts().first else {
+      preconditionFailure("同人审阅必须调用审阅模型")
+    }
+    assertDerivativePromptSections(
+      reviewPrompt,
+      pastMarker: pastMarker,
+      futureMarker: futureMarker,
+      label: "审阅"
+    )
+    precondition(
+      reviewPrompt.contains("必须输出 [hard][prose]"),
+      "审阅提示词必须将未来原著事件标成正文级硬问题"
+    )
+
+    let storedReview: [String: Any] = [
+      "status": "failed",
+      "model": "test-review",
+      "summary": "需要改写正文",
+      "issues": ["[hard][prose] 正文需要调整巡查细节。"],
+      "revisionGuidance": "重写正文，但不得提前出现城门警讯。",
+      "attempts": [],
+    ]
+    try await core.writeChapter(
+      bookID: bookID,
+      number: 1,
+      title: "旧驿道",
+      content: draft,
+      status: "revision_failed",
+      llmReview: storedReview
+    )
+    try await core.persistConsistencyDelta(
+      bookID: bookID,
+      chapterNumber: 1,
+      title: "旧驿道",
+      summary: "巡查旧驿道。",
+      delta: emptyDelta
+    )
+    let revisedPayload = """
+      {"title":"旧驿道","content":"\(draft)铁链上忽然闪出一行异常乱码；他收回手，没有继续追问城墙上的咳嗽声。","summary":"继续巡查旧驿道。","consistencyDelta":\(String(data: try JSONSerialization.data(withJSONObject: emptyDelta), encoding: .utf8)!)}
+      """
+    AutomatedRevisionLLMProtocol.configure([
+      AutomatedRevisionStubResponse(content: revisedPayload, stream: true),
+      AutomatedRevisionStubResponse(
+        content: "{\"pass\":true,\"summary\":\"修订通过\",\"issues\":[],\"revisionGuidance\":\"\"}",
+        stream: true
+      ),
+    ])
+    _ = try await core.reviseChapter(
+      bookID: bookID,
+      number: 1,
+      note: "重写正文，但不得提前出现城门警讯。",
+      mode: "rewrite"
+    )
+    var revisionJob: GenerationJob?
+    for _ in 0..<100 {
+      let job = try await core.fetchGenerationJob(bookID: bookID, chapterNumber: 1).job
+      if job?.isActive == false {
+        revisionJob = job
+        break
+      }
+      try await Task.sleep(nanoseconds: 50_000_000)
+    }
+    guard let revisionJob else { preconditionFailure("同人自动修订任务未完成") }
+    precondition(revisionJob.phase == "ready-for-review", "修订未完成：\(revisionJob)")
+    guard let revisionPrompt = AutomatedRevisionLLMProtocol.observedPrompts().first(where: {
+      $0.contains("你是 InkOS 章节修订器")
+    }) else {
+      preconditionFailure("自动修订必须走章节修订器提示词")
+    }
+    assertDerivativePromptSections(
+      revisionPrompt,
+      pastMarker: pastMarker,
+      futureMarker: futureMarker,
+      label: "修订"
+    )
+
+    _ = try await core.deleteBook(id: bookID)
+    print("Derivative prompt probe passed: generation + revision + review timeline/RAG gates")
+  }
+
+  /// Generation, revision and approval all stop before starting work when a
+  /// derivative book has not completed source preparation.
+  private static func assertDerivativePreparationGate(root: URL) async throws {
+    let gateRoot = root.appendingPathComponent("derivative-preparation-gate", isDirectory: true)
+    let core = InkOSCore(rootURL: gateRoot)
+    let request = CreateBookRequest(
+      title: "同人准备门禁测试书",
+      language: "zh",
+      genre: "fanfic",
+      platform: "tomato",
+      kind: .derivative,
+      sourceTitle: "尚未导入的原著",
+      timelineAnchorLabel: "开篇事件",
+      timelineStartDayOffset: -10,
+      targetChapters: 1,
+      chapterWords: 1_000,
+      totalWords: "1000",
+      targetTotalWords: 1_000,
+      volumeCount: 1,
+      chapterWordTolerance: 10,
+      premise: "验证同人准备完成前不进入章节流水线。",
+      characters: "测试主角。",
+      protagonistProfile: "测试主角谨慎核对来源；缺陷是过度迟疑，会反复检查每一个细节。",
+      protagonistReviewed: true,
+      worldbuilding: "沿用原著。",
+      outline: "第一章等待原著准备。",
+      volumePlan: "第一卷第1章。",
+      pacing: "单章单目标。",
+      style: "第三人称有限视角。",
+      constraints: "必须先完成原著准备。"
+    )
+
+    var missingAnchorGuide = CreateBookGuide(request: request)
+    missingAnchorGuide.protagonistName = "测试主角"
+    missingAnchorGuide.protagonistProfile = request.protagonistProfile
+    missingAnchorGuide.storyPremise += "同时核对时间锚点不可缺失。"
+    missingAnchorGuide.timelineAnchorLabel = "  "
+    do {
+      _ = try await core.assistCreateBook(guide: missingAnchorGuide)
+      preconditionFailure("同人创建引导不得接受空时间锚点")
+    } catch let error as InkOSCoreError {
+      precondition(
+        error.statusCode == 400 && error.message.contains("时间锚点"),
+        "创建引导应明确提示时间锚点：\(error)"
+      )
+    }
+
+    var missingAnchorRequest = request
+    missingAnchorRequest.title = "同人空锚点测试书"
+    missingAnchorRequest.timelineAnchorLabel = "\n"
+    do {
+      _ = try await core.createBook(missingAnchorRequest)
+      preconditionFailure("核心建书入口不得接受空时间锚点")
+    } catch let error as InkOSCoreError {
+      precondition(
+        error.statusCode == 400 && error.message.contains("时间锚点"),
+        "核心建书应明确提示时间锚点：\(error)"
+      )
+    }
+
+    let creation = try await core.createBook(request)
+    let bookID = creation.title
+
+    var generationBlocked = false
+    do {
+      _ = try await core.generateChapter(bookID: bookID, guidance: nil)
+    } catch {
+      generationBlocked = error.localizedDescription.contains("原著")
+    }
+    precondition(generationBlocked, "缺失原著准备必须阻止生成")
+    let generationJob = try await core.fetchGenerationJob(bookID: bookID, chapterNumber: 1)
+    precondition(generationJob.job == nil, "门禁必须在创建生成任务前执行")
+
+    let body = String(repeating: "准备门禁测试正文。", count: 120)
+    try await core.writeChapter(
+      bookID: bookID,
+      number: 1,
+      title: "等待准备",
+      content: body,
+      status: "pending_review",
+      llmReview: passedLLMReviewFixture()
+    )
+    let emptyDelta: [String: Any] = [
+      "upsert": [
+        "immutableCanon": [], "worldRules": [], "entities": [],
+        "knowledgeBoundaries": [], "timeline": [], "hooks": [],
+      ],
+      "remove": [
+        "immutableCanon": [], "worldRules": [], "entities": [],
+        "knowledgeBoundaries": [], "timeline": [], "hooks": [],
+      ],
+    ]
+    try await core.persistConsistencyDelta(
+      bookID: bookID,
+      chapterNumber: 1,
+      title: "等待准备",
+      summary: "门禁测试。",
+      delta: emptyDelta
+    )
+
+    var revisionBlocked = false
+    do {
+      _ = try await core.reviseChapter(
+        bookID: bookID,
+        number: 1,
+        note: "测试门禁",
+        mode: "manual"
+      )
+    } catch {
+      revisionBlocked = error.localizedDescription.contains("原著")
+    }
+    precondition(revisionBlocked, "缺失原著准备必须阻止修订")
+
+    var approvalBlocked = false
+    do {
+      _ = try await core.approveChapter(bookID: bookID, number: 1)
+    } catch {
+      approvalBlocked = error.localizedDescription.contains("原著")
+    }
+    precondition(approvalBlocked, "缺失原著准备必须阻止批准")
+    let chapter = try await core.fetchChapter(bookID: bookID, number: 1)
+    precondition(chapter.status == "pending_review", "门禁失败不得改变章节状态")
+    print("Derivative preparation gate probe passed: generate + revise + approve")
+  }
+
+  private static func assertDerivativePromptSections(
+    _ prompt: String,
+    pastMarker: String,
+    futureMarker: String,
+    label: String
+  ) {
+    precondition(prompt.contains("【本章的原著时间进度】"), "\(label)提示词缺少原著时间进度")
+    precondition(prompt.contains("【原著正典检索结果】"), "\(label)提示词未在空 lexical key + 非空 query 时触发检索")
+    precondition(prompt.contains(pastMarker), "\(label)提示词没有注入已发生的原著段落")
+    precondition(!prompt.contains(futureMarker), "\(label)提示词泄漏了未来原著段落")
+  }
+
   private static func assertDerivativeTimelineGatesCanonEvents(root: URL) async throws {
     let timelineRoot = root.appendingPathComponent("timeline-gate", isDirectory: true)
     let core = InkOSCore(rootURL: timelineRoot)
@@ -3119,6 +4286,12 @@ struct NativeCoreSmoke {
     // with no day and a later source chapter.
     var continuity = LongFormContinuity()
     continuity.timeline = [
+      // Same label as the source anchor but no source coordinate: this is an author
+      // overlay and must never win label resolution merely because it appears first.
+      LongFormTimelineMilestone(
+        id: "TL-overlay-anchor", order: 1, label: "主线事件",
+        earliestChapter: 1, latestChapter: 1
+      ),
       LongFormTimelineMilestone(
         id: "TL-early", order: 1, label: "很早以前的旧事",
         earliestChapter: 1, latestChapter: 1, sourceDay: -400, sourceChapter: 5
@@ -3152,6 +4325,21 @@ struct NativeCoreSmoke {
         earliestChapter: 1, latestChapter: 1
       ),
     ]
+
+    let resolvedSourceAnchor = await core.resolvedDerivativeTimeline(
+      bookID: bookID,
+      continuity: continuity
+    )
+    let hasResolvedSourceAnchor = await core.hasResolvedDerivativeSourceAnchor(
+      resolvedSourceAnchor,
+      continuity: continuity
+    )
+    precondition(
+      resolvedSourceAnchor.anchorMilestoneID == "TL-anchor"
+        && resolvedSourceAnchor.anchorSourceChapter == 100
+        && hasResolvedSourceAnchor,
+      "同名 author overlay 不得抢占原著锚点：\(resolvedSourceAnchor)"
+    )
 
     let opening = await core.derivativeTimelineStatus(
       bookID: bookID,
@@ -3232,6 +4420,58 @@ struct NativeCoreSmoke {
     )
     precondition(afterAnchor.future.isEmpty, "此时没有可确定判为未发生的事件")
 
+    // Prompt lists retain only 12 entries. The RAG chapter boundary must still use
+    // every classified event, including an old dated event whose high source chapter
+    // falls outside that display slice.
+    var denseContinuity = LongFormContinuity()
+    denseContinuity.timeline = [
+      LongFormTimelineMilestone(
+        id: "TL-dense-anchor", order: 1, label: "主线事件",
+        earliestChapter: 1, latestChapter: 1, sourceDay: 0, sourceChapter: 100
+      ),
+      LongFormTimelineMilestone(
+        id: "TL-old-late-source", order: 2, label: "后段原著回叙的旧事",
+        earliestChapter: 1, latestChapter: 1, sourceDay: -100, sourceChapter: 500
+      ),
+    ]
+    denseContinuity.timeline.append(contentsOf: (1...20).map { offset in
+      LongFormTimelineMilestone(
+        id: "TL-dense-\(offset)",
+        order: offset + 2,
+        label: "已发生事件 \(offset)",
+        earliestChapter: 1,
+        latestChapter: 1,
+        sourceDay: offset,
+        sourceChapter: 100 + offset
+      )
+    })
+    var denseTimeline = timeline
+    denseTimeline.startDayOffset = 30
+    let denseStatus = await core.derivativeTimelineStatus(
+      bookID: bookID,
+      chapterNumber: 1,
+      continuity: denseContinuity,
+      timeline: denseTimeline,
+      beats: nil
+    )
+    precondition(
+      denseStatus.past.count == InkOSCore.timelineEventListLimit
+        && !denseStatus.past.contains { $0.id == "TL-old-late-source" },
+      "回归夹具必须把高章号旧事件截到展示列表之外：\(denseStatus.past.map(\.id))"
+    )
+    precondition(
+      denseStatus.latestPastSourceChapter == 500,
+      "未截断分类的最近原著章号应为 500：\(denseStatus.latestPastSourceChapter as Any)"
+    )
+    let denseRetrievalMaximum = await core.derivativeRetrievalMaximumSourceChapter(
+      status: denseStatus,
+      timeline: denseTimeline
+    )
+    precondition(
+      denseRetrievalMaximum == 500,
+      "RAG 上界不得退回 12 条展示列表中的章号：\(denseRetrievalMaximum as Any)"
+    )
+
     // Without an anchor chapter there is nothing to compare undated events against.
     // They must be reported as unplaced rather than sorted by `order`, which is a
     // sort key the delta merge renumbers, not a clock.
@@ -3305,6 +4545,249 @@ struct NativeCoreSmoke {
     print("Derivative timeline probe passed: past/future/unplaced gates + day summation")
   }
 
+  /// The beat prompt prints its forbidden list at the batch's opening chapter and
+  /// caps it at `timelineEventListLimit`. A batch that retires the nearest future
+  /// events mid-batch lets an event ranked beyond the cap enter the writing
+  /// prompt's forbidden list without the planner ever seeing it — the planner could
+  /// schedule it for a late-batch chapter and the conflict would surface only as a
+  /// failed review. The closing section must name exactly those events.
+  private static func assertDerivativeBeatClosingCoversCappedFuture(root: URL) async throws {
+    let core = InkOSCore(rootURL: root.appendingPathComponent("beat-closing-cap", isDirectory: true))
+    let bookID = "beat-closing-cap-fixture"
+    let timeline = DerivativeTimeline(anchorLabel: "锚点事件", startDayOffset: 0)
+    func milestone(_ day: Int) -> LongFormTimelineMilestone {
+      LongFormTimelineMilestone(
+        id: "TL-d\(day)", order: day, label: "第\(day)日事件",
+        earliestChapter: 1, latestChapter: 1, sourceDay: day, sourceChapter: 100 + day
+      )
+    }
+    // Six one-day beats move the clock from day 0 to day 6 across the batch.
+    let beats = ChapterBeatPlan(
+      bookId: bookID,
+      beats: (1...6).map { ChapterBeat(number: $0, storyDays: 1) }
+    )
+    var continuity = LongFormContinuity()
+    continuity.timeline = (1...17).map(milestone)
+    let opening = await core.derivativeTimelineStatus(
+      bookID: bookID, chapterNumber: 1, continuity: continuity, timeline: timeline, beats: beats
+    )
+    let closing = await core.derivativeTimelineStatus(
+      bookID: bookID, chapterNumber: 7, continuity: continuity, timeline: timeline, beats: beats
+    )
+    precondition(opening.storyDay == 0 && closing.storyDay == 6)
+    precondition(
+      opening.future.count == InkOSCore.timelineEventListLimit,
+      "开场禁止清单必须顶到条数上限，否则本探针没有证明任何东西：\(opening.future.count)"
+    )
+
+    guard let section = await core.derivativeBeatClosingSection(
+      opening: opening, closing: closing, endChapter: 7
+    ) else {
+      preconditionFailure("批次内日期有推移时必须产出终点段落")
+    }
+    // The events capped out of the opening list but still future at the closing
+    // chapter are exactly the ones the planner would otherwise never see.
+    for day in 13...17 {
+      precondition(
+        section.contains("第\(day)日事件"),
+        "终点段落必须点名被上限挤掉的事件：第\(day)日事件"
+      )
+    }
+    // Already printed at the opening or already past: repeating them wastes the
+    // budget and reads as a second, contradictory list.
+    for day in 1...12 {
+      precondition(
+        !section.contains("第\(day)日事件"),
+        "终点段落不得重复开场已列出的事件：第\(day)日事件"
+      )
+    }
+
+    // No clock movement, no closing section at all.
+    let noMovement = await core.derivativeBeatClosingSection(
+      opening: opening, closing: opening, endChapter: 7
+    )
+    precondition(noMovement == nil, "批次内日期无推移时不得输出终点段落")
+
+    // Fewer events than the cap: the opening list is already complete, so the
+    // closing section reports the movement but adds no second forbidden list.
+    var small = LongFormContinuity()
+    small.timeline = (1...10).map(milestone)
+    let smallOpening = await core.derivativeTimelineStatus(
+      bookID: bookID, chapterNumber: 1, continuity: small, timeline: timeline, beats: beats
+    )
+    let smallClosing = await core.derivativeTimelineStatus(
+      bookID: bookID, chapterNumber: 7, continuity: small, timeline: timeline, beats: beats
+    )
+    let smallSection = await core.derivativeBeatClosingSection(
+      opening: smallOpening, closing: smallClosing, endChapter: 7
+    )
+    precondition(smallSection != nil, "日期有推移时即使无新增事件也应有终点段落")
+    precondition(
+      smallSection?.contains("同样绝对不得发生") == false,
+      "开场清单未顶满时不得追加第二份禁止清单"
+    )
+    print("Derivative beat closing probe passed: capped future events named at batch end")
+  }
+
+  /// The beat planner receives a compact, prioritised view of unresolved hooks.
+  /// This must never become an unbounded prompt section as a long novel accumulates
+  /// hooks, and it must not cut a rendered line in half while enforcing the budget.
+  private static func assertOpenHooksPromptBudgeting(root: URL) async throws {
+    let core = InkOSCore(rootURL: root.appendingPathComponent("open-hooks-budget", isDirectory: true))
+    let longDescription = String(repeating: "伏笔细节", count: 90)
+    var hooks: [LongFormHookPlan] = [
+      LongFormHookPlan(
+        hookId: "HOOK-overdue",
+        description: "已到期伏笔。" + longDescription,
+        openFromChapter: 1,
+        resolveByChapter: 8
+      ),
+      LongFormHookPlan(
+        hookId: "HOOK-near-deadline",
+        description: "临近截止伏笔。" + longDescription,
+        openFromChapter: 2,
+        resolveByChapter: 12
+      ),
+      LongFormHookPlan(
+        hookId: "HOOK-recent",
+        description: "最近开启伏笔。" + longDescription,
+        openFromChapter: 30
+      ),
+    ]
+    for number in 1...40 {
+      hooks.append(LongFormHookPlan(
+        hookId: String(format: "HOOK-old-%02d", number),
+        description: "旧伏笔 \(number)。" + longDescription,
+        openFromChapter: number % 20 + 1
+      ))
+    }
+    let rendered = await core.openHooksText(
+      LongFormContinuity(hooks: hooks),
+      upTo: 40
+    )
+    precondition(
+      rendered.count <= InkOSCore.chapterBeatOpenHooksMaxCharacters,
+      "未回收伏笔必须受总字符预算约束：\(rendered.count)"
+    )
+    precondition(rendered.contains("HOOK-overdue"), "已到期伏笔必须优先保留")
+    precondition(rendered.contains("HOOK-near-deadline"), "临近到期伏笔必须优先保留")
+    precondition(rendered.contains("HOOK-recent"), "无截止期时最近开启的伏笔必须优先保留")
+    precondition(rendered.contains("已省略"), "超过预算必须明确说明省略数量")
+    precondition(rendered.contains("…"), "超长单条伏笔必须单独截断并标记")
+
+    let hookLines = rendered.split(separator: "\n").filter { $0.hasPrefix("- ") }
+    precondition(
+      hookLines.allSatisfy { $0.hasSuffix("）") },
+      "预算裁剪不得截断半条伏笔行：\(hookLines)"
+    )
+    precondition(
+      hookLines.allSatisfy { $0.count <= InkOSCore.chapterBeatOpenHookDescriptionMaxCharacters + 96 },
+      "单条伏笔描述必须受独立预算约束：\(hookLines)"
+    )
+    print("Open hook prompt budget probe passed: prioritised + bounded + whole lines")
+  }
+
+  /// Compacting the continuity share must produce complete JSON within its
+  /// character budget and keep the policy plus prioritized entity identities.
+  private static func assertCompactContinuityContext(root: URL) async throws {
+    let core = InkOSCore(rootURL: root.appendingPathComponent("continuity-context-budget"))
+    let details = String(repeating: "连续性详情", count: 80)
+    let continuity = LongFormContinuity(
+      immutableCanon: (1...20).map {
+        LongFormImmutableCanon(id: "CANON-\($0)", category: "world", statement: "事实\($0)\(details)")
+      },
+      worldRules: (1...20).map {
+        LongFormWorldRule(id: "RULE-\($0)", statement: "规则\($0)\(details)")
+      },
+      entities: (1...40).map {
+        LongFormEntity(
+          id: "ENT-\($0)",
+          name: "实体\($0)",
+          type: "character",
+          attributes: ["状态": details, "位置": "第\($0)处"]
+        )
+      },
+      knowledgeBoundaries: (1...20).map {
+        LongFormKnowledgeBoundary(
+          factId: "KNOW-\($0)",
+          statement: "知识\($0)\(details)",
+          allowedKnowers: ["实体\($0)"],
+          availableFromChapter: 1
+        )
+      },
+      timeline: (1...30).map {
+        LongFormTimelineMilestone(
+          id: "TL-\($0)",
+          order: $0,
+          label: "事件\($0)\(details)",
+          earliestChapter: 1,
+          latestChapter: 1
+        )
+      },
+      hooks: (1...30).map { (index: Int) in
+        LongFormHookPlan(
+          hookId: "HOOK-\(index)",
+          description: "伏笔\(index)\(details)",
+          openFromChapter: 1,
+          resolveByChapter: index
+        )
+      },
+      policy: LongFormContinuityPolicy(allowUnplannedEntities: false)
+    )
+    let budget = 2_000
+    let compact = await core.truncateContinuityIndex(continuity, maxChars: budget)
+    precondition(compact.count <= budget, "紧凑连续性索引超出预算：\(compact.count)")
+    guard let data = compact.data(using: .utf8),
+      let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let policy = object["policy"] as? [String: Any],
+      let truncation = object["_truncation"] as? [String: Any],
+      let omitted = truncation["omittedCounts"] as? [String: Any]
+    else {
+      preconditionFailure("紧凑连续性索引必须始终是完整 JSON：\(compact)")
+    }
+    precondition(policy["allowUnplannedEntities"] as? Bool == false, "策略必须始终保留")
+    precondition(truncation["truncated"] as? Bool == true, "超预算输入必须标记截断")
+    precondition(
+      omitted.values.compactMap { $0 as? Int }.contains { $0 > 0 },
+      "截断元数据必须报告省略数量：\(omitted)"
+    )
+    let entities = object["entities"] as? [[String: Any]] ?? []
+    precondition(
+      !entities.isEmpty && entities.allSatisfy { $0["id"] != nil && $0["name"] != nil },
+      "实体身份字段应最优先保留：\(entities)"
+    )
+
+    // When the full index fits, compaction must be lossless rather than silently
+    // dropping immutable flags, attributes, markers or additional knowers.
+    let small = LongFormContinuity(
+      entities: [LongFormEntity(
+        id: "ENT-full",
+        name: "完整实体",
+        type: "object",
+        owner: "主角",
+        location: "旧仓库",
+        attributes: [
+          "a": "1", "b": "2", "c": "3", "d": "4", "e": "5", "f": "6",
+        ],
+        immutableOwner: true,
+        immutableLocation: true,
+        immutableAttributes: ["a", "f"]
+      )],
+      knowledgeBoundaries: [LongFormKnowledgeBoundary(
+        factId: "KNOW-full",
+        statement: "完整知识",
+        allowedKnowers: (1...8).map { "知情者\($0)" },
+        forbiddenKnowers: (1...8).map { "禁知者\($0)" },
+        availableFromChapter: 1,
+        markers: ["marker-a", "marker-b"]
+      )]
+    )
+    let lossless = await core.truncateContinuityIndex(small, maxChars: 100_000)
+    let decoded = try JSONDecoder().decode(LongFormContinuity.self, from: Data(lossless.utf8))
+    precondition(decoded == small, "预算充足时连续性索引必须无损：\(lossless)")
+    print("Compact continuity context probe passed: parseable + bounded + lossless")
+  }
+
   /// A model-supplied `null` must not terminate the process.
   ///
   /// This is a regression probe for a real production crash: extraction of 诡秘之主
@@ -3329,7 +4812,12 @@ struct NativeCoreSmoke {
           ["id": "E-1", "name": "克莱恩", "owner": NSNull(), "aliases": NSNull(), "location": NSNull()],
         ],
         "timeline": [
-          ["id": "T-nested", "label": ["text": "占卜家途径开启"], "sourceChapter": 1],
+          [
+            "id": "T-nested",
+            "label": ["text": "占卜家途径开启"],
+            "sourceDay": 12,
+            "sourceChapter": 99,
+          ],
         ],
       ]
     ]
@@ -3353,12 +4841,16 @@ struct NativeCoreSmoke {
     precondition(entityNames == ["克莱恩"], "实体不应因可选字段为 null 被丢弃：\(entityNames)")
     let entityOwners = delta.upsert.entities.map { $0.owner ?? "nil" }
     precondition(entityOwners == ["nil"], "owner 为 null 应变成 nil 而不是空串：\(entityOwners)")
-    // The nested object is flattened to JSON text, not dropped: the label is the
-    // one required field, so dropping it would discard the whole milestone.
+    // The nested wrapper is unwrapped to its exact prose, and ordinary chapter
+    // deltas are not allowed to write source-axis coordinates.
     let labels = delta.upsert.timeline.map { $0.label }
     precondition(
-      labels.contains(where: { $0.contains("占卜家途径开启") }),
-      "嵌套对象应被展平成文本而不是丢弃：\(labels)"
+      labels == ["占卜家途径开启"],
+      "嵌套对象应解包成精确正文文本：\(labels)"
+    )
+    precondition(
+      delta.upsert.timeline.allSatisfy { $0.sourceDay == nil && $0.sourceChapter == nil },
+      "普通章节 Delta 不得污染原著时间坐标：\(delta.upsert.timeline)"
     )
 
     // A null in a *required* text field is a different contract: it must surface as
