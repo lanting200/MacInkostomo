@@ -39,7 +39,9 @@ SwiftUI View
 
 LLM 辅助整理创建方案后，主角性格档案必须在创建向导中经人工逐字审核并确认，否则核心拒绝创建小说。确认后的档案写入 `story/protagonist.md`，在设置页「角色档案」分组维护，并注入每一章的写作提示。
 
-章节生成会读取故事圣经、硬规则、人物知识边界、当前状态、持久对象账本、资源账本、伏笔池、章节摘要、最近卷末检查点和上一章全文。生成结果必须提交 `consistencyDelta`；本地规则先验证跨章顺序、实体准入、删除目标和不可变冲突，再由独立模型联合审核正文、候选 Delta 和应用后的连续性索引。初审发现的硬问题若只涉及 Delta 登记，核心先单独修复 Delta 并复审，正文保持不动；其余 `[hard]` 问题才进入全文自动修改循环，每轮把上一轮审核意见喂回重写模型，最多重写 2 轮，任一轮通过即交人工终审。人工「驳回修改」同样汇入这条流程。正文未过本地篇幅/写法校验时不进循环，直接保留完整草稿并落 `revision_failed` 等人工驳回。
+章节生成会读取故事圣经、硬规则、人物知识边界、当前状态、持久对象账本、资源账本、伏笔池、章节摘要、最近卷末检查点和上一章全文。生成结果必须提交 `consistencyDelta`；本地规则先验证跨章顺序、实体准入、删除目标和不可变冲突，再由独立模型联合审核正文、候选 Delta 和应用后的连续性索引。
+
+审核模型对每个 `[hard]` 问题标注修复范围：`[delta]` 只需补登记，无需动正文；`[prose]` 需要改动正文。未打标签的问题由启发式判定（引用正文作为证据不算需要改正文，"正文与既有记录矛盾"才算）。初审发现的 `[hard]` 若全是 delta 问题，核心单独修复 Delta 并复审，正文不变；一旦有 `[prose]` 问题或 delta-only 修复仍未通过，进入全文自动修改循环，每轮把上一轮审核意见喂回重写模型，最多重写 `maxAutoRevisionRounds` 轮（默认 3），任一轮通过即交人工终审。人工「驳回修改」同样汇入这条流程。正文未过本地篇幅/写法校验时不进循环，直接保留完整草稿并落 `revision_failed` 等人工驳回。
 
 写作响应的 JSON 外壳损坏时，完整正文同样不会被丢弃。核心先记录 `chapter.invalidJson`，再逐字段解码 `title`/`content`/`summary`，不依赖整个对象可解析；只有 `content` 能确认闭合（未转义引号后必须紧跟 `}` 或 `,` 加下一个 `"key":`，因此对白里的裸引号不会截断正文）才算恢复成功，记录 `chapter.proseRecovered`，丢弃损坏外壳里的 Delta 并只补请求 Delta。只有正文本身在字符串中途被截断时，才追加严格格式要求重试整章。
 
@@ -57,7 +59,9 @@ Delta 补登的每条失败路径都会记录 `chapter.deltaRepair.failed` 和�
 - `story/craft_rules.md` 是本书可编辑的写法约束，在设置页“世界与卷纲”分组中紧随文风指南维护，只能叠加在内核之上。
 - 篇幅按 `long-form-plan.json` 的每章 `minWords`/`maxWords` 校验，窗口按平台字数（含标点）计算，另设中文字符密度下限，防止靠标点凑数。模型已返回完整正文时，篇幅、写法或 Delta 本地校验失败不会丢弃草稿：正文会以 `revision_failed` 落盘，并附带本地审核意见进入“待修改”。
 - 生成与修订在送审前先过本地确定性校验：清单式条目铺陈、总结或淡出式收尾直接退稿；前三章作为开篇段整体至少建立一次核心能力异常锚点，前章已经建立后不要求后续章重复，且节拍卡的禁止清单优先于重复锚点。这些规则与审核模型的同类 `[hard]` 规则互为兜底。
-- 审核区分严重级别：只涉及 Delta 字段、分类或遗漏登记的 `[hard]` 问题先走登记单独修复；涉及正文冲突、不可变设定或因果问题时直接进入全文修订。本地校验失败稿按默认意见再次提交时先重新校验并复审原正文，仍未通过才进入全文自动修改；正文、排期与篇幅问题最多执行 2 轮重写+复审。`[soft]` 写法问题记入 `llmReview.craftAdvisories` 并进入人工审核；所有提交和轮次都在 `llmReview.attempts` 中连续追加，后一轮异常也会把完整历史与最新错误写回章节。审核工作台的进度视图会按实际上限显示当前自动修改轮次和流式正文。
+- 审核区分严重级别，并要求每条 `[hard]` 附带修复范围标签：`[delta]` 表示正文无需改动、只补候选 Delta 登记；`[prose]` 表示必须改正文。全部 `[hard]` 都是 `[delta]` 时先走登记单独修复、正文一字不动；出现任一 `[prose]` 才进入全文修订。模型漏标时按措辞推断，并按"引用正文作为登记依据"与"正文本身有缺陷"区分：`正文明确写出伤势，但 ENT-004 的 attributes 为空` 判为 `[delta]`，`正文数字与已登记消耗矛盾` 判为 `[prose]`。判定偏向 `[delta]` 是有意的——登记修复不动正文，复审仍不过会自动落回重写循环，而误判成 `[prose]` 会让模型重写一篇本来正确的正文、触发停滞检测。本地篇幅/写法校验结论固定标 `[prose]`，本地连续性差量冲突固定标 `[delta]`。
+- 本地校验失败稿按默认意见再次提交时先重新校验并复审原正文，仍未通过才进入全文自动修改；正文、排期与篇幅问题最多执行 `maxAutoRevisionRounds` 轮（默认 3）重写+复审。两类情况提前终止而不耗尽轮次：模型两次返回逐字相同的正文（第一次会抬高温度并给出强化指令重试），以及服务端以 4xx 拒绝请求（429 除外，那已由传输层重试过）——重发同一调用不会成功。模型停滞时，章节记录的失败原因是当前真正的阻断项，不是"输出与原文完全相同"这类机制信息。
+- `[soft]` 写法问题记入 `llmReview.craftAdvisories` 并进入人工审核；所有提交和轮次都在 `llmReview.attempts` 中连续追加，后一轮异常也会把完整历史与最新错误写回章节。`attempts` 是这条流程的完整台账，本地校验、原稿复审、Delta 单独修复和每轮重写各占一条，所以它的条数通常大于自动重写轮数。审核工作台的进度视图会按实际上限显示当前自动修改轮次和流式正文。
 - 章节通过人工审核后，`current_state.md`、`pending_hooks.md` 和 `current_focus.md` 由核心按已审核进度自动回写，不再停留在创建时的占位内容；这三个文件在设置页标记为自动重写并给出覆盖提示，人工修改会在下次审核后失效，连续性事实的人工调整走「长篇计划 · 连续性」覆盖层，单章内容调整走节拍卡。
 - 章节重新修订时，其后续章节的节拍卡自动失效并在下次生成时重新规划。
 
@@ -70,7 +74,7 @@ Delta 补登的每条失败路径都会记录 `chapter.deltaRepair.failed` 和�
 - Debug 构建使用 Xcode 工程目录中的现有 `book/` 和 `data/`，便于开发调试。
 - Release 构建使用 `~/Library/Application Support/MacInkostomo/`。
 - Release 首次运行会从旧工作区复制已有书籍与配置，之后由应用数据目录独立持久化。
-- `MACINKOSTOMO_WORKSPACE` 可显式指定数据工作区，主要用于测试和受控迁移。
+- `MACINKOSTOMO_WORKSPACE` 可显式指定数据工作区，主要用于测试和受控迁移；空目录也会直接采用，并跳过 Release 首次旧工作区迁移。
 
 ## 构建
 
@@ -106,6 +110,9 @@ swiftc -parse-as-library \
   macos/ChapterPublisher/InkOSCoreCraft.swift \
   macos/ChapterPublisher/InkOSCoreSettings.swift \
   macos/ChapterPublisher/InkOSCoreFanqie.swift \
+  macos/ChapterPublisher/InkOSCoreDerivative.swift \
+  macos/ChapterPublisher/InkOSCoreCanon.swift \
+  macos/ChapterPublisher/InkOSCoreTimeline.swift \
   test/NativeCoreSmoke.swift \
   -o /tmp/macingkostomo-native-core-smoke
 
@@ -120,12 +127,38 @@ swiftc -parse-as-library \
 - `ChapterPublisher.xcodeproj/`: Xcode 工程与共享 scheme。
 - `book/`: Debug 工作区的小说工程，属于私有用户数据。
 - `data/`: Debug 工作区的状态、密钥、备份和调试数据，属于私有用户数据。
+- `macos/ChapterPublisher/InkOSCoreDerivative.swift`: 同人文原著检索核心（编码识别、章节切分、BM25 + 语义混合检索）。新建小说选“同人”并上传原著后由界面触发，检索结果在写章节时注入提示词。
+- `macos/ChapterPublisher/InkOSCoreCanon.swift`: 把原著批量抽成正典（不可变事实、世界规则、实体、知识边界、时间线、伏笔），断点续跑，客户设定以 overlay 形式压过原著。
+- `macos/ChapterPublisher/InkOSCoreTimeline.swift`: 同人时间进度系统。以原著锚点事件为 0 天，按节拍卡的 `storyDays` 累加推算本章故事日期，把原著事件分成已发生／尚未发生／时间点未确定三类写进节拍与正文提示词，用来防止同人文时间线错乱。
 - `test/NativeCoreSmoke.swift`: 原生核心临时工作区回归测试。
 - `inkos/`: 上游源码与许可证迁移对照，不进入 App runtime。
 
+## 模型角色
+
+设置页按角色配置三套模型，各自有独立的 Base URL、API Key 和模型名：
+
+- 章节生成（`model` / `baseUrl` / `apiKey`）：主模型，其余角色的回退目标。
+- 设定与初审（`reviewModel` / `reviewBaseUrl` / `reviewApiKey`）。
+- 原著抽取 RAG（`extractionModel` / `extractionBaseUrl` / `extractionApiKey`）：用于把同人文原著抽成正典设定，建议选长上下文模型。
+
+任一角色的字段留空即继承章节生成的对应值，所以只想换模型名时不必重填端点和密钥。原著抽取是可选角色：三个字段全空时不参与保存校验；一旦填写，保存前同样要求测速通过。
+
+## 原著正典抽取
+
+同人创作只需要客户提供两样东西：一份原著 txt 和一段作者设定文本。
+
+- `importDerivativeSource` 导入原著：识别编码、切分章节、建 BM25 与语义检索索引。
+- `extractDerivativeCanon` 把原著抽成正典：按字数预算分批（默认每批 1.5 万字符）交给原著抽取模型，逐批合并进连续性投影的 `baseContinuity`。进度写在 `source/canon-progress.json`，每批落一次盘，中断后可续跑；某一批失败不影响之前已完成的批次。换了原著文件会同时清掉旧进度和旧 `baseContinuity`，但保留作者 overlay 与已审核章节贡献。
+- `extractDerivativeSettingsOverlay` 把作者设定文本写进 `manualOverlay`。这一层在投影时最后应用且允许覆盖不可变字段，所以设定文本与原著冲突时以设定文本为准。
+- 原著章号会统一改写成衍生作自己的章号，原始出处保留在 `markers` 里（`source-chapter-N`）。
+- `source/preparation.json` 保存作者设定文本和是否建立语义索引的意图。App 重启后会恢复未完成横幅；即使正典已完成，overlay 或索引失败也可以继续处理。
+- `sourceDay` 只接受相对整部原著全局锚点的日期。未直接包含锚点的批次不保留模型输出的批次局部日期；作者 overlay 的时间线也不带原著坐标。
+
+导入与抽取由新建小说流程调用（`WorkspaceModel.prepareDerivativeSource`），抽取进度显示在工作区顶部；写作时 `generationPrompt` 从节拍卡的重点人物、目标、场景和必写事件中提取已登记正典实体名，命中就把原文段落作为「原著正典检索结果」写进提示词。
+
 ## 密钥
 
-模型密钥保存在私有配置文件中并收紧为 `0600`。设置页只显示遮罩预览。远程模型地址默认要求 HTTPS；已有配置明确启用 HTTP 时，原生核心仍会执行同一配置约束。
+模型密钥保存在私有配置文件中并收紧为 `0600`。设置页只显示遮罩预览。远程模型地址默认要求 HTTPS；已有配置明确启用 HTTP 时，原生核心仍会执行同一配置约束。三个角色的密钥都不会随配置读取返回界面，编码时固定写空串。
 
 ## 许可
 

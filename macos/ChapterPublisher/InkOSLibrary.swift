@@ -154,6 +154,104 @@ final class InkOSLibrary: @unchecked Sendable {
     )
   }
 
+  // MARK: Derivative (同人) source retrieval
+
+  func importDerivativeSource(bookID: String, from fileURL: URL) async throws -> SourceManifest {
+    try await core.importDerivativeSource(bookID: bookID, from: fileURL)
+  }
+
+  func embedDerivativeSource(bookID: String) async throws -> SourceEmbeddingStatus {
+    try await core.embedDerivativeSource(bookID: bookID)
+  }
+
+  func derivativeSourceEmbeddingStatus(bookID: String) async throws -> SourceEmbeddingStatus {
+    try await core.derivativeSourceEmbeddingStatus(bookID: bookID)
+  }
+
+  func retrieveDerivativeContext(
+    bookID: String,
+    keys: [String],
+    query: String? = nil,
+    limit: Int = 8
+  ) async throws -> [SourceRetrievalHit] {
+    try await core.retrieveDerivativeContext(
+      bookID: bookID,
+      keys: keys,
+      query: query,
+      limit: limit
+    )
+  }
+
+  // MARK: Derivative (同人) canon extraction
+
+  /// Runs canon extraction over the imported original. `maxBatches` caps the model
+  /// calls one invocation makes so the UI can extract incrementally; the pass is
+  /// checkpointed and a later call resumes where this one stopped.
+  func extractDerivativeCanon(
+    bookID: String,
+    maxBatches: Int = 0
+  ) async throws -> SourceCanonStatus {
+    try await core.extractDerivativeCanon(bookID: bookID, maxBatches: maxBatches)
+  }
+
+  func extractDerivativeSettingsOverlay(
+    bookID: String,
+    settingsText: String
+  ) async throws -> SourceCanonStatus {
+    try await core.extractDerivativeSettingsOverlay(
+      bookID: bookID,
+      settingsText: settingsText
+    )
+  }
+
+  func derivativeCanonStatus(bookID: String) async throws -> SourceCanonStatus {
+    try await core.derivativeCanonStatus(bookID: bookID)
+  }
+
+  @discardableResult
+  func saveDerivativePreparationIntent(
+    bookID: String,
+    settingsText: String,
+    embedRequested: Bool
+  ) async throws -> DerivativePreparationIntent {
+    try await core.saveDerivativePreparationIntent(
+      bookID: bookID,
+      settingsText: settingsText,
+      embedRequested: embedRequested
+    )
+  }
+
+  func derivativePreparationSnapshot(bookID: String) async throws -> DerivativePreparationSnapshot {
+    try await core.derivativePreparationSnapshot(bookID: bookID)
+  }
+
+  // MARK: Derivative (同人) story clock
+
+  func derivativeTimeline(bookID: String) async throws -> DerivativeTimeline {
+    try await core.loadDerivativeTimeline(bookID: bookID)
+  }
+
+  @discardableResult
+  func saveDerivativeTimeline(
+    bookID: String,
+    _ timeline: DerivativeTimeline
+  ) async throws -> DerivativeTimeline {
+    try await core.saveDerivativeTimeline(bookID: bookID, timeline)
+  }
+
+  /// Where a chapter sits on the original's clock, and which canon events are
+  /// therefore behind it, ahead of it, or unplaced.
+  func derivativeTimelineStatus(
+    bookID: String,
+    chapterNumber: Int
+  ) async throws -> DerivativeTimelineStatus {
+    try await core.derivativeTimelineStatus(bookID: bookID, chapterNumber: chapterNumber)
+  }
+
+  func bookKind(bookID: String) async throws -> BookKind {
+    try await core.bookKind(bookID: bookID)
+  }
+
   func fetchFanqieLoginState() async throws -> FanqieLoginState {
     try await core.fetchFanqieLoginState()
   }

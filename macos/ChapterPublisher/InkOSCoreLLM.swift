@@ -17,9 +17,38 @@ extension InkOSCore {
     let finishReason: String?
   }
 
+  /// Upper bound for the `max_tokens` doubling that follows a reasoning pass which
+  /// consumed the whole configured ceiling.
+  ///
+  /// Bounded rather than unbounded because a model that produces no prose for a
+  /// genuine reason — a prompt it will not answer — would otherwise be retried at
+  /// ever larger ceilings, and every attempt costs a full reasoning pass. 65 536
+  /// covers every measured case: the widest observed reasoning pass on the beat
+  /// prompt was 16 383 tokens with roughly 10 000 tokens of JSON still to write.
+  static let maxTokensRetryCeiling = 65_536
+
   enum LLMRole: Sendable {
     case primary
     case review
+    /// Canon extraction over an imported original work. See `ModelRole.extraction`.
+    case extraction
+
+    /// The public `ModelRole` this maps onto, which owns the config key names.
+    var modelRole: ModelRole {
+      switch self {
+      case .primary: return .chapter
+      case .review: return .review
+      case .extraction: return .extraction
+      }
+    }
+
+    init(_ modelRole: ModelRole) {
+      switch modelRole {
+      case .chapter: self = .primary
+      case .review: self = .review
+      case .extraction: self = .extraction
+      }
+    }
   }
 
   // MARK: - Configuration
@@ -38,12 +67,19 @@ extension InkOSCore {
     let raw = try loadRawConfig()
     let primaryKey = string(raw["apiKey"])
     let reviewKey = string(raw["reviewApiKey"])
+    let extractionKey = string(raw["extractionApiKey"])
+    let primaryModel = string(raw["model"], fallback: "gpt-5.6-terra")
+    // An unset role model reports the primary one, matching what `requestLLM`
+    // falls back to. Endpoints are reported verbatim: blank means "inherit the
+    // primary endpoint", and the UI shows that as an empty field.
     return try decodeObject([
       "provider": "openai",
-      "model": string(raw["model"], fallback: "gpt-5.6-terra"),
-      "reviewModel": string(raw["reviewModel"], fallback: string(raw["model"], fallback: "gpt-5.6-terra")),
+      "model": primaryModel,
+      "reviewModel": string(raw["reviewModel"], fallback: primaryModel),
+      "extractionModel": string(raw["extractionModel"], fallback: primaryModel),
       "baseUrl": string(raw["baseUrl"]),
       "reviewBaseUrl": string(raw["reviewBaseUrl"]),
+      "extractionBaseUrl": string(raw["extractionBaseUrl"]),
       "apiFormat": "chat",
       "stream": (raw["stream"] as? Bool) ?? false,
       "temperature": raw["temperature"] ?? NSNull(),
@@ -54,8 +90,11 @@ extension InkOSCore {
       "apiKeyPreview": secretPreview(primaryKey),
       "hasReviewApiKey": !reviewKey.isEmpty,
       "reviewApiKeyPreview": secretPreview(reviewKey),
+      "hasExtractionApiKey": !extractionKey.isEmpty,
+      "extractionApiKeyPreview": secretPreview(extractionKey),
       "apiKey": "",
       "reviewApiKey": "",
+      "extractionApiKey": "",
     ], as: InkOSConfig.self)
   }
 
@@ -63,12 +102,17 @@ extension InkOSCore {
     var raw = try loadRawConfig()
     let baseURL = try validatedEndpoint(input.baseUrl, allowEmpty: true, existing: raw)
     let reviewBaseURL = try validatedEndpoint(input.reviewBaseUrl, allowEmpty: true, existing: raw)
+    let extractionBaseURL = try validatedEndpoint(
+      input.extractionBaseUrl, allowEmpty: true, existing: raw
+    )
     raw["provider"] = "openai"
     raw["apiFormat"] = "chat"
     raw["model"] = input.model.trimmingCharacters(in: .whitespacesAndNewlines)
     raw["reviewModel"] = input.reviewModel.trimmingCharacters(in: .whitespacesAndNewlines)
+    raw["extractionModel"] = input.extractionModel.trimmingCharacters(in: .whitespacesAndNewlines)
     raw["baseUrl"] = baseURL
     raw["reviewBaseUrl"] = reviewBaseURL
+    raw["extractionBaseUrl"] = extractionBaseURL
     raw["stream"] = false
     raw["thinkingBudget"] = 0
     if !input.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -77,30 +121,35 @@ extension InkOSCore {
     if !input.reviewApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       raw["reviewApiKey"] = input.reviewApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
     }
+    if !input.extractionApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      raw["extractionApiKey"] = input.extractionApiKey
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
     if let temperature = input.temperature { raw["temperature"] = temperature }
     if let maxTokens = input.maxTokens { raw["maxTokens"] = maxTokens }
     try writeJSON(raw, to: configURL, privateFile: true)
     recordDebug(scope: "config", message: "llm.config.updated", data: [
       "model": string(raw["model"]), "reviewModel": string(raw["reviewModel"]),
+      "extractionModel": string(raw["extractionModel"]),
     ])
     let fields = [
-      "model", "reviewModel", "baseUrl", "reviewBaseUrl", "stream",
-      "thinkingBudget", "temperature", "maxTokens",
+      "model", "reviewModel", "extractionModel", "baseUrl", "reviewBaseUrl",
+      "extractionBaseUrl", "stream", "thinkingBudget", "temperature", "maxTokens",
     ]
     return InkOSConfigApplyResponse(ok: true, applied: fields.count, fields: fields, errors: [])
   }
 
   func fetchModels(_ endpoint: ModelEndpointRequest) async throws -> ModelCatalogResponse {
     let raw = try loadRawConfig()
+    let keys = endpoint.role.configKeys
     let configured = endpoint.baseUrl?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-    let fallback = endpoint.role == .review
-      ? string(raw["reviewBaseUrl"], fallback: string(raw["baseUrl"]))
-      : string(raw["baseUrl"])
+    // `.nonEmpty` rather than a `fallback:` argument: a saved-but-blank role
+    // endpoint is stored as "", and that has to inherit the primary endpoint
+    // instead of reaching `validatedEndpoint` as an empty string and throwing.
+    let fallback = string(raw[keys.baseURL]).nonEmpty ?? string(raw["baseUrl"])
     let baseURL = try validatedEndpoint(configured.isEmpty ? fallback : configured, existing: raw)
     let suppliedKey = endpoint.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-    let storedKey = endpoint.role == .review
-      ? string(raw["reviewApiKey"], fallback: string(raw["apiKey"]))
-      : string(raw["apiKey"])
+    let storedKey = string(raw[keys.apiKey]).nonEmpty ?? string(raw["apiKey"])
     let key = suppliedKey.isEmpty ? storedKey : suppliedKey
     guard !key.isEmpty else { throw InkOSCoreError("请先填写或保存 API Key", statusCode: 400) }
     let url = try endpointURL(baseURL: baseURL, suffix: "models")
@@ -125,7 +174,7 @@ extension InkOSCore {
     do {
       let result = try await requestLLM(
         prompt: "只回复 OK",
-        role: input.role == .review ? .review : .primary,
+        role: LLMRole(input.role),
         overrideModel: input.model,
         overrideBaseURL: input.baseUrl,
         overrideAPIKey: input.apiKey,
@@ -453,10 +502,15 @@ extension InkOSCore {
         review: nil,
         title: lastTitle,
         content: lastContent,
-        error: InkOSCoreError("修订输出与原文完全相同，继续重试无意义"),
+        error: InkOSCoreError(stallErrorMessage),
         persisted: false
       )
     }
+
+    /// A stall is the model declining to change anything, not a fault of its
+    /// own. `finalizeRevisionFailure` matches on this to report the standing
+    /// review findings instead, which is what a human actually needs to act on.
+    static let stallErrorMessage = "修订输出与原文完全相同，继续重试无意义"
   }
 
   private func storedNativeReview(_ review: LLMReview?) -> NativeReview? {
@@ -471,20 +525,112 @@ extension InkOSCore {
     )
   }
 
+  /// Repair scope for one `[hard]` finding: does fixing it require editing the
+  /// chapter text, or only the registered `consistencyDelta`?
+  private enum IssueRepairScope {
+    case delta
+    case prose
+  }
+
+  /// Explicit `[delta]` / `[prose]` tag the review prompt asks for. Present only
+  /// when the review model honoured the contract, so callers fall back to
+  /// `inferredRepairScope` when this returns nil.
+  private func taggedRepairScope(_ issue: String) -> IssueRepairScope? {
+    let lowered = issue.lowercased()
+    // Check prose first: a finding tagged with both is a prose fix, because a
+    // rewrite round regenerates the delta anyway while a delta-only repair
+    // cannot touch the text.
+    if lowered.contains("[prose]") || lowered.contains("[正文]") { return .prose }
+    if lowered.contains("[delta]") || lowered.contains("[差量]") { return .delta }
+    return nil
+  }
+
+  /// Heuristic scope for an untagged finding.
+  ///
+  /// A delta-gap finding cites the prose as *evidence* for what the delta failed
+  /// to register ("正文明确写出伤势，但 ENT-004 的 attributes 为空"). Treating any
+  /// mention of 正文 as "the text is wrong" sent those findings to a full
+  /// rewrite, which regenerated prose that was already correct — the model
+  /// returned near-identical text and the stall detector killed the round. So
+  /// 正文 alone no longer forces a rewrite; only phrasing that asks for the text
+  /// itself to change does.
+  private func inferredRepairScope(_ issue: String) -> IssueRepairScope {
+    let lowered = issue.lowercased()
+    // Phrasings that put the defect in the text: the prose contradicts an
+    // established fact, or the reviewer explicitly asks for the text to change.
+    let proseMutationPatterns = [
+      #"正文[^。；\n]{0,12}(却|但|仍|还|竟)"#,
+      #"正文[^。；\n]{0,8}(应|需|要|得|须)(改|补|删|写|加|减|调)"#,
+      #"(改|补|删|加|调)[^。；\n]{0,6}正文"#,
+      // 正文 must be the subject of the defect, not the yardstick it is
+      // measured against. "正文写错了" is a prose fix; "实体 state 与正文矛盾"
+      // is a delta fix, because the text is the source of truth there — so a
+      // preceding 与/和/跟 excludes the match.
+      #"(?<![与和跟])正文[^。；\n]{0,12}(错|矛盾|不一致|无依据|无源|遗漏了)"#,
+      #"在正文(中|里)?(补|加|写|删|改)"#,
+      // "the text contradicts an established record" — the number or fact in
+      // the prose is the defect, so registering it in the delta would only
+      // record the contradiction. Distinct from "prose shows X but the delta
+      // failed to register X", where the text is already right.
+      #"与(既有|既定|已登记|在案)[^。；\n]{0,10}(冲突|矛盾|不符|不一致)"#,
+      #"(与|和)[^。；\n]{0,16}(冲突|矛盾)[^。；\n]{0,8}(应|需|须|改)"#,
+    ]
+    if proseMutationPatterns.contains(where: {
+      lowered.range(of: $0, options: .regularExpression) != nil
+    }) {
+      return .prose
+    }
+    // Defects that are inherently about the text, independent of 正文 wording.
+    let proseOnlyMarkers = [
+      "剧情", "叙事", "字数", "文风", "因果", "自相矛盾",
+      "不可变", "违反", "不允许新增", "越界", "时间线错误",
+    ]
+    if proseOnlyMarkers.contains(where: lowered.contains) { return .prose }
+    // Structural craft words that a delta-gap finding also uses incidentally —
+    // "章末纱布重新渗血" cites where the evidence sits, it does not complain
+    // about the ending. These count only alongside violation phrasing.
+    let structuralCraftPatterns = [
+      #"(章末|收尾|结尾)[^。；\n]{0,20}(总结|淡出|独白|格言|睡去|违规|不符|应停|未停|收束)"#,
+      #"(节拍卡?)[^。；\n]{0,12}(禁止|违反|未覆盖|漏写|不符|超出|范围)"#,
+      #"(超出|越出|不在)[^。；\n]{0,12}节拍卡"#,
+      // Time/place drift in the text itself: the prose puts a scene outside the
+      // window the beat sheet or a prior chapter fixed.
+      #"正文[^。；\n]{0,20}(时间|时刻|时序)[^。；\n]{0,12}(超出|不符|错|矛盾|推后|提前)"#,
+      #"(时间|时刻|时序)[^。；\n]{0,12}(口径)?[^。；\n]{0,8}不一致"#,
+      #"(清单|条目化|备忘录|盘点块)[^。；\n]{0,12}(叙事|承担|铺陈|呈现)"#,
+    ]
+    if structuralCraftPatterns.contains(where: {
+      lowered.range(of: $0, options: .regularExpression) != nil
+    }) {
+      return .prose
+    }
+    let deltaMarkers = [
+      "delta", "consistencydelta", "差量", "登记", "upsert", "attributes",
+      "type字段", "实体分类", "索引分类", "ent-", "tl-", "hook-",
+    ]
+    let repairMarkers = [
+      "缺少", "遗漏", "未登记", "漏登", "缺口", "需要在", "应在", "补充", "补全",
+      "登记", "记录", "类型", "type字段", "分类", "字段", "为空", " id", "id ", "统一",
+    ]
+    if deltaMarkers.contains(where: lowered.contains),
+       repairMarkers.contains(where: lowered.contains) {
+      return .delta
+    }
+    return .prose
+  }
+
+  private func repairScope(_ issue: String) -> IssueRepairScope {
+    taggedRepairScope(issue) ?? inferredRepairScope(issue)
+  }
+
+  /// True when every blocking finding can be cleared by rewriting the delta
+  /// alone. Erring toward delta-only is cheap and self-correcting: the repair
+  /// leaves the prose untouched and a still-failing re-review falls through to
+  /// the rewrite loop, whereas a needless rewrite burns a full generate+review
+  /// round on text that was already correct.
   func shouldAttemptDeltaOnlyRepair(_ review: NativeReview) -> Bool {
     guard !review.issues.isEmpty else { return false }
-    let deltaMarkers = ["delta", "consistencydelta", "差量", "登记", "type字段", "实体分类", "索引分类"]
-    let repairMarkers = ["缺少", "遗漏", "未登记", "需要在", "应在", "补充", "补全", "登记", "记录", "类型", "type字段", "分类", "字段", " id", "id ", "统一"]
-    let proseOrConflictMarkers = [
-      "正文", "剧情", "叙事", "字数", "文风", "节拍", "因果", "行为", "自相矛盾",
-      "冲突", "不可变", "违反", "不允许新增", "越界", "时间线错误",
-    ]
-    return review.issues.allSatisfy { issue in
-      let lowered = issue.lowercased()
-      return deltaMarkers.contains(where: lowered.contains)
-        && repairMarkers.contains(where: lowered.contains)
-        && !proseOrConflictMarkers.contains(where: lowered.contains)
-    }
+    return review.issues.allSatisfy { repairScope($0) == .delta }
   }
 
   /// Drives up to `maxAutoRevisionRounds` rewrite+re-review rounds. The first
@@ -522,6 +668,10 @@ extension InkOSCore {
     var anyRoundPersisted = false
     var stopBeforeRewrite = false
     var completedRewriteRounds = 0
+    // Set after a stalled round so the next one runs with an explicit
+    // "you returned identical text" directive and a raised temperature. Only one
+    // escalation is attempted; a second stall is a real dead end.
+    var stallEscalated = false
 
     if let triggerReview, shouldRevalidateStoredDraft(note: note, review: triggerReview) {
       automaticLeadIn = true
@@ -581,10 +731,23 @@ extension InkOSCore {
       bookID: bookID,
       chapterNumber: chapter.number
     )
-    let wantsDeltaOnlyRepair = missingDelta
+    var wantsDeltaOnlyRepair = missingDelta
       || (deltaRepairReview.map(shouldAttemptDeltaOnlyRepair) ?? false)
-    if !stopBeforeRewrite, wantsDeltaOnlyRepair {
-      if missingDelta {
+    // Delta repair used to get exactly one attempt: a re-review that came back
+    // with fresh `[delta]`-only findings still fell through to the rewrite loop,
+    // which is the wrong tool by construction. Chapter 27 of 《渊雨浩劫》 spent
+    // its whole budget that way — the repair closed the ID collision, the
+    // re-review answered with three more delta faults (unclosed hooks, a
+    // duplicate hook), and the three rewrite rounds that followed all worked on
+    // prose that needed no edit. Two of them returned byte-identical text (the
+    // correct answer for a delta-only fault), which the stall detector read as a
+    // dead end and escalated to temperature 0.7 with "the text must differ" —
+    // so the model padded the chapter to 4052 characters and died on the length
+    // ceiling. Keep repairing while the findings stay in delta scope.
+    var deltaRepairRounds = 0
+    while !stopBeforeRewrite, wantsDeltaOnlyRepair, deltaRepairRounds < maxAutoRevisionRounds {
+      deltaRepairRounds += 1
+      if missingDelta, deltaRepairRounds == 1 {
         recordDebug(scope: "review", message: "chapter.delta_revision.forced", data: [
           "bookId": bookID,
           "chapterNumber": chapter.number,
@@ -619,11 +782,22 @@ extension InkOSCore {
             "bookId": bookID,
             "chapterNumber": chapter.number,
             "status": "pending_review",
+            "deltaRounds": deltaRepairRounds,
           ])
           return
         }
         currentNote = automaticRevisionNote(for: review)
         currentMode = "auto_rewrite"
+        // Still delta-only? Repair again rather than rewriting correct prose.
+        wantsDeltaOnlyRepair = shouldAttemptDeltaOnlyRepair(review)
+        if wantsDeltaOnlyRepair, deltaRepairRounds < maxAutoRevisionRounds {
+          recordDebug(scope: "review", message: "chapter.delta_revision.repeated", data: [
+            "bookId": bookID,
+            "chapterNumber": chapter.number,
+            "round": deltaRepairRounds + 1,
+            "reason": "复审意见仍全部属于 Delta 范畴，继续只修登记，不重写正文。",
+          ])
+        }
       } else {
         attempts.append([
           "pass": false,
@@ -636,6 +810,7 @@ extension InkOSCore {
         stopBeforeRewrite = outcome.persisted
         currentNote = "\(note)\n\n【Delta 单独修复失败，允许重写正文与 Delta】\n\(outcome.error?.localizedDescription ?? "")"
         currentMode = "auto_rewrite"
+        wantsDeltaOnlyRepair = false
       }
     }
 
@@ -649,6 +824,7 @@ extension InkOSCore {
         attempts: attempts,
         startedAt: startedAt,
         lastReview: lastReview,
+        triggerReview: triggerReview,
         lastError: lastError,
         anyRoundPersisted: anyRoundPersisted,
         automatic: true,
@@ -671,7 +847,8 @@ extension InkOSCore {
         round: round,
         startedAt: startedAt,
         priorAttempts: attempts,
-        isAutomaticRound: isAutomaticRound
+        isAutomaticRound: isAutomaticRound,
+        stallEscalated: stallEscalated
       )
       anyRoundPersisted = anyRoundPersisted || outcome.persisted
       let attemptNumber = attempts.count + 1
@@ -717,14 +894,50 @@ extension InkOSCore {
             content: outcome.content
           )
         }
-        // If the model returned unchanged output, retrying with the same prompt
-        // is futile. Break immediately rather than burning more rounds.
+        // Unchanged output used to terminate the whole revision on the spot. That
+        // made every deterministic local-rule failure a dead end: at the
+        // configured temperature (0.2) restating the same request reproduces the
+        // same prose, so chapter 25 of 《渊雨浩劫》 burned a round and died 257
+        // characters short of its floor with no way to recover. Escalate once
+        // instead — say plainly that nothing changed, name the required edit, and
+        // raise the temperature — and only treat a second stall as a real dead end.
         if errorMessage.contains("完全相同") || errorMessage.contains("stalled") {
+          if !stallEscalated, round < maxAutoRevisionRounds {
+            stallEscalated = true
+            recordDebug(scope: "craft", message: "chapter.revision.stallEscalated", data: [
+              "bookId": bookID,
+              "chapterNumber": chapter.number,
+              "round": round,
+              "reason": "输出与上一版逐字相同，下一轮改用强化指令并抬高温度重试。",
+            ])
+            currentMode = "auto_rewrite"
+            lastError = nil
+            continue
+          }
           recordDebug(scope: "craft", message: "chapter.revision.terminated", level: "warning", data: [
             "bookId": bookID,
             "chapterNumber": chapter.number,
             "round": round,
-            "reason": "模型输出停滞，终止自动重试。",
+            "escalated": stallEscalated,
+            "reason": stallEscalated
+              ? "强化指令后输出仍与上一版相同，终止自动重试。"
+              : "模型输出停滞且已无剩余轮次，终止自动重试。",
+          ])
+          break
+        }
+        // The endpoint rejected the request itself (4xx other than rate
+        // limiting, which `requestLLM` already retried and gave up on). Re-issuing
+        // the same call cannot succeed, so spending the remaining rounds on it is
+        // pure churn — stop and let a human see the rejection.
+        if let coreError = outcome.error as? InkOSCoreError,
+           (400...499).contains(coreError.statusCode),
+           coreError.statusCode != 429 {
+          recordDebug(scope: "craft", message: "chapter.revision.terminated", level: "warning", data: [
+            "bookId": bookID,
+            "chapterNumber": chapter.number,
+            "round": round,
+            "statusCode": coreError.statusCode,
+            "reason": "请求被服务端拒绝，重试同一调用不会成功，终止自动重试。",
           ])
           break
         }
@@ -757,6 +970,7 @@ extension InkOSCore {
       attempts: attempts,
       startedAt: startedAt,
       lastReview: lastReview,
+      triggerReview: triggerReview,
       lastError: lastError,
       anyRoundPersisted: anyRoundPersisted,
       // `maxAutoRevisionRounds > 1` used to sit in this disjunction; it is a
@@ -959,6 +1173,7 @@ extension InkOSCore {
         operation: "deltaOnlyRepair"
       )
       let repairedRaw = try await requestConsistencyDeltaRepair(
+        bookID: bookID,
         chapterNumber: chapter.number,
         title: chapter.title,
         content: chapter.content,
@@ -1049,6 +1264,7 @@ extension InkOSCore {
   }
 
   private func requestConsistencyDeltaRepair(
+    bookID: String,
     chapterNumber: Int,
     title: String,
     content: String,
@@ -1056,14 +1272,27 @@ extension InkOSCore {
     findings: String
   ) async throws -> [String: Any] {
     let currentJSON = String(data: try encoder.encode(currentDelta), encoding: .utf8) ?? "{}"
+    // The full continuity index the reviewer sees is a ~70 000-character JSON
+    // blob, and an ID buried in it is easy to miss: chapter 27 reused ENT-030
+    // for 苏晚晴 even though the canon showed ENT-CH26-001. A flat ID → name
+    // roster is the one thing this repairer must not have to search for.
+    let registry = (try? entityIDRegistryText(bookID: bookID)) ?? "（无法读取，请勿改动任何既有 ID）"
     let prompt = """
       你是 InkOS 一致性登记修复器。正文已经定稿，本次禁止改写正文、标题、剧情、字数或文风，只修复 consistencyDelta。
       根据审核意见校正当前 Delta，保留没有问题的 ID 和字段，只修改审核点名的登记错误；正文未支持的事实不得新增。
       entities.type 最终只能输出五个英文值：character、object、location、faction、concept。审核意见中的 item、物品、物件、设备、资源或储备一律输出 object，地点或场所输出 location，人物输出 character。
+      每个实体的 id 必须与下面【正典实体 ID 名册】里同名条目的 ID 完全一致；名册里没有的实体才算新实体，新实体必须使用名册中尚未出现的 ID。绝不能把一个实体登记成名册中另一个实体已占用的 ID。
+      remove.hooks 的 id 必须使用下面【未关闭伏笔名册】中的真实 hookId；猜测或自造 ID 会触发"删除目标不存在"校验错误。
       只输出修复后的 consistencyDelta JSON：{"upsert":{"immutableCanon":[],"worldRules":[],"entities":[],"knowledgeBoundaries":[],"timeline":[],"hooks":[]},"remove":{"immutableCanon":[],"worldRules":[],"entities":[],"knowledgeBoundaries":[],"timeline":[],"hooks":[]}}。
 
       【审核意见】
       \(findings)
+
+      【正典实体 ID 名册】
+      \(registry)
+
+      【未关闭伏笔名册】
+      \((try? openHooksRegistryText(bookID: bookID)) ?? "（无法读取，请勿关闭任何伏笔）")
 
       【当前 consistencyDelta】
       \(currentJSON)
@@ -1101,7 +1330,8 @@ extension InkOSCore {
     round: Int,
     startedAt: String,
     priorAttempts: [[String: Any]],
-    isAutomaticRound: Bool
+    isAutomaticRound: Bool,
+    stallEscalated: Bool = false
   ) async -> RevisionRoundOutcome {
     let key = generationKey(bookID, baseChapter.number)
     var latestTitle = baseChapter.title
@@ -1156,8 +1386,12 @@ extension InkOSCore {
           "已超出验收上限 \(ceiling) 字约 \(currentCount - ceiling) 字，" +
           "必须精简或将多余剧情移至后续章节。"
       } else if currentCount > maxWords {
+        // "建议适当精简" alone let chapter 27 of 《渊雨浩劫》 read this band as
+        // "essentially fine" and grow to 4052 while repairing a delta-only
+        // defect. The ceiling is a hard local gate, so say so here.
         wordGapInstruction =
-          "超出软上限约 \(currentCount - maxWords) 字（验收上限 \(ceiling) 字），建议适当精简。"
+          "超出软上限约 \(currentCount - maxWords) 字，建议适当精简；"
+          + "无论如何修订，全章不得超过验收上限 \(ceiling) 字，超出即整轮作废，因此严禁扩写。"
       } else {
         wordGapInstruction = "字数已在目标区间，修订以质量为主，保持字数基本不变。"
       }
@@ -1186,6 +1420,30 @@ extension InkOSCore {
       }
       let beatSection = beat.map(beatBriefText)
         ?? "（本章没有节拍卡，按既有正文范围修订，不要扩大本章承载的剧情量）"
+      // Set when the previous round returned prose byte-identical to its input.
+      // Restating the same request produces the same sample, so the retry has to
+      // say plainly that nothing changed and name the concrete edit required.
+      //
+      // The "expand 2–3 scenes" line is conditional on the chapter actually being
+      // short, and must stay that way: chapter 27 of 《渊雨浩劫》 sat 6 characters
+      // over its soft cap with a delta-only defect, and an unconditional expand
+      // instruction at temperature 0.7 took it to 4052 against a 3795 ceiling —
+      // three rounds died on a chapter whose prose needed no edit at all.
+      let stallLengthDirective = currentCount >= maxWords
+        ? "- 本章字数已到上限，绝不可扩写：必须在不增加总字数的前提下改写"
+          + "（替换或重写句子、收紧冗余表述），改完后总字数不得超过 \(ceiling) 字；"
+        : "- 若问题是字数或密度不足，选定 2–3 个已有场景就地展开（增加动作、对话、环境细节与人物反应），"
+          + "不要新增剧情线、不要提前后续章节内容、不要用符号或空行凑数；"
+      let stallDirective = stallEscalated
+        ? """
+
+          【重要：上一轮你返回的正文与修订前逐字相同，等于没有修改】
+          请不要再原样返回。本轮必须产出与上一版不同的正文：
+          - 逐条落实上面的修改意见，改动要能在正文里看得见；
+          \(stallLengthDirective)
+          - 保留已经正确的段落，只改需要改的部分，但整章不得与上一版完全一致。
+          """
+        : ""
       let prompt = """
         你是 InkOS 章节修订器。请依据修改意见修订完整正文，保持既有设定、人物知识边界、持久物品和前后章因果。
         此前章节与本章既有正文确立的中断、不可用或耗尽状态（断信号、断电、断水、资源耗尽等）有约束力：修订稿使用通信、电力、设施或消耗品之前必须确认其可用；改变状态可用性时必须在正文写出发生的时刻与原因；同章之内不得自相矛盾。
@@ -1195,11 +1453,20 @@ extension InkOSCore {
         consistencyDelta 必须完整描述修订后本章的新贡献；旧版本仅由本章产生的记录会自动退出。新增或更新写入 upsert；remove 只用于正文事件明确终止的既有跨章记录。
         修订稿的 Delta 必须覆盖修订后正文的全部事实：原版本已登记且仍然成立的实体与伏笔必须保留，修订不是从零登记；正文出现的每个具名人物、地点、持久物品都必须登记；本章兑现或推翻的既有伏笔必须在 remove.hooks 中按 ID 关闭；不得静默丢弃索引中的既有实体。
         entities.type 只能输出 character、object、location、faction、concept；物品、设备、资源和储备统一写 object，不得写 item 或中文类型名。
+        entities 的 id 规则：已在【正典实体 ID 名册】中出现的实体，必须沿用名册里同名条目的 ID；名册中没有的才是新实体，新实体必须使用名册里尚未出现的 ID。把某个实体登记成名册中另一实体已占用的 ID 会导致本章被打回。
+        remove.hooks 的 id 规则：必须使用【未关闭伏笔名册】中的真实 hookId；猜测或自造 ID 会触发"删除目标不存在"错误，本章将被打回。
         只输出 JSON：{"title":"章节标题","content":"完整正文","summary":"修订摘要","consistencyDelta":{"upsert":{"immutableCanon":[],"worldRules":[],"entities":[{"id":"","name":"","type":"character|object|location|faction|concept"}],"knowledgeBoundaries":[],"timeline":[],"hooks":[]},"remove":{"immutableCanon":[],"worldRules":[],"entities":[],"knowledgeBoundaries":[],"timeline":[],"hooks":[]}}}。
         修订模式：\(mode)
         修改意见：\(note)
+        \(stallDirective)
 
         \(craft)
+
+        【正典实体 ID 名册】
+        \(entityIDRegistryText(plan.continuity))
+
+        【未关闭伏笔名册】
+        \(openHooksRegistryText(plan.continuity))
 
         【本章节拍卡】
         \(beatSection)
@@ -1220,6 +1487,9 @@ extension InkOSCore {
         chapterNumber: baseChapter.number,
         requireDelta: plan.continuity.policy.requireConsistencyDelta,
         timeout: 600,
+        // Raised only for a stall retry: the configured 0.2 is near-deterministic,
+        // so the same prompt reproduces the same prose no matter how it is worded.
+        temperature: stallEscalated ? 0.7 : nil,
         onPartialContent: { [weak self] partial in
           await self?.updateGenerationLiveText(key: key, rawText: partial)
         }
@@ -1429,17 +1699,29 @@ extension InkOSCore {
     attempts: [[String: Any]],
     startedAt: String,
     lastReview: NativeReview?,
+    /// The finding that opened this revision — the local validator's verdict or
+    /// the stored review. Used only to explain a stall, where no round produced
+    /// a newer review of its own.
+    triggerReview: NativeReview?,
     lastError: Error?,
     anyRoundPersisted: Bool,
     automatic: Bool,
     roundsCompleted: Int
   ) {
     let key = generationKey(bookID, chapter.number)
-    let errorText = lastError?.localizedDescription
-      ?? lastReview?.issues.joined(separator: "；")
+    // A stall means the model returned the previous text unchanged, so the
+    // reason this chapter is still blocked is whatever the last review found —
+    // "输出与原文完全相同" is mechanism, not a defect a human can act on. Any
+    // other error (transport, JSON, persistence) is itself the news and stays.
+    let stalled = lastError?.localizedDescription == RevisionRoundOutcome.stallErrorMessage
+    let standingReview = lastReview ?? triggerReview
+    let standingIssues = standingReview?.issues.joined(separator: "；").nonEmpty
+    let errorText = (stalled ? standingIssues : nil)
+      ?? lastError?.localizedDescription
+      ?? standingIssues
       ?? "自动修改多轮后仍未通过"
     let review: NativeReview
-    if let lastError {
+    if let lastError, !(stalled && standingIssues != nil) {
       review = NativeReview(
         pass: false,
         model: "native-revision-loop",
@@ -1447,8 +1729,8 @@ extension InkOSCore {
         issues: ["[hard] 修订异常：\(lastError.localizedDescription)"],
         revisionGuidance: "请根据错误信息修正后重新提交修改。"
       )
-    } else if let lastReview {
-      review = lastReview
+    } else if let standingReview {
+      review = standingReview
     } else {
       review = NativeReview(
         pass: false,
@@ -1553,7 +1835,9 @@ extension InkOSCore {
   ) throws {
     let key = generationKey(bookID, chapterNumber)
     let errorMessage = validationError.localizedDescription
-    let issue = "[hard] 本地章节规则：\(errorMessage)"
+    // Local draft rules are length and craft checks, so clearing them always
+    // means editing the text — never a delta-only repair.
+    let issue = "[hard][prose] 本地章节规则：\(errorMessage)"
     let review = NativeReview(
       pass: false,
       model: "native-draft-validator",
@@ -1715,8 +1999,14 @@ extension InkOSCore {
         pass: false,
         model: "native-continuity-validator",
         summary: "候选连续性差量未通过本地规则校验",
-        issues: ["[hard] 连续性差量：\(error.localizedDescription)"],
-        revisionGuidance: "修正文与 consistencyDelta，使其符合连续性策略后重新提交。"
+        // These are structural delta faults (missing removal target, locked
+        // attribute, illegal type change), so the delta-only repair goes first.
+        // Where the prose is the real cause, that repair's re-review still
+        // fails and the rewrite loop picks it up — the cheap attempt costs one
+        // delta call, while the reverse misclassification costs a full
+        // generate+review round on text that needed no edit.
+        issues: ["[hard][delta] 连续性差量：\(error.localizedDescription)"],
+        revisionGuidance: "修正 consistencyDelta，使其符合连续性策略后重新提交；确认正文本身无需改动。"
       )
     }
     let plan = try synchronizeContinuityProjection(bookID: bookID)
@@ -1750,7 +2040,10 @@ extension InkOSCore {
       正文不得用清单、备忘录、条目化盘点或资料登记块承担叙事。主角本人的账本记录也只能以动作与判断混合的方式呈现，不能以并列条目铺陈，出现记为 hard。
       第 1 至 3 章作为开篇段整体必须至少建立一次主角核心能力或金手指锚点：异常征兆、首次显现或章末触发均可。前章已经建立后，当前章无需重复；节拍卡明确禁止能力显现时，以禁止清单为准，不得为了重复锚点提前能力。仅在截至当前章整个开篇段仍完全没有锚点时记为 hard。
       环境状态与资源可用性必须前后一致：此前章节或本章前文确立的中断、不可用或耗尽状态（断信号、断电、断水、封路、资源耗尽、设施损坏等），后文不得在没有恢复、替代或解释的情况下当作可用。同章之内自相矛盾（如先说信号彻底没了、后文又收到群视频）同样记为 hard。
-      以上任一问题输出前缀 [hard]。
+      以上任一问题输出前缀 [hard]，并紧跟一个修复范围标签，二者只能选一个：
+      [delta]：只需改候选 consistencyDelta 就能消除该问题，正文不必改动一个字。正文写对了、只是没登记进 Delta（如实体 attributes 为空、漏登 upsert、时间线 order 排序错误、删除目标不存在、type 取值不规范）都属于此类；即使你在描述中引用正文作为"应当登记什么"的依据，只要正文本身无需修改，就必须标 [delta]。
+      [prose]：必须改动正文才能消除该问题（字数不足或超限、章末收尾方式违规、条目化叙事、节拍卡禁止内容、正文与既有设定直接冲突、正文数字与已登记消耗不符、正文写了无依据的细节）。
+      标签决定系统走"只补登记"还是"重写正文"：把只需补登记的问题标成 [prose]，会让系统重写一篇本来正确的正文，属于严重误导。
 
       第二类：写法质量（不阻断）。依据下方写法内核与本书写法约束检查：
       是否有用总结代替关键场景，是否跳过了本该写出的冲突过程；开场是否为背景综述或履历介绍；对话是否承载了关键分歧和转折；本章必需事件和挫折是否真的在场景里发生；视角是否统一；配角语言是否符合其身份、能否相互区分；承诺的冷幽默是否落地；主角是否只有功能反应而没有一处情感泄底（恐惧、犹豫、疲惫、自嘲等）——配角有人味而主角像机器时尤其要点名。
@@ -1758,8 +2051,8 @@ extension InkOSCore {
 
       pass 只取决于 [hard]：没有 [hard] 问题时 pass=true，即使存在 [soft] 问题。
       只输出 JSON：
-      {"pass":true,"summary":"结论","issues":["[hard] 类型：具体问题","[soft] 写法：具体问题"],"revisionGuidance":""}
-      issues 必须是字符串数组，每项以 [hard] 或 [soft] 开头，不要返回对象数组。
+      {"pass":true,"summary":"结论","issues":["[hard][delta] 类型：具体问题","[hard][prose] 类型：具体问题","[soft] 写法：具体问题"],"revisionGuidance":""}
+      issues 必须是字符串数组；每项以 [hard] 或 [soft] 开头，[hard] 项必须紧跟 [delta] 或 [prose]；不要返回对象数组。
 
       \(craft)
 
@@ -1932,6 +2225,14 @@ extension InkOSCore {
     let beatSection = beat.map { beatBriefText($0) }
       ?? "（本章暂无节拍卡，按分卷目标推进单一问题，不要跨越多个阶段目标。）"
     let craft = try craftDirectives(bookID: bookID, chapterNumber: chapterNumber)
+    // Derivative-only: the story clock and the retrieved original passages. Empty
+    // for an original book, so its prompt is unchanged by this feature.
+    let derivative = derivativeGenerationSections(
+      bookID: bookID,
+      chapterNumber: chapterNumber,
+      beat: beat,
+      plan: plan
+    )
     return """
       你是原生 InkOS 长篇小说写作引擎。生成第\(chapterNumber)章完整正文。
       正文字数必须落在 \(minWords) 至 \(maxWords) 字之间，目标 \(targetWords) 字（验收上限 \(maxWords + max(200, maxWords / 10)) 字）。中文字符不得少于 \(bodyFloor) 个，标点、空行与符号不计入密度；内容不足时展开场景与对话，禁止靠符号或空行凑数。严格遵守权威设定、分卷目标、时间线、人物知识边界、持久物品与特殊约束。
@@ -1943,6 +2244,7 @@ extension InkOSCore {
       consistencyDelta 必须记录本章新增、更新或删除的事实，它是本章对连续性索引的全部贡献而非节选：正文出现的每个具名人物、地点、持久物品、组织、概念都必须登记；本章兑现或推翻的既有伏笔必须在 remove.hooks 中按 ID 关闭；索引中的既有实体不得静默丢弃，本章仍然成立的事实必须保留；新增随机设定必须登记，并与既有事实兼容。
       entities 每一项的 type 只能取五个值之一，必须按对象性质如实归类，禁止一律填 character：
       character 有意识的人物或生物；location 楼层、房间、区域、建筑等场所；object 物品、设备、资源、储备等实体物；faction 组织、势力、团体；concept 能力、规则、现象等抽象概念。例如“201公寓”“储物间”是 location，“电热水器存水”“界务门”这类物件或装置是 object，只有真正的人才是 character。
+      entities 的 id 规则：已在【正典实体 ID 名册】中出现的实体，必须沿用名册里同名条目的 ID，一个字符都不能改；名册中没有的实体才是新实体，新实体必须使用名册里尚未出现的 ID。把某个实体登记成名册中另一实体已占用的 ID 会导致本章被打回。
       正文里改变生存账本或后续决策的关键资源（存水量、存粮、燃料、电量等）必须在 entities 或 hooks 中登记，且 Delta 中的每个数字与结论都要与正文严格一致，不得出现正文一个数、Delta 另一个数的矛盾。
       此前章节确立的中断、不可用或耗尽状态（断信号、断电、断水、封路、资源耗尽等）对本章有约束力：使用通信、电力、设施或消耗品之前必须确认其当前可用；本章若要改变某个状态的可用性（如信号短暂恢复），必须在正文写出发生的时刻与原因，并登记进 consistencyDelta 的 worldRules；同章之内不得自相矛盾。
       只输出 JSON：{"title":"章节标题","content":"完整正文","summary":"章节摘要","consistencyDelta":{"upsert":{"immutableCanon":[],"worldRules":[],"entities":[{"id":"","name":"","type":"character|location|object|faction|concept"}],"knowledgeBoundaries":[],"timeline":[],"hooks":[]},"remove":{"immutableCanon":[],"worldRules":[],"entities":[],"knowledgeBoundaries":[],"timeline":[],"hooks":[]}}}。
@@ -1951,14 +2253,119 @@ extension InkOSCore {
       \(craft)
 
       【本章节拍卡】
-      \(beatSection)
+      \(beatSection)\(derivative.timeline)
+
+      【正典实体 ID 名册】
+      \(entityIDRegistryText(plan.continuity))
 
       【权威设定与当前状态】
-      \(try storyContext(bookID: bookID, maxCharacters: 100_000, plan: plan))
+      \(try storyContext(bookID: bookID, maxCharacters: 100_000, plan: plan))\(derivative.source)
 
       【上一章全文】
       \(previous)
       """
+  }
+
+  /// The story clock and retrieved original passages, for derivative books only.
+  ///
+  /// Returns empty strings for an original book. Non-throwing: retrieval touches a
+  /// SQLite index that may not exist yet (the customer imported a source but has not
+  /// finished ingesting it), and a chapter must still be writable in that state — it
+  /// simply writes without source quotations rather than failing generation.
+  private func derivativeGenerationSections(
+    bookID: String,
+    chapterNumber: Int,
+    beat: ChapterBeat?,
+    plan: LongFormPlanResponse
+  ) -> (timeline: String, source: String) {
+    guard bookKind(bookID: bookID) == .derivative else { return ("", "") }
+
+    var timelineSection = ""
+    let status = derivativeTimelineStatus(
+      bookID: bookID,
+      chapterNumber: chapterNumber,
+      continuity: plan.continuity
+    )
+    if let text = derivativeTimelineSection(status) {
+      timelineSection = "\n\n【本章的原著时间进度】\n\(text)\n"
+        + "以上时间进度与节拍卡同等强制：「尚未发生」的原著事件在本章不得发生，"
+        + "也不得被任何人知晓、预言或议论。"
+    }
+
+    var sourceSection = ""
+    let keys = derivativeRetrievalKeys(beat: beat, plan: plan)
+    if !keys.isEmpty {
+      let query = derivativeRetrievalQuery(beat: beat)
+      if let text = try? derivativeSourceContext(
+        bookID: bookID,
+        keys: keys,
+        query: query,
+        limit: 8,
+        maxCharacters: 6_000
+      ) {
+        sourceSection = "\n\n【原著正典检索结果】\n"
+          + "以下是从原著原文检索到的相关段落，只作为事实依据，不要照抄其文字或把它当作本章剧情：\n"
+          + text
+      }
+    }
+    return (timelineSection, sourceSection)
+  }
+
+  /// Retrieval keys for the chapter: the canon names the beat actually involves.
+  ///
+  /// Each key is a single term, and the multi-key search is OR — one whitespace-
+  /// joined key would AND the terms instead and typically return nothing, since a
+  /// single source paragraph rarely contains every character the chapter features.
+  /// Keys are intersected with registered canon entities so a name the derivative
+  /// work invented is not searched for in a novel that has never heard of it; an
+  /// invented name matches nothing and would only crowd out the real keys.
+  func derivativeRetrievalKeys(beat: ChapterBeat?, plan: LongFormPlanResponse) -> [String] {
+    guard let beat else { return [] }
+    let canonNames = Set(plan.continuity.entities.map { $0.name })
+    var keys: [String] = []
+    var seen = Set<String>()
+
+    func append(_ name: String) {
+      let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard keys.count < 6,
+        trimmed.count >= 2,
+        canonNames.contains(trimmed),
+        !seen.contains(trimmed)
+      else { return }
+      seen.insert(trimmed)
+      keys.append(trimmed)
+    }
+
+    for name in beat.focusCharacters {
+      append(name)
+    }
+
+    // Beat generators do not always mirror every involved entity into
+    // `focusCharacters`: locations, factions and objects usually appear only in
+    // the goal, scenes or required events. Search those active beat fields for
+    // registered canon names so the source passages relevant to the actual action
+    // still reach the writing prompt.
+    let activeText = ([beat.goal, beat.openingHook]
+      + beat.scenes
+      + beat.requiredEvents
+      + [beat.endingHook, beat.setback, beat.notes])
+      .joined(separator: "\n")
+    for name in plan.continuity.entities.map(\.name) where activeText.contains(name) {
+      append(name)
+      if keys.count >= 6 { break }
+    }
+    return keys
+  }
+
+  /// Free-text side of hybrid retrieval: what the chapter is about, so the semantic
+  /// half can surface a passage that never names the keys.
+  private func derivativeRetrievalQuery(beat: ChapterBeat?) -> String? {
+    guard let beat else { return nil }
+    let parts = [beat.goal, beat.openingHook, beat.scenes.first ?? ""]
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+    let query = parts.joined(separator: "。")
+    return query.isEmpty ? nil : String(query.prefix(400))
   }
 
   /// Assembles the authoritative context. Files get reserved shares of the
@@ -2068,20 +2475,25 @@ extension InkOSCore {
     overrideModel: String? = nil,
     overrideBaseURL: String? = nil,
     overrideAPIKey: String? = nil,
+    overrideTemperature: Double? = nil,
     timeout: TimeInterval = 300,
     onPartialContent: (@Sendable (String) async -> Void)? = nil
   ) async throws -> LLMResult {
     let raw = try loadRawConfig()
-    let isReview = role == .review
+    // Each role reads its own model/endpoint/key triple and falls back to the
+    // primary one when the role-specific value is blank, so configuring only a
+    // different model name is enough.
+    let keys = role.modelRole.configKeys
     let model = overrideModel?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
-      ?? string(isReview ? raw["reviewModel"] : raw["model"], fallback: string(raw["model"], fallback: "gpt-5.6-terra"))
+      ?? string(raw[keys.model]).nonEmpty
+      ?? string(raw["model"], fallback: "gpt-5.6-terra")
     let configuredBase = overrideBaseURL?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
-      ?? string(isReview ? raw["reviewBaseUrl"] : raw["baseUrl"]).nonEmpty
+      ?? string(raw[keys.baseURL]).nonEmpty
       ?? string(raw["baseUrl"])
     let baseURL = try validatedEndpoint(configuredBase, existing: raw)
     let suppliedKey = overrideAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     let key = suppliedKey.nonEmpty
-      ?? string(isReview ? raw["reviewApiKey"] : raw["apiKey"]).nonEmpty
+      ?? string(raw[keys.apiKey]).nonEmpty
       ?? string(raw["apiKey"])
     guard !key.isEmpty else { throw InkOSCoreError("请先在设置中填写模型 API Key", statusCode: 400) }
     guard !model.isEmpty else { throw InkOSCoreError("请先在设置中选择模型", statusCode: 400) }
@@ -2095,24 +2507,58 @@ extension InkOSCore {
         ["role": "user", "content": prompt],
       ],
     ]
-    if let temperature = raw["temperature"] as? NSNumber { body["temperature"] = temperature.doubleValue }
-    if let maxTokens = integer(raw["maxTokens"]), maxTokens > 0 { body["max_tokens"] = maxTokens }
+    // An explicit override wins over the configured value. Retries that need a
+    // different sample than the one that just failed raise it — at the configured
+    // 0.2 the model is near-deterministic and re-returns identical prose.
+    if let overrideTemperature {
+      body["temperature"] = overrideTemperature
+    } else if let temperature = raw["temperature"] as? NSNumber {
+      body["temperature"] = temperature.doubleValue
+    }
+    // `buildRequest` owns the `max_tokens` key so a retry can raise it.
+    let configuredMaxTokens = integer(raw["maxTokens"]).flatMap { $0 > 0 ? $0 : nil }
     if json { body["response_format"] = ["type": "json_object"] }
 
-    var request = URLRequest(url: url, timeoutInterval: timeout)
-    request.httpMethod = "POST"
-    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-    if onPartialContent != nil {
-      request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+    func buildRequest(maxTokens: Int?) throws -> URLRequest {
+      var body = body
+      if let maxTokens {
+        body["max_tokens"] = maxTokens
+      } else {
+        body.removeValue(forKey: "max_tokens")
+      }
+      var request = URLRequest(url: url, timeoutInterval: timeout)
+      request.httpMethod = "POST"
+      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+      request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+      if onPartialContent != nil {
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+      }
+      request.httpBody = try JSONSerialization.data(withJSONObject: body)
+      return request
     }
-    request.httpBody = try JSONSerialization.data(withJSONObject: body)
     let started = Date()
     // Transient upstream failures (rate limit, 5xx, network) get up to two
     // retries with backoff. Client errors (4xx) and cancellation propagate
     // immediately — retrying those only burns time.
     let maxAttempts = 3
+    // Raised for the next attempt when a reasoning model spends the whole budget
+    // thinking. `max_tokens` is a ceiling, not a reservation: a request that only
+    // needs 10k tokens costs the same whether the ceiling is 16k or 64k, so
+    // raising it on retry has no cost for prompts that were already succeeding.
+    // Measured on this exact beat prompt against `deepseek-v4-flash`: the reasoning
+    // pass varied between 5 347 and 16 383 tokens across identical requests, so a
+    // 16 384 ceiling fails a large fraction of the time and the failure looks
+    // random. Retrying at the same ceiling is what burned all three attempts on
+    // chapter 1 of 《灰雾之前》.
+    var budget = configuredMaxTokens
+    // Set when the attempt that just failed would be fixed by a larger ceiling —
+    // either no prose at all, or JSON cut off mid-object. The status code alone
+    // cannot carry this: an empty completion that did not report `length` is a 502,
+    // and so is a dropped connection, but only the first is fixed by more budget.
+    var lastAttemptNeedsMoreBudget = false
     for attempt in 1...maxAttempts {
+      let request = try buildRequest(maxTokens: budget)
+      lastAttemptNeedsMoreBudget = false
       do {
         if let onPartialContent {
           let streamed = try await performLLMStreamingRequest(
@@ -2121,7 +2567,24 @@ extension InkOSCore {
             onPartialContent: onPartialContent
           )
           guard !streamed.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw InkOSCoreError("模型返回了空内容", statusCode: 502)
+            lastAttemptNeedsMoreBudget = true
+            throw emptyContentError(
+              model: model,
+              finishReason: streamed.finishReason,
+              reasoningCharacters: streamed.reasoningCharacters,
+              maxTokens: budget
+            )
+          }
+          if let error = truncatedJSONError(
+            model: model,
+            json: json,
+            finishReason: streamed.finishReason,
+            contentCharacters: streamed.content.count,
+            reasoningCharacters: streamed.reasoningCharacters,
+            maxTokens: budget
+          ) {
+            lastAttemptNeedsMoreBudget = true
+            throw error
           }
           return LLMResult(
             content: streamed.content,
@@ -2141,7 +2604,24 @@ extension InkOSCore {
         let message = choices.first?["message"] as? [String: Any]
         let content = extractMessageContent(message?["content"])
         guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-          throw InkOSCoreError("模型返回了空内容", statusCode: 502)
+          lastAttemptNeedsMoreBudget = true
+          throw emptyContentError(
+            model: model,
+            finishReason: (choices.first?["finish_reason"] as? String)?.nonEmpty,
+            reasoningCharacters: extractMessageContent(message?["reasoning_content"]).count,
+            maxTokens: budget
+          )
+        }
+        if let error = truncatedJSONError(
+          model: model,
+          json: json,
+          finishReason: (choices.first?["finish_reason"] as? String)?.nonEmpty,
+          contentCharacters: content.count,
+          reasoningCharacters: extractMessageContent(message?["reasoning_content"]).count,
+          maxTokens: budget
+        ) {
+          lastAttemptNeedsMoreBudget = true
+          throw error
         }
         return LLMResult(
           content: content,
@@ -2151,14 +2631,41 @@ extension InkOSCore {
           finishReason: (choices.first?["finish_reason"] as? String)?.nonEmpty
         )
       } catch let error as InkOSCoreError {
+        // 404 (no relay channel for the configured model) is deliberately absent:
+        // the model name will not start existing mid-call, so a retry reproduces it
+        // at full cost.
         let transient = [429, 500, 502, 503, 504].contains(error.statusCode)
-        guard transient, attempt < maxAttempts else { throw error }
+        // An attempt that produced no prose is retried at a higher ceiling. Retrying
+        // at the same ceiling is close to pointless, but a higher one usually
+        // succeeds, because the reasoning length varies run to run on an identical
+        // prompt: measured 5 347 to 16 383 tokens on the same beat prompt. Doubling
+        // here rather than telling the user to change a setting, since the same
+        // prompt already succeeded at this ceiling on other attempts — the
+        // configured value is not wrong, only too close to the margin.
+        //
+        // Keyed on emptiness rather than on the 422, because the two empty-content
+        // outcomes need the same treatment and only one of them reports `length`.
+        // Chapter 1 of 《灰雾之前》 failed three times with `stop` and 11k-14k
+        // characters of reasoning, took the transient path, and re-ran at the
+        // identical ceiling all three times.
+        let raisable = lastAttemptNeedsMoreBudget && budget != nil
+        guard transient || raisable, attempt < maxAttempts else { throw error }
+        var raisedTo: Int? = nil
+        if raisable, let current = budget {
+          let raised = Swift.min(current * 2, Self.maxTokensRetryCeiling)
+          // Already at the ceiling: doubling changes nothing, so stop rather than
+          // spend another full reasoning pass on the identical request.
+          guard raised > current else { throw error }
+          budget = raised
+          raisedTo = raised
+        }
         let delaySeconds = attempt == 1 ? 4 : 12
         recordDebug(scope: "llm", message: "request.retry", level: "warning", data: [
           "attempt": attempt,
           "statusCode": error.statusCode,
           "error": error.localizedDescription,
           "retryAfterSeconds": delaySeconds,
+          "maxTokensRaisedTo": raisedTo ?? -1,
         ])
         try await Task.sleep(nanoseconds: UInt64(delaySeconds) * 1_000_000_000)
       }
@@ -2255,7 +2762,7 @@ extension InkOSCore {
     _ request: URLRequest,
     operation: String,
     onPartialContent: @Sendable (String) async -> Void
-  ) async throws -> (content: String, finishReason: String?) {
+  ) async throws -> (content: String, finishReason: String?, reasoningCharacters: Int) {
     do {
       let (bytes, response) = try await URLSession.shared.bytes(for: request)
       if let requestedURL = request.url?.absoluteString,
@@ -2282,6 +2789,11 @@ extension InkOSCore {
       var content = ""
       var nonStreamData = Data()
       var finishReason: String? = nil
+      // Reasoning models bill `reasoning_content` against the same `max_tokens`
+      // budget as `content`. Counting it lets the caller tell "the model said
+      // nothing" apart from "the model spent the whole budget thinking", which
+      // are the same empty string but need opposite handling.
+      var reasoningCharacters = 0
       var lastEmittedCount = 0
       var lastEmittedAt = Date.distantPast
       for try await line in bytes.lines {
@@ -2305,6 +2817,8 @@ extension InkOSCore {
         let piece = extractMessageContent(delta?["content"])
           .nonEmpty ?? extractMessageContent(message?["content"])
         if !piece.isEmpty { content += piece }
+        reasoningCharacters += extractMessageContent(delta?["reasoning_content"]).count
+          + extractMessageContent(message?["reasoning_content"]).count
         let now = Date()
         if content.count - lastEmittedCount >= 64
           || now.timeIntervalSince(lastEmittedAt) >= 0.18
@@ -2321,12 +2835,13 @@ extension InkOSCore {
         let choices = object["choices"] as? [[String: Any]] ?? []
         let message = choices.first?["message"] as? [String: Any]
         content = extractMessageContent(message?["content"])
+        reasoningCharacters += extractMessageContent(message?["reasoning_content"]).count
         if let reason = choices.first?["finish_reason"] as? String, !reason.isEmpty {
           finishReason = reason
         }
       }
       if !content.isEmpty { await onPartialContent(content) }
-      return (content, finishReason)
+      return (content, finishReason, reasoningCharacters)
     } catch is CancellationError {
       throw CancellationError()
     } catch let error as InkOSCoreError {
@@ -2522,12 +3037,14 @@ extension InkOSCore {
     chapterNumber: Int,
     requireDelta: Bool,
     timeout: TimeInterval,
+    temperature: Double? = nil,
     onPartialContent: (@Sendable (String) async -> Void)? = nil
   ) async throws -> (object: [String: Any], result: LLMResult) {
     var result = try await requestLLM(
       prompt: prompt,
       role: .primary,
       json: true,
+      overrideTemperature: temperature,
       timeout: timeout,
       onPartialContent: onPartialContent
     )
@@ -2563,6 +3080,7 @@ extension InkOSCore {
             """,
           role: .primary,
           json: true,
+          overrideTemperature: temperature,
           timeout: timeout,
           onPartialContent: onPartialContent
         )
@@ -2766,10 +3284,109 @@ extension InkOSCore {
     return ""
   }
 
+  /// Separates an empty completion worth retrying from one that is deterministic.
+  ///
+  /// A reasoning model bills `reasoning_content` against the same `max_tokens`
+  /// budget as `content`. When thinking exhausts the budget the relay still
+  /// answers 200, carrying `finish_reason: "length"` and an empty `content`.
+  /// Retrying spends the same budget on the same prompt and fails identically:
+  /// chapter 27 of 《渊雨浩劫》 burned three rounds that way at roughly two
+  /// minutes of upstream thinking each, and `deepseek-v4-flash` measured 16381
+  /// of 16384 tokens spent on reasoning with zero characters of prose. So a
+  /// truncated empty response is reported as a configuration fault that names
+  /// the fix, not as a transient upstream failure.
+  /// Rejects a JSON answer that stopped at the token ceiling, so the retry can raise
+  /// the ceiling instead of handing the caller an unusable fragment.
+  ///
+  /// Only for `json: true`. Truncated prose is still worth something — the chapter
+  /// pipeline reviews and revises it — but truncated JSON cannot be parsed at all, so
+  /// returning it makes every caller re-derive "this was cut off" from a failed parse.
+  /// The beat planner did exactly that: it read `finishReason == "length"` and halved
+  /// its chapter range, which shrinks the *answer* when the fault was that the
+  /// reasoning pass had already spent the budget. Chapter 1 of 《灰雾之前》 halved
+  /// 1-10 to 1-5 to 1-3, paying a full reasoning pass each time, while every attempt
+  /// wrote barely 1-3k characters before hitting the same ceiling.
+  private func truncatedJSONError(
+    model: String,
+    json: Bool,
+    finishReason: String?,
+    contentCharacters: Int,
+    reasoningCharacters: Int,
+    maxTokens: Int?
+  ) -> InkOSCoreError? {
+    guard json, finishReason == "length" else { return nil }
+    recordDebug(scope: "llm", message: "response.truncated_json", level: "warning", data: [
+      "model": model,
+      "contentCharacters": contentCharacters,
+      "reasoningCharacters": reasoningCharacters,
+      "maxTokens": maxTokens ?? -1,
+    ])
+    var message = "模型 \(model) 的 JSON 输出在 max_tokens"
+    if let maxTokens { message += "（\(maxTokens)）" }
+    message += " 处被截断（已写 \(contentCharacters) 字符"
+    if reasoningCharacters > 0 { message += "，推理另占 \(reasoningCharacters) 字符" }
+    message += "）。"
+    message += reasoningCharacters > 0
+      ? "该模型是推理模型，reasoning_content 与正文共用同一预算；请在设置中调大「最大 token」，或改用非推理模型。"
+      : "请在设置中调大「最大 token」。"
+    return InkOSCoreError(message, statusCode: 422)
+  }
+
+  private func emptyContentError(
+    model: String,
+    finishReason: String?,
+    reasoningCharacters: Int,
+    maxTokens: Int?
+  ) -> InkOSCoreError {
+    let detail = reasoningCharacters > 0
+      ? "，推理过程占用了 \(reasoningCharacters) 字符"
+      : ""
+    // `finishReason` decides which of two very different faults this is, and the
+    // message alone does not carry it: chapter 1 of 《灰雾之前》 failed three times
+    // with 11k-14k characters of reasoning, which reads like budget exhaustion but
+    // was reported as transient, and there was no way to tell from the log whether
+    // the relay had said "length", said "stop", or ended the stream without saying
+    // anything. Record the raw fields so the next occurrence is classifiable.
+    recordDebug(scope: "llm", message: "response.empty_content", level: "warning", data: [
+      "model": model,
+      "finishReason": finishReason ?? "(none)",
+      "reasoningCharacters": reasoningCharacters,
+      "maxTokens": maxTokens ?? -1,
+    ])
+    guard finishReason == "length" else {
+      return InkOSCoreError("模型返回了空内容\(detail)", statusCode: 502)
+    }
+    var message = "模型 \(model) 没有产出正文\(detail)，输出在 max_tokens"
+    if let maxTokens { message += "（\(maxTokens)）" }
+    message += " 处被截断。"
+    message += reasoningCharacters > 0
+      ? "该模型是推理模型，reasoning_content 与正文共用同一预算；请在设置中调大「最大 token」，或改用非推理模型。"
+      : "请在设置中调大「最大 token」。"
+    // 422 keeps this out of the transient retry set below: the outcome is fixed
+    // by the prompt and the budget, so a second attempt only burns time.
+    return InkOSCoreError(message, statusCode: 422)
+  }
+
   private func remoteError(data: Data, status: Int, prefix: String) throws -> InkOSCoreError {
     let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     let nested = object?["error"] as? [String: Any]
     let message = string(nested?["message"], fallback: string(object?["message"], fallback: "HTTP \(status)"))
+    // A relay that has no channel for the configured model name answers 503,
+    // which otherwise lands in the transient retry set and costs three attempts
+    // plus backoff before surfacing. The model name will not appear mid-call,
+    // so report it as a settings fault immediately. Chapter 27 of 《渊雨浩劫》
+    // spent its rounds this way after the model was switched to a name the
+    // relay does not carry.
+    let code = string(nested?["code"], fallback: "")
+    let unavailableModel = code == "model_not_found"
+      || message.contains("No available channel")
+      || message.contains("无可用渠道")
+    if unavailableModel {
+      return InkOSCoreError(
+        "\(prefix)：中转站没有可用于该模型的渠道。请在设置中改用中转站实际提供的模型。原始信息：\(message)",
+        statusCode: 404
+      )
+    }
     return InkOSCoreError("\(prefix)：\(message)", statusCode: status)
   }
 
@@ -2783,6 +3400,40 @@ extension InkOSCore {
   /// malformed JSON and hides the tail of the timeline. This keeps complete
   /// entries, prioritizes recent timeline milestones, and adds a summary hint
   /// when timeline is truncated so the model knows what order values are taken.
+  /// Flat `ID | type | name` roster of every canon entity. Deliberately not
+  /// truncated: it is small (one short line per entity) and dropping the tail
+  /// would hide exactly the recently-introduced entities the next chapter is
+  /// most likely to register.
+  func entityIDRegistryText(bookID: String) throws -> String {
+    entityIDRegistryText(try synchronizeContinuityProjection(bookID: bookID).continuity)
+  }
+
+  func entityIDRegistryText(_ continuity: LongFormContinuity) -> String {
+    guard !continuity.entities.isEmpty else { return "（正典中暂无实体，本章所有实体都是新实体）" }
+    let rows = continuity.entities
+      .map { "\($0.id) | \($0.type) | \($0.name)" }
+      .joined(separator: "\n")
+    return rows + "\n（以上 ID 均已占用；新实体必须使用不在此列表中的新 ID）"
+  }
+
+  /// Flat `hookId | openFromChapter | description` roster of every unresolved hook
+  /// in the current projection. Given alongside the delta repair and revision
+  /// prompts so the model can look up exact IDs instead of guessing variants like
+  /// HOOK-CH23-先过江, HOOK-023-先过江, etc.
+  func openHooksRegistryText(bookID: String) throws -> String {
+    openHooksRegistryText(try synchronizeContinuityProjection(bookID: bookID).continuity)
+  }
+
+  func openHooksRegistryText(_ continuity: LongFormContinuity) -> String {
+    guard !continuity.hooks.isEmpty else { return "（当前无未关闭伏笔）" }
+    // All hooks in the projection are unresolved. Closed hooks are removed from
+    // the canon via remove.hooks and never appear here.
+    let rows = continuity.hooks.map {
+      "\($0.hookId) | 第\($0.openFromChapter)章 | \($0.description.prefix(80))"
+    }.joined(separator: "\n")
+    return rows + "\n（remove.hooks 中只能使用以上 hookId；不存在的 ID 会触发校验错误）"
+  }
+
   private func truncateContinuityIndex(
     _ continuity: LongFormContinuity,
     maxChars: Int

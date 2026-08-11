@@ -30,6 +30,11 @@ struct CreateBookSheet: View {
   @State private var assistCompleted = false
   @State private var isSubmitting = false
   @State private var protagonistConfirmed = false
+  /// The uploaded original. Held only in view state, never in the persisted draft:
+  /// a file path saved across launches can point at a file that has since moved, and
+  /// silently importing the wrong bytes is worse than asking again.
+  @State private var sourceFileURL: URL?
+  @State private var isChoosingSource = false
 
   init(model: WorkspaceModel) {
     _model = ObservedObject(wrappedValue: model)
@@ -67,6 +72,14 @@ struct CreateBookSheet: View {
   private var ideaValidationMessage: String? {
     if guide.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       return "请填写小说暂定名"
+    }
+    if guide.kind == .derivative {
+      if sourceFileURL == nil {
+        return "同人小说需要先上传原著 txt 文件"
+      }
+      if guide.sourceTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        return "请填写原著名称"
+      }
     }
     if guide.storyPremise.trimmingCharacters(in: .whitespacesAndNewlines).count < 20 {
       return "请用至少 20 个字讲讲你想写的故事"
@@ -155,6 +168,13 @@ struct CreateBookSheet: View {
     value.totalWords = String(lockedGuide.targetTotalWords)
     value.volumeCount = lockedGuide.volumeCount
     value.chapterWordTolerance = lockedGuide.chapterWordTolerance
+    // Without these five the core would write `book.json` as 自创 and drop every
+    // canon and timeline constraint the customer just filled in.
+    value.kind = lockedGuide.kind
+    value.sourceTitle = lockedGuide.sourceTitle
+    value.timelineAnchorLabel = lockedGuide.timelineAnchorLabel
+    value.timelineStartDayOffset = lockedGuide.timelineStartDayOffset
+    value.timelineStartDateLabel = lockedGuide.timelineStartDateLabel
     var mergedConstraints = LongFormConstraints.lines(from: value.constraints)
     mergedConstraints.append(contentsOf: lockedGuide.specialConstraints)
     var seenConstraints = Set<String>()
@@ -325,6 +345,8 @@ struct CreateBookSheet: View {
 
   private var ideaQuestions: some View {
     dialogSection("你想写一个什么故事？") {
+      kindPicker
+      if guide.kind == .derivative { derivativeSourceFields }
       Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
         GridRow {
           dialogField("这本小说暂定叫什么？", required: true) {
@@ -372,6 +394,90 @@ struct CreateBookSheet: View {
         minHeight: 82,
         required: true
       )
+    }
+  }
+
+  private var kindPicker: some View {
+    dialogField("这是同人还是自创？", required: true) {
+      VStack(alignment: .leading, spacing: 6) {
+        Picker("小说类型", selection: $guide.kind) {
+          ForEach(BookKind.allCases) { kind in
+            Text(kind.label).tag(kind)
+          }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        Text(guide.kind.summary)
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+    }
+  }
+
+  /// The 同人 half of step one: which original, where its file is, and where this
+  /// book sits on the original's clock. All three feed the core directly — the file
+  /// becomes the retrieval index, and the two timeline fields become
+  /// `source/timeline.json`, which every later beat card is measured against.
+  private var derivativeSourceFields: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
+        GridRow {
+          dialogField("原著叫什么？", required: true) {
+            TextField("例如：诡秘之主", text: $guide.sourceTitle)
+          }
+          dialogField("原著 txt 文件", required: true) {
+            HStack(spacing: 8) {
+              Text(sourceFileURL?.lastPathComponent ?? "尚未选择")
+                .font(.caption)
+                .foregroundStyle(sourceFileURL == nil ? .secondary : .primary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+              Spacer(minLength: 4)
+              Button("选择文件…") { isChoosingSource = true }
+                .controlSize(.small)
+            }
+          }
+        }
+      }
+      Text("建好小说后会自动切分原著、抽取正典与世界设定，并建立检索索引。原著越长，这一步越久，期间可以关掉本窗口。")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+      Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 12) {
+        GridRow {
+          dialogField("以原著哪个事件为时间锚点？") {
+            TextField("例如：克莱恩穿越", text: $guide.timelineAnchorLabel)
+          }
+          dialogField("本书开篇相对锚点第几天？") {
+            HStack(spacing: 6) {
+              TextField("天数", value: $guide.timelineStartDayOffset, format: .number)
+                .textFieldStyle(.roundedBorder)
+                .monospacedDigit()
+              Text("天").foregroundStyle(.secondary)
+            }
+          }
+        }
+        GridRow {
+          dialogField("开篇时间怎么称呼？") {
+            TextField("例如：1349 年 4 月", text: $guide.timelineStartDateLabel)
+          }
+          Color.clear.frame(height: 0)
+        }
+      }
+      Text("负数表示开篇早于锚点事件，正数表示晚于。填 -365 即“锚点事件发生前一年”，此后原著里晚于开篇的事件都会被判定为“尚未发生”，不允许提前写出来。")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+    .fileImporter(
+      isPresented: $isChoosingSource,
+      allowedContentTypes: [.plainText],
+      allowsMultipleSelection: false
+    ) { result in
+      switch result {
+      case .success(let urls):
+        sourceFileURL = urls.first
+      case .failure(let error):
+        model.errorMessage = "无法读取所选文件：\(error.localizedDescription)"
+      }
     }
   }
 
@@ -608,6 +714,12 @@ struct CreateBookSheet: View {
     request.protagonistReviewed = protagonistConfirmed
     request.synchronizeLongFormFields()
     persistDraftImmediately()
+    // Read off the request before the success path resets it, and hold the ingestion
+    // inputs in locals: the pass is handed to the model and outlives this view.
+    let ingestionKind = request.kind
+    let ingestionURL = sourceFileURL
+    let ingestionTitle = request.title
+    let ingestionSettings = derivativeSettingsText
     isSubmitting = true
     Task {
       let response = await model.createBook(request, requirements: requirements)
@@ -623,13 +735,47 @@ struct CreateBookSheet: View {
           requirements = ""
           assistCompleted = false
           protagonistConfirmed = false
+          sourceFileURL = nil
           CreateBookDraftPersistence.clear()
+          // Only now does the book have a `long-form-plan.json` for canon to merge into.
+          if ingestionKind == .derivative, let ingestionURL {
+            // `bookId` is optional on the job record. Falling back to the title match
+            // beats skipping ingestion, which would leave a 同人 book with no canon at
+            // all and no sign of why.
+            let resolvedID =
+              acceptedJob?.bookId.flatMap { $0.isEmpty ? nil : $0 }
+              ?? model.books.first { $0.title == ingestionTitle }?.id
+            if let resolvedID {
+              Task {
+                await model.prepareDerivativeSource(
+                  bookID: resolvedID,
+                  bookTitle: ingestionTitle,
+                  sourceURL: ingestionURL,
+                  settingsText: ingestionSettings
+                )
+              }
+            } else {
+              model.errorMessage = "小说已创建，但没能定位到它的目录，原著未导入。请在书籍列表中选中它后重新导入原著。"
+            }
+          }
         } else {
           pendingCreationJobID = CreateBookDraftPersistence.load().pendingCreationJobID
         }
         dismiss()
       }
     }
+  }
+
+  /// The customer's own settings, as one block, for `manualOverlay`.
+  ///
+  /// Deliberately not the whole request: overlay extraction reads this as "what the
+  /// customer asked for", and feeding it generated plan text would let the model's own
+  /// output outrank the source it was supposed to obey.
+  private var derivativeSettingsText: String {
+    [guide.storyPremise, guide.protagonistProfile, guide.specialConstraints.joined(separator: "\n")]
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+      .joined(separator: "\n")
   }
 
   private func assistCreation() {

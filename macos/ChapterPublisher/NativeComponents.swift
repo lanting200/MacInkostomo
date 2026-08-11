@@ -553,6 +553,79 @@ struct NativeErrorBanner: View {
   }
 }
 
+/// Progress for the 同人 source-ingestion pass.
+///
+/// The pass is checkpointed per batch, so an incomplete run is a resumable state
+/// rather than a failure: the banner keeps the resume affordance visible instead of
+/// disappearing, and refuses to be dismissed while work is in flight.
+struct DerivativePreparationBanner: View {
+  let state: DerivativePreparationState
+  let resume: () -> Void
+  let dismiss: () -> Void
+
+  var body: some View {
+    HStack(alignment: .top, spacing: 9) {
+      if state.isRunning {
+        ProgressView()
+          .controlSize(.small)
+      } else {
+        Image(systemName: state.isComplete ? "checkmark.seal.fill" : "pause.circle.fill")
+          .foregroundStyle(state.isComplete ? .green : .orange)
+          .accessibilityHidden(true)
+      }
+      VStack(alignment: .leading, spacing: 3) {
+        Text("《\(state.bookTitle)》原著导入：\(state.phase)")
+          .font(.callout.weight(.semibold))
+        if state.sourceChapterCount > 0 {
+          ProgressView(value: state.canonProgress)
+            .progressViewStyle(.linear)
+            .frame(maxWidth: 320)
+          Text(detailLine)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .textSelection(.enabled)
+        }
+        if let failure = state.failure, !failure.isEmpty {
+          Text(failure)
+            .font(.caption)
+            .foregroundStyle(.orange)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+      Spacer(minLength: 8)
+      if !state.isRunning && state.needsResume {
+        Button("继续处理", action: resume)
+          .buttonStyle(.link)
+      }
+      if !state.isRunning {
+        Button(action: dismiss) {
+          Image(systemName: "xmark")
+        }
+        .buttonStyle(.plain)
+        .help("关闭原著导入提示")
+        .accessibilityLabel("关闭原著导入提示")
+      }
+    }
+    .padding(.horizontal, 12)
+    .padding(.vertical, 9)
+    .background((state.isComplete ? Color.green : Color.accentColor).opacity(0.1))
+    .overlay(alignment: .bottom) { Divider() }
+    .accessibilityElement(children: .contain)
+  }
+
+  private var detailLine: String {
+    var parts = ["正典 \(state.canonChaptersDone)/\(state.sourceChapterCount) 章"]
+    if state.entityCount > 0 { parts.append("实体 \(state.entityCount)") }
+    if state.timelineCount > 0 { parts.append("时间线事件 \(state.timelineCount)") }
+    if !state.overlayComplete { parts.append("作者设定待登记") }
+    if state.totalPassages > 0 {
+      parts.append("向量 \(state.embeddedPassages)/\(state.totalPassages)")
+    }
+    return parts.joined(separator: " · ")
+  }
+}
+
 struct NativeLoadingOverlay: View {
   var title = "正在处理"
 

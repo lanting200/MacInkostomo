@@ -20,6 +20,23 @@ struct NativeWorkspaceView: View {
           )
         }
 
+        // Sits at window level, not in the create sheet: the pass runs for minutes
+        // on a full-length original and the sheet is gone long before it finishes.
+        if let preparation = model.derivativePreparation {
+          DerivativePreparationBanner(
+            state: preparation,
+            resume: {
+              Task {
+                await model.resumeDerivativePreparation(
+                  bookID: preparation.bookID,
+                  bookTitle: preparation.bookTitle
+                )
+              }
+            },
+            dismiss: model.clearDerivativePreparation
+          )
+        }
+
         workspace
           .frame(maxWidth: .infinity, maxHeight: .infinity)
       }

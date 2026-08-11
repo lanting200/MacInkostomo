@@ -318,13 +318,113 @@ extension InkOSCore {
     try applyContinuityDelta(
       delta,
       to: &after,
-      source: "第\(chapterNumber)章候选差量"
+      source: "第\(chapterNumber)章候选差量",
+      strictIdentity: true
     )
     after.policy.requireConsistencyDelta = true
     return try after.validated(
       targetChapters: current.plan.targetChapters,
       volumeCount: current.constraints.volumeCount
     )
+  }
+
+  /// Merges extracted canon into the projection's `baseContinuity`.
+  ///
+  /// `baseContinuity` rather than a new field: it is the layer chapter deltas and
+  /// the manual overlay are already applied *on top of*, which is exactly where
+  /// source canon belongs. Adding a fourth layer would need a projection schema
+  /// migration and a matching change in every replay site.
+  ///
+  /// Idempotent as long as the extraction model keeps its IDs stable — every entry
+  /// is keyed, so re-applying the same delta upserts in place. A model swap that
+  /// renames IDs for the same facts will add duplicates; that is a re-extraction,
+  /// not a resume, and clearing `canon-progress.json` is the way to redo it.
+  ///
+  /// - Parameter allowImmutableChanges: true because extraction is authoritative
+  ///   over the canon it produced. A second pass that revises an immutable fact it
+  ///   wrote itself must be able to land, or the pass deadlocks on its own output.
+  @discardableResult
+  func mergeCanonIntoBaseContinuity(
+    bookID: String,
+    delta: ContinuityDelta,
+    source: String
+  ) throws -> LongFormPlanResponse {
+    try mutateContinuityProjection(bookID: bookID) { projection, _ in
+      try self.applyContinuityDelta(
+        delta,
+        to: &projection.baseContinuity,
+        source: source,
+        allowImmutableChanges: true
+      )
+    }
+  }
+
+  /// Removes facts extracted from a replaced original while preserving the layers
+  /// that belong to this derivative work: approved chapter deltas, the customer's
+  /// manual overlay, and the configured continuity policy.
+  @discardableResult
+  func clearSourceCanonBaseContinuity(bookID: String) throws -> LongFormPlanResponse {
+    try mutateContinuityProjection(bookID: bookID) { projection, _ in
+      projection.baseContinuity = LongFormContinuity(
+        policy: projection.baseContinuity.policy
+      )
+    }
+  }
+
+  /// Merges a delta into `manualOverlay`, the authoritative layer.
+  ///
+  /// `synchronizeContinuityProjection` applies the overlay last and with
+  /// `allowImmutableChanges: true`, so an entry here outranks both source-extracted
+  /// canon and approved chapter deltas. That is what makes it the right home for
+  /// the customer's settings text.
+  @discardableResult
+  func mergeCanonIntoManualOverlay(
+    bookID: String,
+    delta: ContinuityDelta
+  ) throws -> LongFormPlanResponse {
+    try mutateContinuityProjection(bookID: bookID) { projection, _ in
+      projection.manualOverlay = self.mergedCanonDelta(projection.manualOverlay, delta)
+    }
+  }
+
+  /// Applies `mutate` to the stored projection, then rebuilds plan and projection.
+  ///
+  /// Both files are snapshotted first and restored on any failure. Without that, a
+  /// delta that passes its own merge but fails the full `validated()` pass would
+  /// leave a projection on disk that no later synchronize call can rebuild — the
+  /// book's continuity would be permanently unloadable.
+  private func mutateContinuityProjection(
+    bookID: String,
+    _ mutate: (inout ContinuityProjection, LongFormPlanResponse) throws -> Void
+  ) throws -> LongFormPlanResponse {
+    let current = try synchronizeContinuityProjection(bookID: bookID)
+    let projectionURL = try continuityProjectionURL(bookID: bookID)
+    let planURL = try existingBookURL(bookID).appendingPathComponent("long-form-plan.json")
+    guard var projection = try loadContinuityProjection(at: projectionURL) else {
+      throw InkOSCoreError("连续性投影缺失，请先同步长篇规划", statusCode: 503)
+    }
+    let projectionSnapshot = try? Data(contentsOf: projectionURL)
+    let planSnapshot = try? Data(contentsOf: planURL)
+    let checkpointSnapshots = (try? snapshotVolumeCheckpoints(bookID: bookID)) ?? [:]
+
+    try mutate(&projection, current)
+    projection = ContinuityProjection(
+      version: Self.continuityProjectionVersion,
+      baseContinuity: projection.baseContinuity,
+      chapters: projection.chapters,
+      manualOverlay: projection.manualOverlay,
+      continuity: projection.continuity,
+      updatedAt: isoTimestamp()
+    )
+    try atomicWrite(encoder.encode(projection), to: projectionURL)
+    do {
+      return try synchronizeContinuityProjection(bookID: bookID)
+    } catch {
+      restoreFile(projectionURL, snapshot: projectionSnapshot)
+      restoreFile(planURL, snapshot: planSnapshot)
+      restoreVolumeCheckpoints(bookID: bookID, snapshots: checkpointSnapshots)
+      throw error
+    }
   }
 
   func latestVolumeCheckpointText(bookID: String) throws -> String? {
@@ -337,11 +437,18 @@ extension InkOSCore {
     return String(data: try encoder.encode(latest), encoding: .utf8)
   }
 
+  /// - Parameter strictIdentity: rejects an entity whose `id` and `name` point at
+  ///   two different canon entries. Only the pre-commit validation of a *candidate*
+  ///   delta sets this. Replaying deltas that are already committed must stay
+  ///   reproducible — chapter 25 of a live book committed such a collision back
+  ///   when it merged silently, and throwing on replay would make that book's
+  ///   projection permanently unbuildable.
   func applyContinuityDelta(
     _ delta: ContinuityDelta,
     to continuity: inout LongFormContinuity,
     source: String,
-    allowImmutableChanges: Bool = false
+    allowImmutableChanges: Bool = false,
+    strictIdentity: Bool = false
   ) throws {
     for id in delta.remove.immutableCanon {
       if continuity.immutableCanon.contains(where: { $0.id == id }), !allowImmutableChanges {
@@ -400,38 +507,39 @@ extension InkOSCore {
     }
     for item in delta.upsert.entities {
       let normalizedName = normalizedContinuityName(item.name)
-      if let index = continuity.entities.firstIndex(where: {
-        $0.id == item.id || normalizedContinuityName($0.name) == normalizedName
-      }) {
-        let previous = continuity.entities[index]
-        if previous.type != item.type, !allowImmutableChanges {
-          throw continuityConflict(source, "实体 \(previous.name) 的类型不能从 \(previous.type) 改为 \(item.type)")
+      // ID and name are two independent identity claims and the model can get
+      // them to disagree: chapter 27 registered 苏晚晴 under ENT-030, an ID the
+      // canon had already given to 黑影软管与水箱旁烟头. Resolve the two matches
+      // separately — a single `id || name` predicate with `firstIndex` silently
+      // resolved the collision by array position, which surfaced as either a
+      // baffling type conflict naming an entity the delta never touched (no
+      // repair round could act on it, so the loop deadlocked) or, when the two
+      // types happened to agree, a silent rename of the canon entry.
+      let idMatch = continuity.entities.firstIndex { $0.id == item.id }
+      let nameMatch = continuity.entities.firstIndex {
+        normalizedContinuityName($0.name) == normalizedName
+      }
+      if let idMatch, idMatch != nameMatch {
+        let holder = continuity.entities[idMatch]
+        if strictIdentity {
+          throw entityIDCollision(source, incoming: item, holder: holder, canonicalIndex: nameMatch, in: continuity)
         }
-        if previous.immutableOwner, let owner = item.owner, owner != previous.owner, !allowImmutableChanges {
-          throw continuityConflict(source, "实体 \(previous.name) 的归属已锁定")
+        // Replay of an already-committed delta must stay reproducible, so the
+        // name wins as identity and the wrong ID is dropped rather than thrown.
+        if let nameMatch {
+          try mergeEntity(item, into: &continuity.entities, at: nameMatch, source: source, allowImmutableChanges: allowImmutableChanges)
+        } else {
+          continuity.entities.append(item.reidentified(as: freeEntityID(basedOn: item.id, in: continuity)))
         }
-        if previous.immutableLocation, let location = item.location, location != previous.location,
-          !allowImmutableChanges
-        {
-          throw continuityConflict(source, "实体 \(previous.name) 的位置已锁定")
-        }
-        for key in previous.immutableAttributes {
-          if let value = item.attributes[key], value != previous.attributes[key], !allowImmutableChanges {
-            throw continuityConflict(source, "实体 \(previous.name) 的属性 \(key) 已锁定")
-          }
-        }
-        var attributes = previous.attributes
-        attributes.merge(item.attributes) { _, new in new }
-        continuity.entities[index] = LongFormEntity(
-          id: previous.id,
-          name: item.name,
-          type: allowImmutableChanges ? item.type : previous.type,
-          owner: item.owner ?? previous.owner,
-          location: item.location ?? previous.location,
-          attributes: attributes,
-          immutableOwner: previous.immutableOwner || item.immutableOwner,
-          immutableLocation: previous.immutableLocation || item.immutableLocation,
-          immutableAttributes: Array(Set(previous.immutableAttributes + item.immutableAttributes)).sorted()
+        continue
+      }
+      if let index = idMatch ?? nameMatch {
+        try mergeEntity(
+          item,
+          into: &continuity.entities,
+          at: index,
+          source: source,
+          allowImmutableChanges: allowImmutableChanges
         )
       } else {
         continuity.entities.append(item)
@@ -884,7 +992,12 @@ extension InkOSCore {
       label: item.label,
       earliestChapter: item.earliestChapter,
       latestChapter: item.latestChapter,
-      immutable: item.immutable
+      immutable: item.immutable,
+      // Carried through: only `order` is being reassigned here. Rebuilding the
+      // milestone without these would silently unplace an event from the story
+      // clock every time two orders happened to collide.
+      sourceDay: item.sourceDay,
+      sourceChapter: item.sourceChapter
     )
   }
 
@@ -898,7 +1011,13 @@ extension InkOSCore {
       label: label,
       earliestChapter: integer(object["earliestChapter"]) ?? chapterNumber,
       latestChapter: integer(object["latestChapter"]) ?? chapterNumber,
-      immutable: (object["immutable"] as? Bool) ?? true
+      immutable: (object["immutable"] as? Bool) ?? true,
+      // Both stay nil when the model omits them, which is the honest state: an
+      // unplaced event is reported as unplaced rather than guessed onto the axis.
+      // This is the only entry point for the source's own clock, so canon
+      // extraction depends on it reading these keys.
+      sourceDay: integer(object["sourceDay"]),
+      sourceChapter: integer(object["sourceChapter"])
     )
   }
 
@@ -943,12 +1062,25 @@ extension InkOSCore {
     anyArray(value).compactMap { normalizedText($0).continuityNonEmpty }
   }
 
+  /// Flattens one field of model-supplied JSON into text.
+  ///
+  /// Every value here came from an LLM, so the type is whatever the model felt like
+  /// emitting: a string where the schema asked for one, a number, a `null`, or a
+  /// nested object it decided to nest one level deeper. Only containers may be
+  /// serialized: `data(withJSONObject:)` raises `NSInvalidArgumentException` on a
+  /// bare top-level scalar, and that is an ObjC exception, so `try?` does not catch
+  /// it — it terminates the process. The old guard validated a *wrapped* value
+  /// (`["value": value]`) and then serialized the *bare* one, so a single `null` in
+  /// a canon field crashed the whole extraction pass.
   private func normalizedText(_ value: Any?) -> String {
     if let text = value as? String {
       return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
     if let number = value as? NSNumber { return number.stringValue }
-    guard let value, JSONSerialization.isValidJSONObject(["value": value]),
+    guard let value, !(value is NSNull) else { return "" }
+    // Containers only, and the validity check now covers the exact object serialized.
+    guard value is [Any] || value is [String: Any],
+      JSONSerialization.isValidJSONObject(value),
       let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
       let text = String(data: data, encoding: .utf8)
     else { return "" }
@@ -980,6 +1112,105 @@ extension InkOSCore {
 
   private func continuityConflict(_ source: String, _ detail: String) -> InkOSCoreError {
     InkOSCoreError("连续性冲突（\(source)）：\(detail)", statusCode: 409)
+  }
+
+  /// Merges an upserted entity into an existing canon slot. Extracted so the
+  /// normal path and the ID-collision replay path cannot drift apart.
+  private func mergeEntity(
+    _ item: LongFormEntity,
+    into entities: inout [LongFormEntity],
+    at index: Int,
+    source: String,
+    allowImmutableChanges: Bool
+  ) throws {
+    let previous = entities[index]
+    if previous.type != item.type, !allowImmutableChanges {
+      throw continuityConflict(source, "实体 \(previous.name) 的类型不能从 \(previous.type) 改为 \(item.type)")
+    }
+    if previous.immutableOwner, let owner = item.owner, owner != previous.owner, !allowImmutableChanges {
+      throw continuityConflict(source, "实体 \(previous.name) 的归属已锁定")
+    }
+    if previous.immutableLocation, let location = item.location, location != previous.location,
+      !allowImmutableChanges
+    {
+      throw continuityConflict(source, "实体 \(previous.name) 的位置已锁定")
+    }
+    for key in previous.immutableAttributes {
+      if let value = item.attributes[key], value != previous.attributes[key], !allowImmutableChanges {
+        throw continuityConflict(source, "实体 \(previous.name) 的属性 \(key) 已锁定")
+      }
+    }
+    var attributes = previous.attributes
+    attributes.merge(item.attributes) { _, new in new }
+    entities[index] = LongFormEntity(
+      id: previous.id,
+      name: item.name,
+      type: allowImmutableChanges ? item.type : previous.type,
+      owner: item.owner ?? previous.owner,
+      location: item.location ?? previous.location,
+      attributes: attributes,
+      immutableOwner: previous.immutableOwner || item.immutableOwner,
+      immutableLocation: previous.immutableLocation || item.immutableLocation,
+      immutableAttributes: Array(Set(previous.immutableAttributes + item.immutableAttributes)).sorted()
+    )
+  }
+
+  /// The message a `[delta]` repair round actually has to act on: which ID was
+  /// reused, who already holds it, and the exact ID to write instead. The old
+  /// wording named only the *holder* and its type change, so the repairer looked
+  /// for an entity its delta never mentioned, concluded nothing needed fixing,
+  /// and returned byte-identical JSON until the round budget ran out.
+  private func entityIDCollision(
+    _ source: String,
+    incoming: LongFormEntity,
+    holder: LongFormEntity,
+    canonicalIndex: Int?,
+    in continuity: LongFormContinuity
+  ) -> InkOSCoreError {
+    var detail = "实体 ID 撞车：你把 \(incoming.name) 登记为 \(incoming.id)，"
+    detail += "但 \(incoming.id) 在正典中已属于 \(holder.name)（\(holder.type)）。"
+    if let canonicalIndex {
+      let canonical = continuity.entities[canonicalIndex]
+      detail += "\(incoming.name) 的正确 ID 是 \(canonical.id)（\(canonical.type)）；"
+      detail += "请把这一项的 id 改成 \(canonical.id)，name 与 type 保持不变。"
+    } else {
+      let suggestion = freeEntityID(basedOn: incoming.id, in: continuity)
+      detail += "\(incoming.name) 是本章新实体，正典中尚无对应条目；"
+      detail += "请改用未被占用的新 ID，例如 \(suggestion)。"
+    }
+    detail += "不要修改 \(holder.name) 的任何字段，也不要改动正文。"
+    return continuityConflict(source, detail)
+  }
+
+  /// A collision-free ID derived from what the model asked for, so a repaired or
+  /// replayed entity keeps a recognizable prefix instead of an opaque hash.
+  private func freeEntityID(basedOn requested: String, in continuity: LongFormContinuity) -> String {
+    let taken = Set(continuity.entities.map(\.id))
+    let base = requested.isEmpty ? "ENT" : requested
+    guard taken.contains(base) else { return base }
+    for suffix in 2...999 {
+      let candidate = "\(base)-\(suffix)"
+      if !taken.contains(candidate) { return candidate }
+    }
+    return "\(base)-\(UUID().uuidString.prefix(8))"
+  }
+}
+
+extension LongFormEntity {
+  /// Same entity, different ID. Used when a replayed delta's ID is already taken
+  /// by an unrelated canon entry and the entity is genuinely new.
+  func reidentified(as newID: String) -> LongFormEntity {
+    LongFormEntity(
+      id: newID,
+      name: name,
+      type: type,
+      owner: owner,
+      location: location,
+      attributes: attributes,
+      immutableOwner: immutableOwner,
+      immutableLocation: immutableLocation,
+      immutableAttributes: immutableAttributes
+    )
   }
 }
 

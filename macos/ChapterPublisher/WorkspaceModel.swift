@@ -34,6 +34,15 @@ final class WorkspaceModel: ObservableObject {
   @Published private(set) var isMutating = false
   @Published var errorMessage: String?
 
+  /// Progress of the derivative preparation pass: import, canon extraction, and
+  /// embedding of an uploaded original.
+  ///
+  /// Held here rather than in the create sheet because the pass outlives the sheet —
+  /// extracting canon from a multi-million-character novel is hundreds of model
+  /// calls, and the customer must be able to close the dialog and watch it from the
+  /// library. `nil` means no pass has run this launch.
+  @Published private(set) var derivativePreparation: DerivativePreparationState?
+
   var currentBook: BookSummary? {
     guard let currentBookID else { return nil }
     return books.first { $0.id == currentBookID }
@@ -85,6 +94,7 @@ final class WorkspaceModel: ObservableObject {
   func bootstrap() async {
     clearError()
     await refreshBooks()
+    await restoreIncompleteDerivativePreparation()
     await loadInkOSConfig()
     await refreshActivity()
   }
@@ -398,6 +408,247 @@ final class WorkspaceModel: ObservableObject {
       setError(error)
       return nil
     }
+  }
+
+  // MARK: Derivative (同人) preparation
+
+  /// Ingests an uploaded original and turns it into canon the pipeline can obey.
+  ///
+  /// Runs after the book exists, not before: canon is merged into the book's
+  /// continuity projection, and the projection is rebuilt from `long-form-plan.json`,
+  /// which only exists once the book has been created. The customer-facing order is
+  /// unchanged — they attach the file while creating the book and this runs
+  /// immediately after — but nothing here can be hoisted ahead of creation.
+  ///
+  /// `maxCanonBatches` bounds the model calls one invocation makes. Zero means run to
+  /// completion, which for a full-length novel is hundreds of calls; the pass is
+  /// checkpointed per batch, so a bounded run followed by a resume reaches the same
+  /// place. `settingsText` goes into `manualOverlay`, which is applied last, so the
+  /// customer's settings outrank the source wherever the two disagree.
+  func prepareDerivativeSource(
+    bookID: String,
+    bookTitle: String,
+    sourceURL: URL,
+    settingsText: String = "",
+    maxCanonBatches: Int = 0,
+    embed: Bool = true
+  ) async {
+    var state = DerivativePreparationState(
+      bookID: bookID,
+      bookTitle: bookTitle,
+      phase: "正在读取原著文件",
+      isRunning: true,
+      sourceChapterCount: 0,
+      canonChaptersDone: 0,
+      canonComplete: false,
+      entityCount: 0,
+      timelineCount: 0,
+      embeddedPassages: 0,
+      totalPassages: 0,
+      failure: nil
+    )
+    derivativePreparation = state
+
+    do {
+      let manifest = try await inkOS.importDerivativeSource(bookID: bookID, from: sourceURL)
+      let settings = settingsText.trimmingCharacters(in: .whitespacesAndNewlines)
+      _ = try await inkOS.saveDerivativePreparationIntent(
+        bookID: bookID,
+        settingsText: settings,
+        embedRequested: embed
+      )
+      state.sourceChapterCount = manifest.chapterCount
+      state.overlayComplete = settings.isEmpty
+      state.embedRequested = embed
+      state.embeddingComplete = !embed
+      state.phase = "原著已切分 \(manifest.chapterCount) 章，正在抽取原著设定"
+      derivativePreparation = state
+
+      let canon = try await inkOS.extractDerivativeCanon(
+        bookID: bookID,
+        maxBatches: maxCanonBatches
+      )
+      state.canonChaptersDone = canon.extractedChapters
+      state.canonComplete = canon.isComplete
+      state.entityCount = canon.entityCount
+      state.timelineCount = canon.timelineCount
+      state.phase = canon.isComplete
+        ? "原著设定抽取完成"
+        : "已抽取原著前 \(canon.extractedChapters) 章设定，可继续抽取"
+      derivativePreparation = state
+
+      if !settings.isEmpty {
+        state.phase = "正在把你的设定登记为最高优先级"
+        derivativePreparation = state
+        let overlay = try await inkOS.extractDerivativeSettingsOverlay(
+          bookID: bookID,
+          settingsText: settings
+        )
+        state.entityCount = overlay.entityCount
+        state.timelineCount = overlay.timelineCount
+        state.overlayComplete = true
+      }
+
+      if embed {
+        state.phase = "正在建立语义检索索引"
+        derivativePreparation = state
+        // Non-fatal by design: retrieval is lexical-first and works without
+        // vectors. An unavailable on-device embedding model must not cost the
+        // customer the canon extraction that just succeeded.
+        do {
+          let embedding = try await inkOS.embedDerivativeSource(bookID: bookID)
+          state.embeddedPassages = embedding.embedded
+          state.totalPassages = embedding.total
+          state.embeddingComplete = !embedding.semanticAvailable || embedding.isComplete
+        } catch {
+          state.embeddingComplete = false
+          state.failure = "语义索引未完成（关键词检索仍可用）：\(errorText(error))"
+        }
+      }
+
+      state.isRunning = false
+      state.phase = state.isComplete ? "原著准备完成" : "原著准备已暂停，可继续处理"
+      derivativePreparation = state
+      await refreshWorkspaceAfterWorkflowCompletion()
+    } catch is CancellationError {
+      state.isRunning = false
+      state.phase = "原著准备已取消"
+      derivativePreparation = state
+    } catch {
+      state.isRunning = false
+      state.phase = "原著准备失败"
+      state.failure = errorText(error)
+      derivativePreparation = state
+      setError(error)
+    }
+  }
+
+  /// Continues every checkpointed preparation phase, including an overlay or
+  /// semantic index that failed after canon extraction had already completed.
+  func resumeDerivativePreparation(bookID: String, bookTitle: String, maxBatches: Int = 0) async {
+    var state = derivativePreparation ?? DerivativePreparationState(
+      bookID: bookID,
+      bookTitle: bookTitle,
+      phase: "",
+      isRunning: false,
+      sourceChapterCount: 0,
+      canonChaptersDone: 0,
+      canonComplete: false,
+      entityCount: 0,
+      timelineCount: 0,
+      embeddedPassages: 0,
+      totalPassages: 0,
+      failure: nil
+    )
+    state.bookID = bookID
+    state.bookTitle = bookTitle
+    state.isRunning = true
+    state.failure = nil
+    state.phase = "正在读取原著准备进度"
+    derivativePreparation = state
+    do {
+      let snapshot = try await inkOS.derivativePreparationSnapshot(bookID: bookID)
+      state.sourceChapterCount = snapshot.canon.chapterCount
+      state.canonChaptersDone = snapshot.canon.extractedChapters
+      state.canonComplete = snapshot.canon.isComplete
+      state.entityCount = snapshot.canon.entityCount
+      state.timelineCount = snapshot.canon.timelineCount
+      state.overlayComplete = snapshot.overlayComplete
+      state.embedRequested = snapshot.intent.embedRequested
+      state.embeddingComplete = snapshot.embeddingComplete
+      state.embeddedPassages = snapshot.embedding.embedded
+      state.totalPassages = snapshot.embedding.total
+
+      state.phase = "正在继续抽取原著设定"
+      derivativePreparation = state
+      let canon = try await inkOS.extractDerivativeCanon(bookID: bookID, maxBatches: maxBatches)
+      state.sourceChapterCount = canon.chapterCount
+      state.canonChaptersDone = canon.extractedChapters
+      state.canonComplete = canon.isComplete
+      state.entityCount = canon.entityCount
+      state.timelineCount = canon.timelineCount
+
+      let settings = snapshot.intent.settingsText.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !settings.isEmpty, !state.overlayComplete {
+        state.phase = "正在把你的设定登记为最高优先级"
+        derivativePreparation = state
+        let overlay = try await inkOS.extractDerivativeSettingsOverlay(
+          bookID: bookID,
+          settingsText: settings
+        )
+        state.entityCount = overlay.entityCount
+        state.timelineCount = overlay.timelineCount
+        state.overlayComplete = true
+      }
+
+      if state.embedRequested, !state.embeddingComplete {
+        state.phase = "正在建立语义检索索引"
+        derivativePreparation = state
+        do {
+          let embedding = try await inkOS.embedDerivativeSource(bookID: bookID)
+          state.embeddedPassages = embedding.embedded
+          state.totalPassages = embedding.total
+          state.embeddingComplete = !embedding.semanticAvailable || embedding.isComplete
+        } catch {
+          state.embeddingComplete = false
+          state.failure = "语义索引未完成（关键词检索仍可用）：\(errorText(error))"
+        }
+      }
+
+      state.isRunning = false
+      state.phase = state.isComplete
+        ? "原著准备完成"
+        : "原著准备已暂停，可继续处理"
+      derivativePreparation = state
+      await refreshWorkspaceAfterWorkflowCompletion()
+    } catch is CancellationError {
+      state.isRunning = false
+      state.phase = "抽取已取消"
+      derivativePreparation = state
+    } catch {
+      state.isRunning = false
+      state.phase = "抽取失败"
+      state.failure = errorText(error)
+      derivativePreparation = state
+      setError(error)
+    }
+  }
+
+  /// Restores the first unfinished source-preparation job after an app relaunch.
+  /// The source, author settings and embedding intent all live in the book workspace,
+  /// so this is a read-only scan and does not resume model calls automatically.
+  private func restoreIncompleteDerivativePreparation() async {
+    guard derivativePreparation?.isRunning != true else { return }
+    for book in books {
+      guard (try? await inkOS.bookKind(bookID: book.id)) == .derivative,
+        let snapshot = try? await inkOS.derivativePreparationSnapshot(bookID: book.id),
+        !snapshot.isComplete
+      else { continue }
+
+      derivativePreparation = DerivativePreparationState(
+        bookID: book.id,
+        bookTitle: book.title,
+        phase: "原著准备未完成，可继续处理",
+        isRunning: false,
+        sourceChapterCount: snapshot.canon.chapterCount,
+        canonChaptersDone: snapshot.canon.extractedChapters,
+        canonComplete: snapshot.canon.isComplete,
+        entityCount: snapshot.canon.entityCount,
+        timelineCount: snapshot.canon.timelineCount,
+        overlayComplete: snapshot.overlayComplete,
+        embedRequested: snapshot.intent.embedRequested,
+        embeddingComplete: snapshot.embeddingComplete,
+        embeddedPassages: snapshot.embedding.embedded,
+        totalPassages: snapshot.embedding.total,
+        failure: nil
+      )
+      return
+    }
+  }
+
+  func clearDerivativePreparation() {
+    guard derivativePreparation?.isRunning != true else { return }
+    derivativePreparation = nil
   }
 
   @discardableResult
@@ -1177,11 +1428,16 @@ final class WorkspaceModel: ObservableObject {
 
   private func setError(_ error: Error) {
     guard !(error is CancellationError) else { return }
+    errorMessage = errorText(error)
+  }
+
+  /// The message `setError` would show, for callers that record a failure inline
+  /// instead of raising it to the error banner.
+  private func errorText(_ error: Error) -> String {
     if let localized = error as? LocalizedError, let description = localized.errorDescription {
-      errorMessage = description
-    } else {
-      errorMessage = error.localizedDescription
+      return description
     }
+    return error.localizedDescription
   }
 
   private func normalized(_ value: String?) -> String? {

@@ -40,8 +40,14 @@ actor InkOSCore {
   let decoder: JSONDecoder
 
   init(rootURL: URL? = nil) {
-    let root = rootURL ?? Self.resolveWorkspaceRoot()
-    if rootURL == nil { Self.migrateLegacyWorkspaceIfNeeded(to: root) }
+    let configuredRoot = rootURL == nil ? Self.explicitWorkspaceRoot() : nil
+    let root = rootURL ?? configuredRoot ?? Self.resolveWorkspaceRoot()
+    // An explicitly selected workspace is an isolation boundary. Migration is
+    // only for the default Release Application Support destination; copying the
+    // legacy Debug workspace into a test's empty `mktemp -d` defeats isolation.
+    if rootURL == nil, configuredRoot == nil {
+      Self.migrateLegacyWorkspaceIfNeeded(to: root)
+    }
     self.rootURL = root
     dataURL = root.appendingPathComponent("data", isDirectory: true)
     booksURL = root.appendingPathComponent("book/books", isDirectory: true)
@@ -626,7 +632,10 @@ actor InkOSCore {
   static func resolveWorkspaceRoot() -> URL {
     let fileManager = FileManager.default
     let environment = ProcessInfo.processInfo.environment
-    var candidates = [environment["MACINKOSTOMO_WORKSPACE"]]
+    if let explicit = explicitWorkspaceRoot(environment: environment) {
+      return explicit
+    }
+    var candidates: [String?] = []
 #if DEBUG
     candidates.append(environment["CHAPTER_PUBLISHER_ROOT"])
     candidates.append(Bundle.main.object(forInfoDictionaryKey: "ChapterPublisherRoot") as? String)
@@ -646,6 +655,20 @@ actor InkOSCore {
     )
     return (support ?? fileManager.homeDirectoryForCurrentUser)
       .appendingPathComponent("MacInkostomo", isDirectory: true)
+  }
+
+  private static func explicitWorkspaceRoot(
+    environment: [String: String] = ProcessInfo.processInfo.environment
+  ) -> URL? {
+    guard let value = environment["MACINKOSTOMO_WORKSPACE"]?
+      .trimmingCharacters(in: .whitespacesAndNewlines),
+      !value.isEmpty,
+      !value.contains("$(")
+    else { return nil }
+    return URL(
+      fileURLWithPath: (value as NSString).expandingTildeInPath,
+      isDirectory: true
+    ).standardizedFileURL
   }
 
   static func migrateLegacyWorkspaceIfNeeded(to destination: URL) {

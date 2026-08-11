@@ -101,6 +101,15 @@ extension InkOSCore {
       ),
       "constraints": effectiveConstraints.joined(separator: "\n"),
       "specialConstraints": effectiveConstraints,
+      // Carried from the guide, not generated: these come from the customer's own
+      // answers, and the returned payload is what `createBook` later persists. Left
+      // out, a book the customer marked 同人 would be created as 自创 and silently
+      // lose every canon and timeline constraint.
+      "kind": guide.kind.rawValue,
+      "sourceTitle": guide.sourceTitle,
+      "timelineAnchorLabel": guide.timelineAnchorLabel,
+      "timelineStartDayOffset": guide.timelineStartDayOffset,
+      "timelineStartDateLabel": guide.timelineStartDateLabel,
       "creationGuide": try encodedObject(guide),
     ]
     if string(payload["volumePlan"]).isEmpty {
@@ -420,6 +429,11 @@ extension InkOSCore {
       "status": "active",
       "targetChapters": input.derivedTargetChapters,
       "chapterWordCount": input.chapterWords,
+      // Persisted here rather than only in `state.json` because every later
+      // chapter has to know whether it owes obedience to an imported original,
+      // and `book.json` is the per-book record the pipeline already reads.
+      "kind": input.kind.rawValue,
+      "sourceTitle": input.sourceTitle,
       "createdAt": now,
       "updatedAt": now,
     ], to: bookURL.appendingPathComponent("book.json"))
@@ -451,6 +465,23 @@ extension InkOSCore {
     for (path, content) in files {
       try atomicWrite(content.trimmingCharacters(in: .whitespacesAndNewlines) + "\n", to: storyURL.appendingPathComponent(path))
     }
+
+    // The story clock is written at creation, not on first generation: chapter 1's
+    // date is an input the customer gave, and deriving it later from an already
+    // written chapter would mean the first chapter was drafted with no clock at all.
+    // The anchor milestone id stays nil here — canon extraction assigns ids, so it
+    // is resolved by label on first use.
+    if input.kind == .derivative {
+      let anchor = input.timelineAnchorLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+      let startLabel = input.timelineStartDateLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+      if !anchor.isEmpty || !startLabel.isEmpty {
+        try saveDerivativeTimeline(bookID: bookID, DerivativeTimeline(
+          anchorLabel: anchor,
+          startDayOffset: input.timelineStartDayOffset,
+          startDateLabel: startLabel
+        ))
+      }
+    }
   }
 
   private func validatedGuide(_ raw: CreateBookGuide) throws -> CreateBookGuide {
@@ -481,8 +512,9 @@ extension InkOSCore {
   }
 
   private func createBookPrompt(_ guide: CreateBookGuide) -> String {
-    """
-    你是小说策划编辑。用户只回答了普通作者能够决定的问题，请把这些回答整理成可直接执行的完整长篇小说方案。
+    let derivative = derivativeCreationSections(guide)
+    return """
+    你是小说策划编辑。用户只回答了普通作者能够决定的问题，请把这些回答整理成可直接执行的完整长篇小说方案。\(derivative.intro)
     只输出 JSON，字段为 premise、characters、protagonistProfile、worldbuilding、outline、volumePlan、pacing、style。
     所有字段都必须是非空中文字符串。用户确认事实必须原样保留；用户未决定的世界规则、人物关系、节奏和文风由你合理补全。
     protagonistProfile 是主角性格档案，将逐字呈现给用户审核修改，必须写成"一个具体的人"而不是标签堆砌，包含：三个以内具体性格特质；一个真实的缺陷或软肋（会在小事上拖累他的那种）；情绪反应习惯（压力下先做什么、累极了会怎样）；说话方式与口癖；防御机制（如冷幽默）以及他在防什么；与人相处的方式。避免"冷静""果断""善良"这类空泛评语，每条都要落到可观察的行为上。
@@ -499,8 +531,62 @@ extension InkOSCore {
     用户补充的节奏：\(guide.pacing.isEmpty ? "未指定，请根据题材和平台推导" : guide.pacing)
     用户希望的阅读感觉：\(guide.style.isEmpty ? "未指定，请根据题材和平台推导" : guide.style)
     篇幅：\(guide.targetChapters)章，每章\(guide.targetChapterWords)字，共\(guide.targetTotalWords)字，\(guide.volumeCount)卷
-    必须遵守的要求：\(effectiveCreationConstraints(guide.specialConstraints).joined(separator: "；"))
+    必须遵守的要求：\(effectiveCreationConstraints(guide.specialConstraints).joined(separator: "；"))\(derivative.body)
     """
+  }
+
+  /// Derivative-only additions to the creation prompt.
+  ///
+  /// The plan is written before any chapter exists, so this is the one place a
+  /// timeline mistake is cheapest to prevent and most expensive to miss: an outline
+  /// that schedules a canon event in the wrong volume will drag every beat card and
+  /// every chapter after it off the source timeline. Empty for an original book.
+  private func derivativeCreationSections(_ guide: CreateBookGuide) -> (intro: String, body: String) {
+    guard guide.kind == .derivative else { return ("", "") }
+    let sourceTitle = guide.sourceTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+    let titleText = sourceTitle.isEmpty ? "原著" : "《\(sourceTitle)》"
+    let anchor = guide.timelineAnchorLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+    let startLabel = guide.timelineStartDateLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    let intro = "\n本书是\(titleText)的同人作品，方案必须同时满足两个来源：用户设定决定主角、"
+      + "金手指和主线走向；\(titleText)的既有事实、人物关系和事件顺序是不可改写的前提。"
+      + "两者冲突时，只允许在\(titleText)没有写死的空白处发挥，不得改写\(titleText)已定的事实。"
+
+    var lines: [String] = ["", "同人方案的硬性要求："]
+    lines.append(
+      "1. worldbuilding 只写\(titleText)已有的世界规则加上用户设定新增的部分，"
+        + "不要发明与\(titleText)冲突的体系；不确定的地方留白，不要猜测。"
+    )
+    lines.append(
+      "2. characters 里的原著人物必须沿用\(titleText)的姓名、身份和关系，"
+        + "不要改写他们的既定经历；原创人物要明确标出是原创。"
+    )
+    if !anchor.isEmpty {
+      var timing = "3. 本书开篇的时间点是"
+      timing += startLabel.isEmpty ? "「\(anchor)」之前" : "\(startLabel)"
+      timing += "，"
+      if guide.timelineStartDayOffset < 0 {
+        timing += "即原著事件「\(anchor)」发生前约 \(-guide.timelineStartDayOffset) 天。"
+          + "outline 和 volumePlan 必须尊重这个起点：在「\(anchor)」发生之前，"
+          + "该事件之后的原著剧情、人物状态和已知信息都还不存在，任何人都不知道它会发生。"
+      } else if guide.timelineStartDayOffset > 0 {
+        timing += "即原著事件「\(anchor)」发生后约 \(guide.timelineStartDayOffset) 天。"
+          + "「\(anchor)」之后的原著剧情按原著顺序尚未展开的部分，不得提前发生。"
+      } else {
+        timing += "即与原著事件「\(anchor)」同期。该事件之后的原著剧情不得提前发生。"
+      }
+      lines.append(timing)
+      lines.append(
+        "4. volumePlan 必须写清每一卷与原著时间线的对应关系（这一卷大致处于原著的哪个阶段），"
+          + "并保证原著事件按原著顺序出现，不得为了剧情方便把后期事件提前。"
+      )
+    } else {
+      lines.append(
+        "3. volumePlan 必须写清每一卷与原著时间线的对应关系，"
+          + "并保证原著事件按原著顺序出现，不得把后期事件提前。"
+      )
+    }
+    return (intro, lines.joined(separator: "\n"))
   }
 
   private func normalizedFanqieAbstract(_ raw: String) throws -> String {

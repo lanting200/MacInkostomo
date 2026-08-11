@@ -374,11 +374,15 @@ extension InkOSCore {
     let previousBeats = try previousBeatsText(bookID: bookID, before: range.start, count: 4)
     let openHooks = openHooksText(plan.continuity, upTo: range.end)
     let knownEntities = knownEntitiesText(plan.continuity, limit: 60)
+    // Derivative books get two extra sections and a stricter beat contract. Built
+    // here rather than in the template so an original book's prompt is byte-for-byte
+    // what it was before this feature existed.
+    let derivative = try derivativeBeatSections(bookID: bookID, range: range, plan: plan)
 
     return """
       你是长篇小说的章节节拍规划编辑。为第 \(range.start) 至 \(range.end) 章各生成一张节拍卡。
       本批次属于第 \(range.volume) 卷（第 \(volumeStart)-\(volumeEnd) 章，共 \(volumeChapters) 章），覆盖本卷进度的 \(progressStart)% 至 \(progressEnd)%。
-      每章约 \(targetWords) 字。
+      每章约 \(targetWords) 字。\(derivative.intro)
 
       最重要的约束是排期纪律：
       1. 只允许推进分卷地图中排期落在第 \(range.start) 至 \(range.end) 章的内容。分卷地图里排期在第 \(range.end) 章之后的剧情、任务、副本、地点、组织、人物和物品，必须写进对应章节的 forbiddenElements，不得在本批次发生。
@@ -392,11 +396,12 @@ extension InkOSCore {
       3. 主角的 setback 必须让他在本章结束时处于比开场更被动或更紧迫的位置，而不是"清点完家底后安心等待"。
 
       字段含义：
-      number 章号；volumeNumber 卷号；goal 本章要解决或推进的一个具体问题；openingHook 开场的具体时刻或动作，不是背景介绍；scenes 本章 1 至 3 个场景，每项写清地点、在场人物和现场冲突；requiredEvents 本章必须在正文里被看见发生的事，2 至 4 条，写成可验证的具体事件；forbiddenElements 本章禁止提前出现或提前解决的内容，3 至 6 条，逐条点名具体剧情、人物、物品或能力；endingHook 章末停留的选择、反转、倒计时或新信息；focusCharacters 本章出场并有作用的人物，含新引入者；newNamedCharacters 本章新引入的具名人物数量；timeSpan 本章覆盖的故事时间跨度（可选：仅当时间有明显跳跃时填写，连续剧情可留空）；setback 本章必须出现的挫折、代价或失败；notes 给写作模型的补充提醒。
+      \(derivative.rules)字段含义：
+      number 章号；volumeNumber 卷号；goal 本章要解决或推进的一个具体问题；openingHook 开场的具体时刻或动作，不是背景介绍；scenes 本章 1 至 3 个场景，每项写清地点、在场人物和现场冲突；requiredEvents 本章必须在正文里被看见发生的事，2 至 4 条，写成可验证的具体事件；forbiddenElements 本章禁止提前出现或提前解决的内容，3 至 6 条，逐条点名具体剧情、人物、物品或能力；endingHook 章末停留的选择、反转、倒计时或新信息；focusCharacters 本章出场并有作用的人物，含新引入者；newNamedCharacters 本章新引入的具名人物数量；timeSpan 本章覆盖的故事时间跨度（可选：仅当时间有明显跳跃时填写，连续剧情可留空）；storyDays 本章消耗的故事天数，整数，供系统累加推算故事日期：当天内发生填 0，跨一夜填 1，"三天后"这类跳跃填实际天数，不确定就省略该字段（系统按每章 1 天计）；setback 本章必须出现的挫折、代价或失败；notes 给写作模型的补充提醒。
 
       只输出 JSON：
-      {"beats":[{"number":\(range.start),"volumeNumber":\(range.volume),"goal":"","openingHook":"","scenes":[""],"requiredEvents":[""],"forbiddenElements":[""],"endingHook":"","focusCharacters":[""],"newNamedCharacters":0,"timeSpan":"","setback":"","notes":""}]}
-      beats 必须按章号升序覆盖第 \(range.start) 至 \(range.end) 章，一章一项，不多不少。除 timeSpan 外所有字符串字段非空；timeSpan 仅在时间有明显跳跃时填写，连续叙述的章节可留空。
+      {"beats":[{"number":\(range.start),"volumeNumber":\(range.volume),"goal":"","openingHook":"","scenes":[""],"requiredEvents":[""],"forbiddenElements":[""],"endingHook":"","focusCharacters":[""],"newNamedCharacters":0,"timeSpan":"","storyDays":1,"setback":"","notes":""}]}
+      beats 必须按章号升序覆盖第 \(range.start) 至 \(range.end) 章，一章一项，不多不少。除 timeSpan 外所有字符串字段非空；timeSpan 仅在时间有明显跳跃时填写，连续叙述的章节可留空。storyDays 必须是整数，不要写成"半天"这类文字，半天算 0 天。
 
       【故事基石】
       \(storyFrame)
@@ -420,8 +425,72 @@ extension InkOSCore {
       \(openHooks)
 
       【已登记实体】
-      \(knownEntities)
+      \(knownEntities)\(derivative.sections)
       """
+  }
+
+  /// The two derivative-only additions to the beat prompt, plus the extra rules.
+  ///
+  /// Returns empty strings for an original book so its prompt is unchanged. Each
+  /// piece is separately empty-guarded: a derivative book whose canon extraction has
+  /// not run yet gets the timeline without a canon section rather than an empty
+  /// heading, because an empty 【原著正典约束】 reads as "there is no canon" and is
+  /// worse than saying nothing.
+  private func derivativeBeatSections(
+    bookID: String,
+    range: (start: Int, end: Int, volume: Int),
+    plan: LongFormPlanResponse
+  ) throws -> (intro: String, rules: String, sections: String) {
+    guard bookKind(bookID: bookID) == .derivative else { return ("", "", "") }
+    let sourceTitle = bookSourceTitle(bookID: bookID)
+    let titleText = sourceTitle.isEmpty ? "原著" : "《\(sourceTitle)》"
+
+    // The window spans the whole batch: a beat card for chapter N must not schedule
+    // an event that only becomes true later in the batch either, so the clock is
+    // read at the first chapter and the last.
+    let timeline = loadDerivativeTimeline(bookID: bookID)
+    let beats = try? loadChapterBeatPlan(bookID: bookID)
+    let opening = derivativeTimelineStatus(
+      bookID: bookID,
+      chapterNumber: range.start,
+      continuity: plan.continuity,
+      timeline: timeline,
+      beats: beats
+    )
+    let closing = derivativeTimelineStatus(
+      bookID: bookID,
+      chapterNumber: range.end,
+      continuity: plan.continuity,
+      timeline: timeline,
+      beats: beats
+    )
+
+    var sections = ""
+    if let openingText = derivativeTimelineSection(opening) {
+      sections += "\n\n【本批次起点的原著时间进度】\n\(openingText)"
+      if closing.storyDay != opening.storyDay {
+        sections += "\n\n【本批次终点的原著时间进度】\n第 \(range.end) 章预计距开篇 "
+          + "\(closing.elapsedDays) 天。本批次任何一章都不得触及上面"
+          + "「尚未发生」列表中的内容。"
+      }
+    }
+
+    let intro = "\n本书是\(titleText)的同人作品：客户设定决定主角和主线，"
+      + "\(titleText)的既有事实和时间顺序是不可违背的前提。"
+
+    var ruleLines = [
+      "同人排期纪律（与上面的排期纪律同等强制）：",
+      "1. 客户设定与原著冲突时，客户设定只在自己新增的部分成立，不得改写\(titleText)已经写死的事实、人物关系或结局。",
+      "2. 原著里尚未发生的事件不得提前发生，也不得被本章任何人预知、提及或讨论——这是同人文最常见的破坏方式：事实本身没错，但出现的时间错了。凡属下面「尚未发生」列表的内容，必须写进对应章节的 forbiddenElements。",
+      "3. 原著已经发生的事件可以作为既成事实引用，但不要重写原著章节的内容当作本书剧情。",
+      "4. storyDays 必须按故事时间如实填写：时间进度是靠它累加出来的，填错会让后面所有章节的原著对照全部错位。",
+    ]
+    if !opening.isConfigured {
+      // Say so rather than silently omitting: the model is being asked to fill
+      // storyDays and should know the clock has no origin yet.
+      ruleLines.append("5. 本书尚未设置原著时间锚点，暂时无法核对原著事件的先后，遇到原著事件请回避而不是猜测。")
+    }
+    return (intro, ruleLines.joined(separator: "\n") + "\n\n", sections)
   }
 
   private func normalizedChapterBeat(
@@ -441,6 +510,11 @@ extension InkOSCore {
       focusCharacters: beatList(object["focusCharacters"], limit: 12),
       newNamedCharacters: integer(object["newNamedCharacters"]),
       timeSpan: beatText(object["timeSpan"]),
+      // Clamped, not trusted: a model that answers 3650 would push the story clock
+      // a decade forward in one chapter and desynchronise every later comparison.
+      // Negative is rejected outright — story time does not run backwards between
+      // consecutive chapters, and a negative value would make the sum non-monotonic.
+      storyDays: integer(object["storyDays"]).map { Swift.max(0, Swift.min(365, $0)) },
       setback: beatText(object["setback"]),
       notes: beatText(object["notes"])
     )

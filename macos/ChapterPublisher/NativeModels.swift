@@ -15,8 +15,27 @@ enum WorkspaceSection: String, CaseIterable, Identifiable, Codable {
 enum ModelRole: String, CaseIterable, Identifiable, Codable {
   case chapter
   case review
+  /// Source-material extraction for derivative writing: builds the canon bible
+  /// out of an imported original work. Separate from `chapter` because the pass
+  /// is offline, runs once per book, and reads far more input than it writes —
+  /// a different model and context budget than prose generation wants.
+  case extraction
 
   var id: String { rawValue }
+
+  /// Config keys backing this role. A blank role-specific value falls back to
+  /// the `chapter` role's, so a user who only wants a different model name can
+  /// leave the endpoint and key empty.
+  var configKeys: (model: String, baseURL: String, apiKey: String) {
+    switch self {
+    case .chapter:
+      return ("model", "baseUrl", "apiKey")
+    case .review:
+      return ("reviewModel", "reviewBaseUrl", "reviewApiKey")
+    case .extraction:
+      return ("extractionModel", "extractionBaseUrl", "extractionApiKey")
+    }
+  }
 }
 
 /// A bounded representation for server fields whose schema is intentionally
@@ -496,8 +515,10 @@ struct InkOSConfig: Codable, Equatable, Sendable {
   let provider: String
   let model: String
   let reviewModel: String
+  let extractionModel: String
   let baseUrl: String
   let reviewBaseUrl: String
+  let extractionBaseUrl: String
   let apiFormat: String
   let stream: Bool?
   let temperature: Double?
@@ -508,15 +529,20 @@ struct InkOSConfig: Codable, Equatable, Sendable {
   let apiKeyPreview: String
   let hasReviewApiKey: Bool
   let reviewApiKeyPreview: String
+  let hasExtractionApiKey: Bool
+  let extractionApiKeyPreview: String
 
   /// Deliberately blank even if a future server accidentally returns a key.
   let apiKey: String
   let reviewApiKey: String
+  let extractionApiKey: String
 
   private enum CodingKeys: String, CodingKey {
-    case provider, model, reviewModel, baseUrl, reviewBaseUrl, apiFormat, stream
+    case provider, model, reviewModel, extractionModel, baseUrl, reviewBaseUrl
+    case extractionBaseUrl, apiFormat, stream
     case temperature, maxTokens, thinkingBudget, source, hasApiKey, apiKeyPreview
-    case hasReviewApiKey, reviewApiKeyPreview, apiKey, reviewApiKey
+    case hasReviewApiKey, reviewApiKeyPreview, hasExtractionApiKey, extractionApiKeyPreview
+    case apiKey, reviewApiKey, extractionApiKey
   }
 
   init(from decoder: Decoder) throws {
@@ -524,8 +550,10 @@ struct InkOSConfig: Codable, Equatable, Sendable {
     provider = try values.decodeIfPresent(String.self, forKey: .provider) ?? "openai"
     model = try values.decodeIfPresent(String.self, forKey: .model) ?? ""
     reviewModel = try values.decodeIfPresent(String.self, forKey: .reviewModel) ?? ""
+    extractionModel = try values.decodeIfPresent(String.self, forKey: .extractionModel) ?? ""
     baseUrl = try values.decodeIfPresent(String.self, forKey: .baseUrl) ?? ""
     reviewBaseUrl = try values.decodeIfPresent(String.self, forKey: .reviewBaseUrl) ?? ""
+    extractionBaseUrl = try values.decodeIfPresent(String.self, forKey: .extractionBaseUrl) ?? ""
     apiFormat = try values.decodeIfPresent(String.self, forKey: .apiFormat) ?? "chat"
     stream = try values.decodeIfPresent(Bool.self, forKey: .stream)
     temperature = try values.decodeIfPresent(Double.self, forKey: .temperature)
@@ -537,8 +565,13 @@ struct InkOSConfig: Codable, Equatable, Sendable {
     hasReviewApiKey = try values.decodeIfPresent(Bool.self, forKey: .hasReviewApiKey) ?? false
     reviewApiKeyPreview =
       try values.decodeIfPresent(String.self, forKey: .reviewApiKeyPreview) ?? ""
+    hasExtractionApiKey =
+      try values.decodeIfPresent(Bool.self, forKey: .hasExtractionApiKey) ?? false
+    extractionApiKeyPreview =
+      try values.decodeIfPresent(String.self, forKey: .extractionApiKeyPreview) ?? ""
     apiKey = ""
     reviewApiKey = ""
+    extractionApiKey = ""
   }
 
   func encode(to encoder: Encoder) throws {
@@ -546,8 +579,10 @@ struct InkOSConfig: Codable, Equatable, Sendable {
     try values.encode(provider, forKey: .provider)
     try values.encode(model, forKey: .model)
     try values.encode(reviewModel, forKey: .reviewModel)
+    try values.encode(extractionModel, forKey: .extractionModel)
     try values.encode(baseUrl, forKey: .baseUrl)
     try values.encode(reviewBaseUrl, forKey: .reviewBaseUrl)
+    try values.encode(extractionBaseUrl, forKey: .extractionBaseUrl)
     try values.encode(apiFormat, forKey: .apiFormat)
     try values.encodeIfPresent(stream, forKey: .stream)
     try values.encodeIfPresent(temperature, forKey: .temperature)
@@ -558,18 +593,24 @@ struct InkOSConfig: Codable, Equatable, Sendable {
     try values.encode(apiKeyPreview, forKey: .apiKeyPreview)
     try values.encode(hasReviewApiKey, forKey: .hasReviewApiKey)
     try values.encode(reviewApiKeyPreview, forKey: .reviewApiKeyPreview)
+    try values.encode(hasExtractionApiKey, forKey: .hasExtractionApiKey)
+    try values.encode(extractionApiKeyPreview, forKey: .extractionApiKeyPreview)
     try values.encode("", forKey: .apiKey)
     try values.encode("", forKey: .reviewApiKey)
+    try values.encode("", forKey: .extractionApiKey)
   }
 }
 
 struct InkOSConfigUpdate: Encodable, Sendable, CustomStringConvertible {
   let model: String
   let reviewModel: String
+  let extractionModel: String
   let baseUrl: String
   let reviewBaseUrl: String
+  let extractionBaseUrl: String
   let apiKey: String
   let reviewApiKey: String
+  let extractionApiKey: String
   let stream: Bool
   let thinkingBudget: Int
   let temperature: Double?
@@ -578,10 +619,13 @@ struct InkOSConfigUpdate: Encodable, Sendable, CustomStringConvertible {
   init(
     model: String,
     reviewModel: String,
+    extractionModel: String = "",
     baseUrl: String,
     reviewBaseUrl: String = "",
+    extractionBaseUrl: String = "",
     apiKey: String = "",
     reviewApiKey: String = "",
+    extractionApiKey: String = "",
     stream: Bool = false,
     thinkingBudget: Int = 0,
     temperature: Double? = nil,
@@ -589,10 +633,13 @@ struct InkOSConfigUpdate: Encodable, Sendable, CustomStringConvertible {
   ) {
     self.model = model
     self.reviewModel = reviewModel
+    self.extractionModel = extractionModel
     self.baseUrl = baseUrl
     self.reviewBaseUrl = reviewBaseUrl
+    self.extractionBaseUrl = extractionBaseUrl
     self.apiKey = apiKey
     self.reviewApiKey = reviewApiKey
+    self.extractionApiKey = extractionApiKey
     self.stream = stream
     self.thinkingBudget = thinkingBudget
     self.temperature = temperature
@@ -600,7 +647,8 @@ struct InkOSConfigUpdate: Encodable, Sendable, CustomStringConvertible {
   }
 
   var description: String {
-    "InkOSConfigUpdate(model: \(model), reviewModel: \(reviewModel), credentials: redacted)"
+    "InkOSConfigUpdate(model: \(model), reviewModel: \(reviewModel), "
+      + "extractionModel: \(extractionModel), credentials: redacted)"
   }
 }
 
@@ -1043,9 +1091,30 @@ struct LongFormTimelineMilestone: Codable, Equatable, Sendable {
   let earliestChapter: Int
   let latestChapter: Int
   let immutable: Bool
+  /// Position on the shared in-story day axis, relative to the derivative book's
+  /// anchor event (see `DerivativeTimeline`). Negative is before the anchor.
+  ///
+  /// `order` cannot serve this purpose: it is a dense sort key that
+  /// `applyContinuityDelta` renumbers on collision, so it carries sequence but no
+  /// distance — it cannot answer "has this happened yet at chapter 12". `sourceDay`
+  /// is an absolute coordinate that survives renumbering and supports arithmetic.
+  /// Nil means unplaced, which is the honest state for a source event whose date
+  /// the text never gives; unplaced events are reported separately rather than
+  /// being guessed onto the axis.
+  let sourceDay: Int?
+  /// Chapter of the *original work* this event was extracted from.
+  ///
+  /// This is the axis that actually works. `sourceDay` needs the text to state
+  /// elapsed time and most passages never do, whereas every extracted milestone
+  /// comes from a known batch, so this is populated for all of them and is
+  /// monotonic in source order. Classifying an event as already-happened or
+  /// not-yet falls back to comparing this against the anchor's source chapter
+  /// when `sourceDay` is missing on either side.
+  let sourceChapter: Int?
 
   private enum CodingKeys: String, CodingKey {
     case id, order, label, earliestChapter, latestChapter, immutable
+    case sourceDay, sourceChapter
   }
 
   init(
@@ -1054,8 +1123,12 @@ struct LongFormTimelineMilestone: Codable, Equatable, Sendable {
     label: String,
     earliestChapter: Int,
     latestChapter: Int,
-    immutable: Bool = true
+    immutable: Bool = true,
+    sourceDay: Int? = nil,
+    sourceChapter: Int? = nil
   ) {
+    self.sourceDay = sourceDay
+    self.sourceChapter = sourceChapter
     self.id = id
     self.order = order
     self.label = label
@@ -1072,6 +1145,8 @@ struct LongFormTimelineMilestone: Codable, Equatable, Sendable {
     earliestChapter = try values.decode(Int.self, forKey: .earliestChapter)
     latestChapter = try values.decode(Int.self, forKey: .latestChapter)
     immutable = try values.decodeIfPresent(Bool.self, forKey: .immutable) ?? true
+    sourceDay = try? values.decodeIfPresent(Int.self, forKey: .sourceDay)
+    sourceChapter = try? values.decodeIfPresent(Int.self, forKey: .sourceChapter)
   }
 }
 
@@ -1180,6 +1255,16 @@ struct ChapterBeat: Codable, Identifiable, Equatable, Sendable {
   var newNamedCharacters: Int?
   /// Story time the chapter is allowed to cover.
   var timeSpan: String
+  /// Whole in-story days this chapter consumes, as a number the pipeline can add.
+  ///
+  /// `timeSpan` is free prose ("半天", "三天后") written for the writing model, so
+  /// nothing can sum it. Derivative work needs the sum: the chapter's position on
+  /// the source timeline is the anchor day plus every preceding chapter's elapsed
+  /// days, and that is what decides which canon events have already happened.
+  /// Nil means the beat did not say; `DerivativeTimeline` treats it as
+  /// `defaultChapterStoryDays` rather than zero, because a chapter that advances
+  /// the clock by nothing would freeze the story date forever.
+  var storyDays: Int?
   /// Setback, cost or failure the chapter must contain.
   var setback: String
   /// Free-form reminders for the writing model.
@@ -1199,6 +1284,7 @@ struct ChapterBeat: Codable, Identifiable, Equatable, Sendable {
     focusCharacters: [String] = [],
     newNamedCharacters: Int? = nil,
     timeSpan: String = "",
+    storyDays: Int? = nil,
     setback: String = "",
     notes: String = ""
   ) {
@@ -1213,6 +1299,7 @@ struct ChapterBeat: Codable, Identifiable, Equatable, Sendable {
     self.focusCharacters = focusCharacters
     self.newNamedCharacters = newNamedCharacters
     self.timeSpan = timeSpan
+    self.storyDays = storyDays
     self.setback = setback
     self.notes = notes
   }
@@ -1220,7 +1307,7 @@ struct ChapterBeat: Codable, Identifiable, Equatable, Sendable {
   private enum CodingKeys: String, CodingKey {
     case number, volumeNumber, goal, openingHook, scenes, requiredEvents
     case forbiddenElements, endingHook, focusCharacters, newNamedCharacters
-    case timeSpan, setback, notes
+    case timeSpan, storyDays, setback, notes
   }
 
   init(from decoder: Decoder) throws {
@@ -1237,6 +1324,11 @@ struct ChapterBeat: Codable, Identifiable, Equatable, Sendable {
     focusCharacters = (try? values.decodeIfPresent([String].self, forKey: .focusCharacters)) ?? []
     newNamedCharacters = try? values.decodeIfPresent(Int.self, forKey: .newNamedCharacters)
     timeSpan = values.lossyString(forKey: .timeSpan)
+    // Not `lossyInt`: that folds a missing key into a default, and nil has to stay
+    // distinguishable from an explicit 0. A beat may legitimately say a chapter
+    // occupies the same day as the last one ("0"), which is not the same as a beat
+    // that never mentioned time at all.
+    storyDays = try? values.decodeIfPresent(Int.self, forKey: .storyDays)
     setback = values.lossyString(forKey: .setback)
     notes = values.lossyString(forKey: .notes)
   }
@@ -1327,6 +1419,224 @@ struct ChapterBeatPlan: Codable, Equatable, Sendable {
   func beat(for number: Int) -> ChapterBeat? {
     beats.first { $0.number == number }
   }
+}
+
+/// Progress of the derivative preparation pass, for display while it runs.
+///
+/// Import is fast, canon extraction is not: it is one model call per batch of source
+/// text, so a full-length novel takes hundreds. The pass is checkpointed after every
+/// batch, which is why this carries `canonComplete` separately from `isRunning` — a
+/// pass can stop with usable canon and be resumed later.
+struct DerivativePreparationState: Equatable, Sendable {
+  var bookID: String
+  var bookTitle: String
+  /// What the pass is doing right now, in the customer's words.
+  var phase: String
+  var isRunning: Bool
+  var sourceChapterCount: Int
+  var canonChaptersDone: Int
+  var canonComplete: Bool
+  var entityCount: Int
+  var timelineCount: Int
+  /// The author's settings are a separate overlay pass and must remain resumable
+  /// even after canon extraction itself has completed.
+  var overlayComplete: Bool = true
+  /// Semantic embedding is optional and retrieval still works lexically without it,
+  /// so a failure here is reported while retaining the retry affordance.
+  var embedRequested: Bool = false
+  var embeddingComplete: Bool = true
+  var embeddedPassages: Int
+  var totalPassages: Int
+  var failure: String?
+
+  var canonProgress: Double {
+    guard sourceChapterCount > 0 else { return 0 }
+    return Swift.min(1, Double(canonChaptersDone) / Double(sourceChapterCount))
+  }
+
+  var isComplete: Bool {
+    canonComplete && overlayComplete && embeddingComplete
+  }
+
+  var needsResume: Bool { !isComplete }
+}
+
+// MARK: - Book kind
+
+/// Whether a book invents its world or continues someone else's.
+///
+/// This is the one field that changes what the pipeline is allowed to do: a
+/// derivative book must obey an imported original, so its beats and prose get the
+/// retrieval and timeline sections that an original book has no source for.
+enum BookKind: String, Codable, CaseIterable, Identifiable, Sendable {
+  /// The customer's settings text is the whole world.
+  case original
+  /// 同人: an imported original work supplies canon the book cannot contradict.
+  case derivative
+
+  var id: String { rawValue }
+
+  var label: String {
+    switch self {
+    case .original: return "自创小说"
+    case .derivative: return "同人小说"
+    }
+  }
+
+  var summary: String {
+    switch self {
+    case .original: return "你随便写设定，LLM 补全成完整方案"
+    case .derivative: return "上传原著，正典与时间线由原著约束"
+    }
+  }
+}
+
+// MARK: - Derivative timeline
+
+/// Where a derivative book sits on the source work's clock.
+///
+/// Fan fiction drifts in time because nothing in the pipeline knows *when* the
+/// story is. The writing model sees canon as a flat set of facts, so a chapter set
+/// before the source protagonist's arrival can still have characters discussing
+/// events from source chapter 900. This struct fixes the story to a day axis: one
+/// canon milestone is the origin, chapter 1 sits a stated number of days from it,
+/// and each chapter advances by its beat's `storyDays`.
+///
+/// Days rather than dates because the source calendar is fictional and inconsistent
+/// — the text says "三天后", not a parseable date. An integer day offset can be
+/// summed and compared without parsing anything, and `anchorDateLabel` carries the
+/// in-world calendar wording for the prompt to quote.
+struct DerivativeTimeline: Codable, Equatable, Sendable {
+  var version: Int
+  /// `LongFormTimelineMilestone.id` the axis is measured from. Nil until the
+  /// customer picks one, in which case the axis is relative to chapter 1 alone and
+  /// only elapsed time is reported.
+  var anchorMilestoneID: String?
+  /// The anchor event in the customer's words, quoted into prompts.
+  var anchorLabel: String
+  /// Chapter of the *original work* where the anchor event happens.
+  ///
+  /// This is what makes the timeline usable on a real novel. `sourceDay` requires
+  /// the source text to state elapsed time and most of it never does, so a day-only
+  /// axis leaves nearly every milestone unplaced. Source chapter order, by contrast,
+  /// is chronological in a linearly told novel and is known for every extracted
+  /// milestone. With the anchor's chapter known, "has this happened yet" becomes a
+  /// chapter comparison that works even when no dates exist anywhere.
+  var anchorSourceChapter: Int?
+  /// Day offset of chapter 1 from the anchor. Negative means the book opens before
+  /// the anchor — the "穿越前一年" case, which is -365.
+  var startDayOffset: Int
+  /// In-world calendar wording for chapter 1, quoted verbatim into prompts. Free
+  /// text because the source calendar is fictional.
+  var startDateLabel: String
+  /// Days a chapter advances when its beat leaves `storyDays` unset. One rather
+  /// than zero: a chapter that advances nothing would freeze the clock forever, and
+  /// a serialized chapter almost always covers at least part of a day.
+  var defaultChapterDays: Int
+  var updatedAt: String
+
+  static let currentVersion = 1
+
+  init(
+    version: Int = DerivativeTimeline.currentVersion,
+    anchorMilestoneID: String? = nil,
+    anchorLabel: String = "",
+    anchorSourceChapter: Int? = nil,
+    startDayOffset: Int = 0,
+    startDateLabel: String = "",
+    defaultChapterDays: Int = 1,
+    updatedAt: String = ""
+  ) {
+    self.version = version
+    self.anchorMilestoneID = anchorMilestoneID
+    self.anchorLabel = anchorLabel
+    self.anchorSourceChapter = anchorSourceChapter
+    self.startDayOffset = startDayOffset
+    self.startDateLabel = startDateLabel
+    self.defaultChapterDays = defaultChapterDays
+    self.updatedAt = updatedAt
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case version, anchorMilestoneID, anchorLabel, anchorSourceChapter
+    case startDayOffset, startDateLabel
+    case defaultChapterDays, updatedAt
+  }
+
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    version = values.lossyInt(forKey: .version, default: DerivativeTimeline.currentVersion)
+    anchorMilestoneID = (try? values.decodeIfPresent(String.self, forKey: .anchorMilestoneID))
+      .flatMap { $0 }
+    anchorLabel = values.lossyString(forKey: .anchorLabel)
+    anchorSourceChapter = (try? values.decodeIfPresent(Int.self, forKey: .anchorSourceChapter))
+      .flatMap { $0 }
+    startDayOffset = values.lossyInt(forKey: .startDayOffset)
+    startDateLabel = values.lossyString(forKey: .startDateLabel)
+    defaultChapterDays = Swift.max(0, values.lossyInt(forKey: .defaultChapterDays, default: 1))
+    updatedAt = values.lossyString(forKey: .updatedAt)
+  }
+
+  var isConfigured: Bool {
+    !anchorLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      || !startDateLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      || anchorSourceChapter != nil
+  }
+
+  /// In-story day the given chapter opens on, counted from the anchor.
+  ///
+  /// Days come from the beats rather than a fixed per-chapter constant because
+  /// chapters cover wildly different spans; a beat that skips a month has to move
+  /// the clock by a month. Chapters without a beat yet fall back to
+  /// `defaultChapterDays`, which keeps the axis monotonic instead of stalling.
+  func storyDay(forChapter chapter: Int, beats: [ChapterBeat]) -> Int {
+    guard chapter > 1 else { return startDayOffset }
+    let byNumber = Dictionary(beats.map { ($0.number, $0) }, uniquingKeysWith: { first, _ in first })
+    var day = startDayOffset
+    for number in 1..<chapter {
+      day += byNumber[number]?.storyDays ?? defaultChapterDays
+    }
+    return day
+  }
+}
+
+/// One canon event placed relative to the chapter being written.
+struct DerivativeTimelineEvent: Codable, Equatable, Identifiable, Sendable {
+  let id: String
+  let label: String
+  /// Day on the shared axis, mirrored from `LongFormTimelineMilestone.sourceDay`.
+  let sourceDay: Int?
+  /// Source chapter the event was extracted from.
+  let sourceChapter: Int?
+  /// Days from the current chapter. Negative is past, positive is future, nil when
+  /// the event has no day and was placed by source chapter instead.
+  let dayDelta: Int?
+}
+
+/// The timeline as of one chapter: where the story is, and which canon events are
+/// therefore behind it, ahead of it, or unplaced.
+///
+/// `future` is the load-bearing list. A derivative chapter's most common canon
+/// violation is not getting a fact wrong but knowing it too early, and that is only
+/// detectable with a story clock.
+struct DerivativeTimelineStatus: Codable, Equatable, Sendable {
+  let chapterNumber: Int
+  /// Day offset from the anchor at the start of this chapter.
+  let storyDay: Int
+  /// Days since chapter 1 opened.
+  let elapsedDays: Int
+  let anchorLabel: String
+  let startDateLabel: String
+  /// Canon events at or before `storyDay`, most recent last.
+  let past: [DerivativeTimelineEvent]
+  /// Canon events after `storyDay`, nearest first. These must not be known to
+  /// anyone in the chapter.
+  let future: [DerivativeTimelineEvent]
+  /// Canon events with no `sourceDay`. Reported rather than guessed onto the axis,
+  /// so the writing model knows the ordering is unverified.
+  let unplaced: [DerivativeTimelineEvent]
+  /// True when a timeline exists and is configured for this book.
+  let isConfigured: Bool
 }
 
 extension LongFormContinuity {
@@ -1847,6 +2157,19 @@ struct CreateBookGuide: Codable, Equatable, Sendable {
   var language: String = "zh"
   var genre: String = "xuanhuan"
   var platform: String = "tomato"
+  /// Original or derivative. Drives which questions the creation sheet asks and
+  /// which prompt sections the pipeline adds; nothing else about the flow differs.
+  var kind: BookKind = .original
+  /// Title of the original work, for derivative books only. Quoted into the
+  /// creation prompt so the plan is written against a named canon rather than a
+  /// generic "原著".
+  var sourceTitle: String = ""
+  /// Canon event the story clock is measured from, e.g. 克莱恩穿越.
+  var timelineAnchorLabel: String = ""
+  /// Chapter 1's position relative to the anchor, in days. Negative opens before it.
+  var timelineStartDayOffset: Int = 0
+  /// In-world wording for chapter 1's date, quoted verbatim into prompts.
+  var timelineStartDateLabel: String = ""
   var storyPremise: String = ""
   var protagonistName: String = ""
   var protagonistProfile: String = ""
@@ -1867,6 +2190,11 @@ struct CreateBookGuide: Codable, Equatable, Sendable {
     language = request.language
     genre = request.genre
     platform = request.platform
+    kind = request.kind
+    sourceTitle = request.sourceTitle
+    timelineAnchorLabel = request.timelineAnchorLabel
+    timelineStartDayOffset = request.timelineStartDayOffset
+    timelineStartDateLabel = request.timelineStartDateLabel
     storyPremise = request.premise
     protagonistName = ""
     protagonistProfile = ""
@@ -1888,6 +2216,47 @@ struct CreateBookGuide: Codable, Equatable, Sendable {
   mutating func synchronizeBudget() {
     targetTotalWords = exactTargetTotalWords
   }
+
+  private enum CodingKeys: String, CodingKey {
+    case title, language, genre, platform, kind, sourceTitle
+    case timelineAnchorLabel, timelineStartDayOffset, timelineStartDateLabel
+    case storyPremise, protagonistName, protagonistProfile, worldRules, pacing, style
+    case targetChapters, targetChapterWords, targetTotalWords, volumeCount
+    case chapterWordTolerance, specialConstraints
+  }
+
+  /// Decoded field by field with defaults rather than by the synthesized decoder.
+  ///
+  /// The creation sheet persists a draft to `UserDefaults`, and
+  /// `CreateBookDraftPersistence.load` discards the whole snapshot when decoding
+  /// throws. A synthesized decoder ignores property defaults and demands every key,
+  /// so adding `kind` here would silently erase any draft saved by an earlier build
+  /// — the customer would reopen the sheet to an empty form.
+  init(from decoder: Decoder) throws {
+    let values = try decoder.container(keyedBy: CodingKeys.self)
+    title = values.lossyString(forKey: .title)
+    language = values.lossyString(forKey: .language, default: "zh")
+    genre = values.lossyString(forKey: .genre, default: "xuanhuan")
+    platform = values.lossyString(forKey: .platform, default: "tomato")
+    kind = (try? values.decodeIfPresent(BookKind.self, forKey: .kind)) .flatMap { $0 } ?? .original
+    sourceTitle = values.lossyString(forKey: .sourceTitle)
+    timelineAnchorLabel = values.lossyString(forKey: .timelineAnchorLabel)
+    timelineStartDayOffset = values.lossyInt(forKey: .timelineStartDayOffset)
+    timelineStartDateLabel = values.lossyString(forKey: .timelineStartDateLabel)
+    storyPremise = values.lossyString(forKey: .storyPremise)
+    protagonistName = values.lossyString(forKey: .protagonistName)
+    protagonistProfile = values.lossyString(forKey: .protagonistProfile)
+    worldRules = values.lossyString(forKey: .worldRules)
+    pacing = values.lossyString(forKey: .pacing)
+    style = values.lossyString(forKey: .style)
+    targetChapters = values.lossyInt(forKey: .targetChapters, default: 200)
+    targetChapterWords = values.lossyInt(forKey: .targetChapterWords, default: 3000)
+    targetTotalWords = values.lossyInt(forKey: .targetTotalWords, default: 600_000)
+    volumeCount = values.lossyInt(forKey: .volumeCount, default: 6)
+    chapterWordTolerance = values.lossyInt(forKey: .chapterWordTolerance, default: 15)
+    specialConstraints =
+      (try? values.decodeIfPresent([String].self, forKey: .specialConstraints)) .flatMap { $0 } ?? []
+  }
 }
 
 struct CreateBookRequest: Codable, Equatable, Sendable {
@@ -1895,6 +2264,17 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
   var language: String
   var genre: String
   var platform: String
+  /// Original or derivative. Persisted into `book.json` at creation, which is where
+  /// the pipeline reads it from on every later chapter.
+  var kind: BookKind
+  /// Title of the original work, derivative books only.
+  var sourceTitle: String
+  /// Canon event chapter 1 is positioned against, derivative books only.
+  var timelineAnchorLabel: String
+  /// Chapter 1's day offset from the anchor. Negative opens before it.
+  var timelineStartDayOffset: Int
+  /// In-world wording for chapter 1's date, quoted verbatim into prompts.
+  var timelineStartDateLabel: String
   var targetChapters: Int
   var chapterWords: Int
   var totalWords: String
@@ -1921,6 +2301,11 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
     language: String = "zh",
     genre: String = "xuanhuan",
     platform: String = "tomato",
+    kind: BookKind = .original,
+    sourceTitle: String = "",
+    timelineAnchorLabel: String = "",
+    timelineStartDayOffset: Int = 0,
+    timelineStartDateLabel: String = "",
     targetChapters: Int = 200,
     chapterWords: Int = 3000,
     totalWords: String = "600000",
@@ -1943,6 +2328,11 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
     self.language = language
     self.genre = genre
     self.platform = platform
+    self.kind = kind
+    self.sourceTitle = sourceTitle
+    self.timelineAnchorLabel = timelineAnchorLabel
+    self.timelineStartDayOffset = timelineStartDayOffset
+    self.timelineStartDateLabel = timelineStartDateLabel
     self.targetChapters = targetChapters
     self.chapterWords = chapterWords
     self.totalWords = totalWords
@@ -1982,6 +2372,8 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
 
   private enum CodingKeys: String, CodingKey {
     case title, language, genre, platform, targetChapters, chapterWords, totalWords
+    case kind, sourceTitle
+    case timelineAnchorLabel, timelineStartDayOffset, timelineStartDateLabel
     case targetTotalWords, totalWordCount, targetWords
     case targetChapterWords
     case volumeCount, targetVolumes
@@ -1997,6 +2389,13 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
     language = values.lossyString(forKey: .language, default: "zh")
     genre = values.lossyString(forKey: .genre, default: "xuanhuan")
     platform = values.lossyString(forKey: .platform, default: "tomato")
+    // Absent means a book created before derivative support existed, and those are
+    // all original works, so the default is the correct migration.
+    kind = (try? values.decodeIfPresent(BookKind.self, forKey: .kind)) ?? .original
+    sourceTitle = values.lossyString(forKey: .sourceTitle)
+    timelineAnchorLabel = values.lossyString(forKey: .timelineAnchorLabel)
+    timelineStartDayOffset = values.lossyInt(forKey: .timelineStartDayOffset)
+    timelineStartDateLabel = values.lossyString(forKey: .timelineStartDateLabel)
     targetChapters = values.lossyInt(forKey: .targetChapters, default: 200)
     chapterWords =
       values.contains(.targetChapterWords)
@@ -2046,6 +2445,11 @@ struct CreateBookRequest: Codable, Equatable, Sendable {
     try values.encode(language, forKey: .language)
     try values.encode(genre, forKey: .genre)
     try values.encode(platform, forKey: .platform)
+    try values.encode(kind, forKey: .kind)
+    try values.encode(sourceTitle, forKey: .sourceTitle)
+    try values.encode(timelineAnchorLabel, forKey: .timelineAnchorLabel)
+    try values.encode(timelineStartDayOffset, forKey: .timelineStartDayOffset)
+    try values.encode(timelineStartDateLabel, forKey: .timelineStartDateLabel)
     try values.encode(chapters, forKey: .targetChapters)
     try values.encode(chapterWords, forKey: .chapterWords)
     try values.encode(chapterWords, forKey: .targetChapterWords)

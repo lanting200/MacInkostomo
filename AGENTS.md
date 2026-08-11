@@ -52,6 +52,23 @@ of the build or runtime. The only build system is the Xcode project.
   - `InkOSCoreSettings.swift`: settings files and atomic backup/restore.
   - `InkOSCoreFanqie.swift`: fanqie session, online work/chapter reading, work
     creation, chapter upload and replacement.
+  - `InkOSCoreDerivative.swift`: original-work retrieval for derivative writing —
+    encoding detection, chapter splitting, and hybrid BM25 + on-device semantic
+    search fused by reciprocal rank. `derivativeSourceContext` is called from
+    `generationPrompt` for derivative books, so retrieved canon reaches the writing
+    model; `CreateBookSheet` uploads the original and `WorkspaceModel`
+    `prepareDerivativeSource` ingests it right after the book is created. Retrieval
+    keys include registered canon entities named in the beat goal, scenes and
+    required events, not only `focusCharacters`.
+  - `InkOSCoreCanon.swift`: turns an imported original into continuity — batched
+    extraction of canon, world rules, entities, knowledge boundaries, timeline and
+    hooks, checkpointed per batch so a bounded run plus a resume reaches the same
+    place. Source chapter numbers are rewritten into the derivative book's units,
+    with provenance kept in `markers`.
+  - `InkOSCoreTimeline.swift`: the 同人 story clock. `source/timeline.json` holds the
+    anchor and the day offset of chapter 1; `derivativeStoryDay` sums each beat's
+    `storyDays` to place a chapter, and `derivativeTimelineStatus` splits canon
+    events into past, future, and unplaced for the beat and generation prompts.
   - `NativeModels.swift`, `NativeComponents.swift`, `NativeWorkspaceView.swift`,
     `ActivityWorkspaceView.swift`, `BookDialogs.swift`,
     `FanqieWorkspaceView.swift`, `ReviewWorkspaceView.swift`,
@@ -92,6 +109,9 @@ swiftc -parse-as-library \
   macos/ChapterPublisher/InkOSCoreCraft.swift \
   macos/ChapterPublisher/InkOSCoreSettings.swift \
   macos/ChapterPublisher/InkOSCoreFanqie.swift \
+  macos/ChapterPublisher/InkOSCoreDerivative.swift \
+  macos/ChapterPublisher/InkOSCoreCanon.swift \
+  macos/ChapterPublisher/InkOSCoreTimeline.swift \
   test/NativeCoreSmoke.swift \
   -o /tmp/macingkostomo-native-core-smoke
 
@@ -109,8 +129,8 @@ and deletion inside a temporary directory; it must not touch real `book/` or `da
 - Release builds use `~/Library/Application Support/MacInkostomo/`; first launch
   copies existing books and configuration from the legacy workspace.
 - `MACINKOSTOMO_WORKSPACE` explicitly selects a data workspace; use it for tests
-  and controlled migrations. All persistence tests must run against a temporary
-  workspace.
+  and controlled migrations. An empty directory is valid and suppresses the legacy
+  Release migration. All persistence tests must run against a temporary workspace.
 - Workspace resolution order (`InkOSCore.swift`): `MACINKOSTOMO_WORKSPACE`, then
   in DEBUG only `CHAPTER_PUBLISHER_ROOT`, the `ChapterPublisherRoot` Info.plist
   key, and the current directory. A Debug build launched without an explicit
@@ -211,13 +231,34 @@ half-built features read as done.
   inserting another ability manifestation.
 - Local rules validate cross-chapter order, entity admission, deletion targets, and
   immutable conflicts before an independent model jointly reviews the text, the
-  candidate delta, and the post-application continuity index. An initial model
-  `[hard]` finding that only concerns Delta registration enters a Delta-only
-  repair and re-review without rewriting prose. Other hard findings enter an
-  automatic revision loop of up to `maxAutoRevisionRounds` (2) rewrite+re-review
-  rounds, each feeding the previous round's findings back into the rewrite; any
-  round that passes goes to manual review, and only exhausting all rounds puts
-  the chapter into `revision_failed`.
+  candidate delta, and the post-application continuity index. The review prompt
+  requires every `[hard]` finding to carry a repair-scope tag: `[delta]` when the
+  prose needs no edit and only the candidate delta must be registered, `[prose]`
+  when the text itself must change. When every `[hard]` is `[delta]`, the chapter
+  takes a Delta-only repair and re-review with the prose untouched; a single
+  `[prose]` finding sends it to the rewrite loop.
+  Untagged findings fall back to wording inference, which distinguishes prose
+  cited as *evidence* for a registration gap from prose that is itself defective:
+  "正文明确写出伤势，但 ENT-004 的 attributes 为空" is `[delta]`, while "正文数字与已
+  登记消耗矛盾" is `[prose]`. The inference deliberately leans toward `[delta]`
+  because that path is cheap and self-correcting — it leaves the text alone and a
+  still-failing re-review drops through to the rewrite loop — whereas a wrong
+  `[prose]` verdict makes the model rewrite already-correct prose, return it
+  unchanged, and trip the stall detector. That misclassification is what left
+  chapter 25 of 《渊雨浩劫》 cycling on empty `upsert.attributes`. The local
+  length/craft validator always emits `[prose]`; local continuity-delta conflicts
+  always emit `[delta]`.
+  Findings that need prose changes enter an automatic revision loop of up to
+  `maxAutoRevisionRounds` (default 3) rewrite+re-review rounds, each feeding the
+  previous round's findings back into the rewrite; any round that passes goes to
+  manual review, and only exhausting all rounds puts the chapter into
+  `revision_failed`. Two conditions end the loop early rather than spending the
+  remaining rounds: a second verbatim-identical rewrite (the first one retries
+  with an escalated instruction and a raised temperature), and a 4xx rejection
+  from the endpoint other than 429, which `requestLLM` has already retried —
+  re-issuing an request the server refused cannot succeed. When a stall ends the
+  loop, the recorded failure reason is the standing blocking finding rather than
+  the mechanical "输出与原文完全相同", which gives a human nothing to act on.
   A manual rejection (`reviseChapter`) joins the same loop — round one uses the
   human note, later rounds continue automatically. A local length/craft
   validation failure does not enter the loop: the full draft is retained and
@@ -229,6 +270,11 @@ half-built features read as done.
   later round errors after an earlier draft was persisted, the chapter record
   still receives the complete attempt chain and the latest error. The workflow
   monitor surfaces the current round using the configured maximum.
+  `attempts` is the ledger for the whole pipeline, not a rewrite counter: local
+  validation, stored-draft revalidation, Delta-only repair, and each rewrite round
+  all append one entry. Its length is therefore normally larger than the number of
+  automatic rewrites, so read `revisionRound`/`maxRevisionRounds` — not
+  `attempts.count` — when reporting how many rewrites a chapter took.
 - After manual approval (`approveChapter`), the chapter's `consistencyDelta` is
   projected into `long-form-plan.json.continuity`; re-revision retracts the old
   contribution and re-approval replaces it. Manual edits in the settings page are
@@ -269,11 +315,173 @@ MACINKOSTOMO_WORKSPACE=$(mktemp -d) \
   listing, so moving the directory back restores the book with no `state.json`
   edit. Snapshot `data/state.json` before any launch that could write.
 
+## Model Roles
+
+`ModelRole` (public, UI-facing) and `InkOSCore.LLMRole` (core-internal) are
+parallel enums bridged by `LLMRole(_:)` and `LLMRole.modelRole`. Three roles
+exist: `chapter`/`primary`, `review`, and `extraction`.
+
+- `ModelRole.configKeys` is the single source of truth for the `model`,
+  `baseUrl`, and `apiKey` key names of each role. Add a role there rather than
+  branching on the role at each read site.
+- A blank role-specific value inherits the `chapter` value. Resolve it with
+  `.nonEmpty ??` and not `string(_:fallback:)`: a saved-but-blank field is stored
+  as `""`, which `string(_:fallback:)` returns verbatim, so the fallback would
+  not fire and an empty endpoint would reach `validatedEndpoint` and throw.
+- Adding a role means touching `ModelRole`, `LLMRole`, `InkOSConfig` (decode
+  defaults plus the deliberate `""` key on encode), `InkOSConfigUpdate`,
+  `fetchInkOSConfig`, `updateInkOSConfig`, `fetchModels`, and
+  `SettingsWorkspaceView` (section, state, `keyPlaceholder`, `endpointValues`,
+  `discoverModels`, `probeModel`, `loadConfigDraft`, `saveLLMSettings`,
+  `canSaveLLMSettings`, and the `onChange` invalidations). Switch over the role
+  exhaustively in the view; the discovery and probe handlers previously branched
+  on `if role == .chapter { … } else { … }`, which silently routes any new role
+  into the review state.
+- `extraction` backs the RAG model setting and is consumed by
+  `extractDerivativeCanon` and `extractDerivativeSettingsOverlay` in
+  `InkOSCoreCanon.swift`. Nothing else issues `role: .extraction`.
+
+- **An empty completion is retried at a doubled `max_tokens`, not at the same one.**
+  A reasoning model bills `reasoning_content` against the same ceiling as the prose
+  and its length varies run to run: measured 5 347 to 16 383 tokens across identical
+  requests for one beat prompt against `deepseek-v4-flash`. A ceiling near that
+  margin therefore fails a large fraction of the time and looks random. `requestLLM`
+  rebuilds the request per attempt and doubles the ceiling up to
+  `maxTokensRetryCeiling` (65 536) whenever an attempt produced no prose, then stops
+  once there is no headroom left. Two consequences for anyone editing this path:
+  the raise is keyed on the response being empty rather than on
+  `finishReason == "length"`, because the relay reports this as `stop` about as often
+  as `length` and only the emptiness is reliable; and a transport failure must keep
+  retrying at the *unchanged* ceiling, since more budget does not fix a dropped
+  connection. `test/NativeCoreSmoke.swift` asserts the observed `max_tokens` of every
+  attempt — a count-only assertion passes against a build that retries without
+  raising, which is the bug that failed chapter 1 of 《灰雾之前》 three times.
+
+## Canon Extraction
+
+`extractDerivativeCanon(bookID:maxBatches:)` turns an imported original work into
+canon. It batches the source by character budget, asks the extraction model for
+`ContinuityDelta`-shaped JSON, and merges each batch into the continuity
+projection's `baseContinuity`.
+
+- **Chapter fields must be renumbered.** The model reads *source* chapters and
+  answers in them, but `LongFormContinuity.validated` bounds
+  `availableFromChapter`, `earliestChapter`, `openFromChapter`, and their peers by
+  the *derivative* book's `targetChapters` — typically a few dozen against a
+  source of hundreds. `canonicalizedExtractionDelta` rewrites every one of them to
+  chapter 1 (canon is available from the start) and keeps source provenance in
+  `markers` as `source-chapter-N`. Skipping this fails validation on the first
+  knowledge entry and the error reads like a model fault.
+- **`remove` and `policy` are dropped** from extraction output. The pass only
+  contributes facts; letting it delete canon or rewrite policy would give the
+  model authority over entries the settings text owns.
+- **Layering.** Source canon goes to `baseContinuity`; the customer's settings
+  text goes to `manualOverlay` via `extractDerivativeSettingsOverlay`.
+  `synchronizeContinuityProjection` applies the overlay last and with
+  `allowImmutableChanges: true`, so the settings text outranks both extracted
+  canon and approved chapter deltas. Do not merge settings into `baseContinuity`
+  — a later re-extraction would win the field back.
+- **Resume.** `source/canon-progress.json` records `nextChapterIndex`, the
+  accumulated delta, and the batch log, and is written after every batch. A failed
+  batch keeps the batches before it. The checkpoint is keyed to
+  `SourceManifest.sourceDigest`: replacing the original discards it, since the
+  progress describes a source that no longer exists. Replacement also clears the
+  old source-only `baseContinuity`, while preserving the author's `manualOverlay`
+  and approved chapter deltas. `source/preparation.json` separately persists the
+  author's settings text and embedding intent, so `resumeDerivativePreparation`
+  can finish overlay/index work even when canon is already complete; bootstrap
+  restores the unfinished banner after an app relaunch.
+- **Projection writes are snapshotted.** `mutateContinuityProjection` restores the
+  projection, the plan, and the volume checkpoints if the post-merge
+  `synchronizeContinuityProjection` throws. Without it a delta that passes its own
+  merge but fails the full `validated()` pass leaves a projection on disk that no
+  later synchronize can rebuild, and the book's continuity is permanently
+  unloadable.
+
+- **Source coordinates are global and source-only.** `sourceChapter` survives every
+  rewrite for source milestones. An accepted `sourceDay` must survive too, because
+  these are the only inputs to the timeline gate below. Extraction accepts
+  `sourceDay` only from a batch that directly contains the configured global anchor;
+  otherwise it drops the model's batch-local zero. Author settings milestones keep
+  both fields nil so they cannot be mistaken for original-work events. Three places
+  rebuild a source milestone —
+  `canonicalizedExtractionDelta`, `resolvingTimelineOrderCollision`, and
+  `normalizedTimeline` — and all three must carry them forward. Dropping them in
+  any one silently unplaces events, and nothing fails: the gate just stops
+  reporting the event as not-yet-happened.
+
+- **The batch budget is bounded by output, not context.** A batch must come back as
+  one complete JSON object, and a reasoning model spends part of the same
+  `max_tokens` on `reasoning_content` before writing any of it. At a 40 000-character
+  budget the first 诡秘之主 batch produced 12 056 reasoning tokens and JSON that was
+  still unclosed at the 16 384-token ceiling, so the entire batch was discarded.
+  `canonBatchCharacterBudget` (15 000) and `canonItemsPerArray` (12, enforced in the
+  prompt) keep one answer inside a common ceiling. Raising either means re-checking
+  against the *smallest* `maxTokens` a user might configure, not the current one.
+  Because the pass is checkpointed per batch, smaller batches cost wall-clock time
+  rather than progress.
+
+- **Truncation is reported separately from malformed JSON.** A batch that came back
+  as prose the parser rejected is a prompt or model fault; one cut off at the ceiling
+  is a budget fault, and `finishReason == "length"` is what separates them in the
+  extraction error message. Collapsing the two into one "not JSON" message sent a
+  whole debugging session after the prompt when the output limit was the actual
+  fault. Note this is narrower than the retry rule under Model Roles: `length`
+  distinguishes *truncated output* from *bad output*, but it does not identify an
+  exhausted budget on its own, because a response with no content at all reports
+  `stop` about as often as `length`.
+
+- **Model output is untyped at every field.** Values arriving from extraction are
+  whatever the model emitted — `null`, a number, or a nested object where the schema
+  promised a string. `normalizedText` is the single flattener, and it may hand only
+  containers to `JSONSerialization.data(withJSONObject:)`: a bare top-level scalar
+  raises `NSInvalidArgumentException`, an ObjC exception that `try?` cannot catch and
+  that terminates the app. A single `null` in real 诡秘之主 output crashed the pass
+  this way. Nulls in optional fields must flatten to empty and drop; nulls in
+  required fields must throw `malformedDelta` so the batch stays retryable.
+
+## Derivative Timeline
+
+`InkOSCoreTimeline.swift` answers one question for a derivative book: at this
+chapter, which canon events are already behind the story and which must not have
+happened yet. It exists because the dominant fan-fiction failure is a character
+knowing a source fact too early, which no continuity check catches — the fact is
+correct, only its timing is wrong.
+
+- **Two axes, never interpolated between.** `sourceDay` is exact but sparse (source
+  text says "三天后", not dates). `sourceChapter` is set for every extracted
+  milestone and monotonic in a linearly told novel, so it is the fallback
+  classifier. Deriving a day from a source chapter is deliberately not done:
+  source chapters advance at uneven story rates, so it would be invented
+  precision. Events that cannot be placed go into `unplaced`, which the prompt
+  reports as uncertain rather than as fact.
+- **`order` is not a time axis.** It is a dense sort key that `applyContinuityDelta`
+  renumbers on collision. Never read it as chronology.
+- **The story clock is summed, not stored per chapter.** `derivativeStoryDay` adds
+  each preceding beat's `storyDays`, falling back to
+  `DerivativeTimeline.defaultChapterDays` when a beat omits it. Beats are the only
+  writer of story time, so a beat that lies about `storyDays` moves every later
+  chapter.
+- **Undated events past the anchor stay `unplaced` once the book passes the anchor**,
+  rather than being forced into `future`. Blocking an event wrongly is worse than
+  under-blocking: a derivative book that has caught up to the source is supposed to
+  be able to play canon events out, and the author's beats decide that. Before the
+  anchor — the case where premature references actually happen — they classify as
+  `future` and are forbidden outright.
+- **The anchor binds at read time.** The customer names it in prose while creating
+  the book, before any extraction exists, so no milestone ID can be stored.
+  `resolvedAnchor` matches by ID, then exact label, then containment, and fills
+  `anchorSourceChapter` from whatever it matched.
+- **`bookKind` defaults to `.original`** when `book.json` predates the field. An
+  original book merely loses prompt sections it has no source for, whereas treating
+  an original book as derivative would order the writing model to obey canon that
+  does not exist.
+
 ## Security
 
 - Keep secrets out of logs, source control, and `JSONValue`. Model keys live in a
   private configuration file with `0600` permissions; the settings page shows only
-  masked previews.
+  masked previews. `InkOSConfig.encode` writes `""` for every role's key.
 - Remote model endpoints default to requiring HTTPS; if an existing configuration
   explicitly enables HTTP, the native core still applies the same configuration
   constraints.

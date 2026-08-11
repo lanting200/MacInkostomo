@@ -25,6 +25,9 @@
 		A10000000000000000000013 /* InkOSCoreLLM.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000015 /* InkOSCoreLLM.swift */; };
 		A10000000000000000000014 /* InkOSCoreSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000016 /* InkOSCoreSettings.swift */; };
 		A10000000000000000000015 /* InkOSCoreFanqie.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000017 /* InkOSCoreFanqie.swift */; };
+		A1000000000000000000001A /* InkOSCoreDerivative.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000001A /* InkOSCoreDerivative.swift */; };
+		A1000000000000000000001B /* InkOSCoreCanon.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000001B /* InkOSCoreCanon.swift */; };
+		A1000000000000000000001C /* InkOSCoreTimeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000001C /* InkOSCoreTimeline.swift */; };
 		A10000000000000000000016 /* InkOSCoreContinuity.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000018 /* InkOSCoreContinuity.swift */; };
 		A10000000000000000000017 /* InkOSCoreCraft.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000019 /* InkOSCoreCraft.swift */; };
 /* End PBXBuildFile section */
@@ -50,6 +53,9 @@
 		A20000000000000000000015 /* InkOSCoreLLM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkOSCoreLLM.swift; sourceTree = "<group>"; };
 		A20000000000000000000016 /* InkOSCoreSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkOSCoreSettings.swift; sourceTree = "<group>"; };
 		A20000000000000000000017 /* InkOSCoreFanqie.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkOSCoreFanqie.swift; sourceTree = "<group>"; };
+		A2000000000000000000001A /* InkOSCoreDerivative.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkOSCoreDerivative.swift; sourceTree = "<group>"; };
+		A2000000000000000000001B /* InkOSCoreCanon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkOSCoreCanon.swift; sourceTree = "<group>"; };
+		A2000000000000000000001C /* InkOSCoreTimeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkOSCoreTimeline.swift; sourceTree = "<group>"; };
 		A20000000000000000000018 /* InkOSCoreContinuity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkOSCoreContinuity.swift; sourceTree = "<group>"; };
 		A20000000000000000000019 /* InkOSCoreCraft.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InkOSCoreCraft.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -96,6 +102,9 @@
 				A20000000000000000000015 /* InkOSCoreLLM.swift */,
 				A20000000000000000000016 /* InkOSCoreSettings.swift */,
 				A20000000000000000000017 /* InkOSCoreFanqie.swift */,
+				A2000000000000000000001A /* InkOSCoreDerivative.swift */,
+				A2000000000000000000001B /* InkOSCoreCanon.swift */,
+				A2000000000000000000001C /* InkOSCoreTimeline.swift */,
 				A2000000000000000000000B /* WorkspaceModel.swift */,
 				A2000000000000000000000C /* NativeComponents.swift */,
 				A2000000000000000000000D /* NativeWorkspaceView.swift */,
@@ -206,6 +215,9 @@
 				A10000000000000000000013 /* InkOSCoreLLM.swift in Sources */,
 				A10000000000000000000014 /* InkOSCoreSettings.swift in Sources */,
 				A10000000000000000000015 /* InkOSCoreFanqie.swift in Sources */,
+				A1000000000000000000001A /* InkOSCoreDerivative.swift in Sources */,
+				A1000000000000000000001B /* InkOSCoreCanon.swift in Sources */,
+				A1000000000000000000001C /* InkOSCoreTimeline.swift in Sources */,
 				A10000000000000000000009 /* WorkspaceModel.swift in Sources */,
 				A1000000000000000000000A /* NativeComponents.swift in Sources */,
 				A1000000000000000000000B /* NativeWorkspaceView.swift in Sources */,
@@ -326,7 +338,7 @@
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -336,7 +348,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.lanting200.MacInkostomo;
 				PRODUCT_NAME = MacInkostomo;
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -354,7 +366,7 @@
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -364,7 +376,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 1.2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.lanting200.MacInkostomo;
 				PRODUCT_NAME = MacInkostomo;
 				PROVISIONING_PROFILE_SPECIFIER = "";

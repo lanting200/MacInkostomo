@@ -303,21 +303,30 @@ struct SettingsWorkspaceView: View {
   @State private var reviewBaseURL = ""
   @State private var reviewAPIKey = ""
   @State private var reviewModelName = ""
+  @State private var extractionBaseURL = ""
+  @State private var extractionAPIKey = ""
+  @State private var extractionModelName = ""
   @State private var stream = false
   @State private var thinkingBudget = 0
   @State private var temperature = 0.2
   @State private var chapterModels: [RemoteModel] = []
   @State private var reviewModels: [RemoteModel] = []
+  @State private var extractionModels: [RemoteModel] = []
   @State private var chapterProbe: ModelTestResponse?
   @State private var reviewProbe: ModelTestResponse?
+  @State private var extractionProbe: ModelTestResponse?
   @State private var isDiscoveringChapterModels = false
   @State private var isDiscoveringReviewModels = false
+  @State private var isDiscoveringExtractionModels = false
   @State private var isProbingChapterModel = false
   @State private var isProbingReviewModel = false
+  @State private var isProbingExtractionModel = false
   @State private var chapterDiscoveryRequest = UUID()
   @State private var reviewDiscoveryRequest = UUID()
+  @State private var extractionDiscoveryRequest = UUID()
   @State private var chapterProbeRequest = UUID()
   @State private var reviewProbeRequest = UUID()
+  @State private var extractionProbeRequest = UUID()
 
   var body: some View {
     VStack(spacing: 0) {
@@ -362,24 +371,45 @@ struct SettingsWorkspaceView: View {
     .onChange(of: baseURL) { _ in
       chapterModels = []
       chapterProbe = nil
+      // A role that left its endpoint blank inherits this one, so its cached
+      // list and probe no longer describe what that role would reach.
       if reviewBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
         reviewModels = []
         reviewProbe = nil
+      }
+      if extractionBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        extractionModels = []
+        extractionProbe = nil
       }
     }
     .onChange(of: reviewBaseURL) { _ in
       reviewModels = []
       reviewProbe = nil
     }
+    .onChange(of: extractionBaseURL) { _ in
+      extractionModels = []
+      extractionProbe = nil
+    }
     .onChange(of: apiKey) { _ in
       chapterProbe = nil
       if reviewAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
         reviewProbe = nil
       }
+      if extractionAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        extractionProbe = nil
+      }
     }
     .onChange(of: reviewAPIKey) { _ in reviewProbe = nil }
-    .onChange(of: modelName) { _ in chapterProbe = nil }
+    .onChange(of: extractionAPIKey) { _ in extractionProbe = nil }
+    .onChange(of: modelName) { _ in
+      chapterProbe = nil
+      // Extraction falls back to the chapter model when its own field is blank.
+      if extractionModelName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        extractionProbe = nil
+      }
+    }
     .onChange(of: reviewModelName) { _ in reviewProbe = nil }
+    .onChange(of: extractionModelName) { _ in extractionProbe = nil }
     .onDisappear {
       continuityValidationTask?.cancel()
       continuityValidationTask = nil
@@ -688,6 +718,22 @@ struct SettingsWorkspaceView: View {
 
         Divider()
 
+        llmRoleSection(
+          title: "原著抽取（RAG）",
+          role: .extraction,
+          baseURL: $extractionBaseURL,
+          key: $extractionAPIKey,
+          model: $extractionModelName,
+          models: extractionModels,
+          probe: extractionProbe,
+          discovering: isDiscoveringExtractionModels,
+          probing: isProbingExtractionModel,
+          modelPlaceholder: "模型名称，如 claude-sonnet-4-5",
+          note: "留空则沿用章节生成的模型与端点。建议选长上下文模型，用于把原著抽成正典设定。"
+        )
+
+        Divider()
+
         HStack(spacing: 22) {
           Toggle("流式输出", isOn: $stream)
           Stepper("思考预算 \(thinkingBudget)", value: $thinkingBudget, in: 0...100_000, step: 128)
@@ -720,7 +766,9 @@ struct SettingsWorkspaceView: View {
     models: [RemoteModel],
     probe: ModelTestResponse?,
     discovering: Bool,
-    probing: Bool
+    probing: Bool,
+    modelPlaceholder: String = "模型名称",
+    note: String? = nil
   ) -> some View {
     VStack(alignment: .leading, spacing: 12) {
       NativeSectionHeader(title) {
@@ -753,7 +801,7 @@ struct SettingsWorkspaceView: View {
           Text("模型").frame(width: 92, alignment: .trailing)
           HStack(spacing: 8) {
             if models.isEmpty {
-              TextField("模型名称", text: model)
+              TextField(modelPlaceholder, text: model)
                 .textFieldStyle(.roundedBorder)
             } else {
               Picker("模型", selection: model) {
@@ -780,6 +828,13 @@ struct SettingsWorkspaceView: View {
             }
           }
         }
+      }
+
+      if let note {
+        Text(note)
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
       }
     }
   }
@@ -817,6 +872,10 @@ struct SettingsWorkspaceView: View {
       return config.apiKeyPreview.isEmpty ? "API Key" : "已保存：\(config.apiKeyPreview)"
     case .review:
       return config.reviewApiKeyPreview.isEmpty ? "API Key" : "已保存：\(config.reviewApiKeyPreview)"
+    case .extraction:
+      return config.extractionApiKeyPreview.isEmpty
+        ? "API Key（留空沿用章节生成）"
+        : "已保存：\(config.extractionApiKeyPreview)"
     }
   }
 
@@ -1057,17 +1116,22 @@ struct SettingsWorkspaceView: View {
     guard let config = model.inkOSConfig else { return }
     baseURL = config.baseUrl
     reviewBaseURL = config.reviewBaseUrl
+    extractionBaseURL = config.extractionBaseUrl
     modelName = config.model
     reviewModelName = config.reviewModel
+    extractionModelName = config.extractionModel
     stream = config.stream ?? false
     thinkingBudget = config.thinkingBudget
     temperature = config.temperature ?? 0.2
     apiKey = ""
     reviewAPIKey = ""
+    extractionAPIKey = ""
     chapterModels = []
     reviewModels = []
+    extractionModels = []
     chapterProbe = nil
     reviewProbe = nil
+    extractionProbe = nil
   }
 
   private func saveBookSetting() {
@@ -1087,12 +1151,16 @@ struct SettingsWorkspaceView: View {
   private func discoverModels(_ role: ModelRole) {
     let endpoint = endpointValues(for: role)
     let requestID = UUID()
-    if role == .chapter {
+    switch role {
+    case .chapter:
       chapterDiscoveryRequest = requestID
       isDiscoveringChapterModels = true
-    } else {
+    case .review:
       reviewDiscoveryRequest = requestID
       isDiscoveringReviewModels = true
+    case .extraction:
+      extractionDiscoveryRequest = requestID
+      isDiscoveringExtractionModels = true
     }
     Task {
       let values = await model.loadModels(
@@ -1100,7 +1168,8 @@ struct SettingsWorkspaceView: View {
         baseURL: endpoint.baseURL,
         apiKey: endpoint.apiKey
       )
-      if role == .chapter {
+      switch role {
+      case .chapter:
         guard chapterDiscoveryRequest == requestID else { return }
         isDiscoveringChapterModels = false
         guard endpointMatches(endpoint, role: role) else { return }
@@ -1108,13 +1177,21 @@ struct SettingsWorkspaceView: View {
         if !values.isEmpty, !values.contains(where: { $0.id == modelName }) {
           modelName = values[0].id
         }
-      } else {
+      case .review:
         guard reviewDiscoveryRequest == requestID else { return }
         isDiscoveringReviewModels = false
         guard endpointMatches(endpoint, role: role) else { return }
         reviewModels = values
         if !values.isEmpty, !values.contains(where: { $0.id == reviewModelName }) {
           reviewModelName = values[0].id
+        }
+      case .extraction:
+        guard extractionDiscoveryRequest == requestID else { return }
+        isDiscoveringExtractionModels = false
+        guard endpointMatches(endpoint, role: role) else { return }
+        extractionModels = values
+        if !values.isEmpty, !values.contains(where: { $0.id == extractionModelName }) {
+          extractionModelName = values[0].id
         }
       }
     }
@@ -1124,14 +1201,19 @@ struct SettingsWorkspaceView: View {
     let endpoint = endpointValues(for: role)
     guard !endpoint.model.isEmpty else { return }
     let requestID = UUID()
-    if role == .chapter {
+    switch role {
+    case .chapter:
       chapterProbeRequest = requestID
       chapterProbe = nil
       isProbingChapterModel = true
-    } else {
+    case .review:
       reviewProbeRequest = requestID
       reviewProbe = nil
       isProbingReviewModel = true
+    case .extraction:
+      extractionProbeRequest = requestID
+      extractionProbe = nil
+      isProbingExtractionModel = true
     }
     Task {
       let response = await model.testModel(
@@ -1140,16 +1222,22 @@ struct SettingsWorkspaceView: View {
         baseURL: endpoint.baseURL,
         apiKey: endpoint.apiKey
       )
-      if role == .chapter {
+      switch role {
+      case .chapter:
         guard chapterProbeRequest == requestID else { return }
         isProbingChapterModel = false
         guard endpointMatches(endpoint, role: role) else { return }
         chapterProbe = response
-      } else {
+      case .review:
         guard reviewProbeRequest == requestID else { return }
         isProbingReviewModel = false
         guard endpointMatches(endpoint, role: role) else { return }
         reviewProbe = response
+      case .extraction:
+        guard extractionProbeRequest == requestID else { return }
+        isProbingExtractionModel = false
+        guard endpointMatches(endpoint, role: role) else { return }
+        extractionProbe = response
       }
     }
   }
@@ -1159,10 +1247,13 @@ struct SettingsWorkspaceView: View {
     let update = InkOSConfigUpdate(
       model: modelName.trimmingCharacters(in: .whitespacesAndNewlines),
       reviewModel: reviewModelName.trimmingCharacters(in: .whitespacesAndNewlines),
+      extractionModel: extractionModelName.trimmingCharacters(in: .whitespacesAndNewlines),
       baseUrl: baseURL.trimmingCharacters(in: .whitespacesAndNewlines),
       reviewBaseUrl: reviewBaseURL.trimmingCharacters(in: .whitespacesAndNewlines),
+      extractionBaseUrl: extractionBaseURL.trimmingCharacters(in: .whitespacesAndNewlines),
       apiKey: apiKey,
       reviewApiKey: reviewAPIKey,
+      extractionApiKey: extractionAPIKey,
       stream: stream,
       thinkingBudget: thinkingBudget,
       temperature: temperature
@@ -1204,8 +1295,31 @@ struct SettingsWorkspaceView: View {
       || review.model != config.reviewModel
       || !reviewAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
       || reviewUsesNewPrimaryKey
+
+    // Extraction is optional. While all three fields are blank it inherits the
+    // chapter role and never gates saving; the draft values are compared raw
+    // rather than through `endpointValues` so an inherited value does not read
+    // as an edit. Once the user gives it something of its own it gates like the
+    // other roles.
+    let extractionModelDraft =
+      extractionModelName.trimmingCharacters(in: .whitespacesAndNewlines)
+    let extractionBaseDraft =
+      extractionBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    let extractionKeyDraft =
+      extractionAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    let extractionConfigured =
+      !extractionModelDraft.isEmpty || !extractionBaseDraft.isEmpty
+      || !extractionKeyDraft.isEmpty
+    let extractionChanged =
+      extractionConfigured
+      && (canonicalEndpoint(extractionBaseDraft)
+        != canonicalEndpoint(config.extractionBaseUrl)
+        || extractionModelDraft != config.extractionModel
+        || !extractionKeyDraft.isEmpty)
+
     return (!chapterChanged || chapterProbe?.ok == true)
       && (!reviewChanged || reviewProbe?.ok == true)
+      && (!extractionChanged || extractionProbe?.ok == true)
   }
 
   private func endpointValues(for role: ModelRole) -> (
@@ -1223,6 +1337,20 @@ struct SettingsWorkspaceView: View {
         reviewBase.isEmpty ? primaryBase : reviewBase,
         reviewKey.isEmpty ? primaryKey : reviewKey,
         reviewModelName.trimmingCharacters(in: .whitespacesAndNewlines)
+      )
+    case .extraction:
+      let extractionBase = extractionBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+      let extractionKey = extractionAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+      let extractionModel = extractionModelName
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      return (
+        extractionBase.isEmpty ? primaryBase : extractionBase,
+        extractionKey.isEmpty ? primaryKey : extractionKey,
+        // Blank means "inherit the chapter model", so discovery and the probe
+        // target what extraction would actually send.
+        extractionModel.isEmpty
+          ? modelName.trimmingCharacters(in: .whitespacesAndNewlines)
+          : extractionModel
       )
     }
   }
