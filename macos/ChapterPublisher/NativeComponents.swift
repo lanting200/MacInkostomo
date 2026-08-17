@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 enum NativeLayout {
   static let cornerRadius: CGFloat = 8
@@ -561,7 +562,9 @@ struct NativeErrorBanner: View {
 struct DerivativePreparationBanner: View {
   let state: DerivativePreparationState
   let resume: () -> Void
+  let replace: (URL) -> Void
   let dismiss: () -> Void
+  @State private var isChoosingSource = false
 
   var body: some View {
     HStack(alignment: .top, spacing: 9) {
@@ -577,7 +580,7 @@ struct DerivativePreparationBanner: View {
         Text("《\(state.bookTitle)》原著导入：\(state.phase)")
           .font(.callout.weight(.semibold))
         if state.sourceChapterCount > 0 {
-          ProgressView(value: state.canonProgress)
+          ProgressView(value: state.bannerProgress)
             .progressViewStyle(.linear)
             .frame(maxWidth: 320)
           Text(detailLine)
@@ -594,7 +597,10 @@ struct DerivativePreparationBanner: View {
         }
       }
       Spacer(minLength: 8)
-      if !state.isRunning && state.needsResume {
+      if !state.isRunning && state.needsSourceFile {
+        Button("重新选择原著") { isChoosingSource = true }
+          .buttonStyle(.link)
+      } else if !state.isRunning && state.needsResume {
         Button("继续处理", action: resume)
           .buttonStyle(.link)
       }
@@ -612,6 +618,18 @@ struct DerivativePreparationBanner: View {
     .background((state.isComplete ? Color.green : Color.accentColor).opacity(0.1))
     .overlay(alignment: .bottom) { Divider() }
     .accessibilityElement(children: .contain)
+    .fileImporter(
+      isPresented: $isChoosingSource,
+      allowedContentTypes: [.plainText],
+      allowsMultipleSelection: false
+    ) { result in
+      switch result {
+      case .success(let urls):
+        if let url = urls.first { replace(url) }
+      case .failure:
+        break
+      }
+    }
   }
 
   private var detailLine: String {

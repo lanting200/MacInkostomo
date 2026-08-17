@@ -33,6 +33,23 @@ struct NativeWorkspaceView: View {
                 )
               }
             },
+            replace: { url in
+              let accessed = url.startAccessingSecurityScopedResource()
+              Task {
+                defer {
+                  if accessed { url.stopAccessingSecurityScopedResource() }
+                }
+                guard let staged = await model.stagePendingDerivativeSource(from: url),
+                  let fileURL = await model.pendingDerivativeSourceFileURL(id: staged.id)
+                else { return }
+                await model.prepareDerivativeSource(
+                  bookID: preparation.bookID,
+                  bookTitle: preparation.bookTitle,
+                  sourceURL: fileURL,
+                  pendingSourceID: staged.id
+                )
+              }
+            },
             dismiss: model.clearDerivativePreparation
           )
         }

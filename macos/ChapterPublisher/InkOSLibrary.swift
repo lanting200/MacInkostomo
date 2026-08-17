@@ -156,12 +156,43 @@ final class InkOSLibrary: @unchecked Sendable {
 
   // MARK: Derivative (同人) source retrieval
 
-  func importDerivativeSource(bookID: String, from fileURL: URL) async throws -> SourceManifest {
-    try await core.importDerivativeSource(bookID: bookID, from: fileURL)
+  func importDerivativeSource(
+    bookID: String,
+    from fileURL: URL,
+    onProgress: (@Sendable (SourceImportProgress) async -> Void)? = nil
+  ) async throws -> SourceManifest {
+    try await core.importDerivativeSource(
+      bookID: bookID,
+      from: fileURL,
+      onProgress: onProgress
+    )
   }
 
-  func embedDerivativeSource(bookID: String) async throws -> SourceEmbeddingStatus {
-    try await core.embedDerivativeSource(bookID: bookID)
+  func stagePendingDerivativeSource(from fileURL: URL) async throws -> PendingDerivativeSource {
+    try await core.stagePendingDerivativeSource(from: fileURL)
+  }
+
+  func loadPendingDerivativeSource(id: String) async throws -> PendingDerivativeSource {
+    try await core.loadPendingDerivativeSource(id: id)
+  }
+
+  func pendingDerivativeSourceFileURL(id: String) async throws -> URL {
+    try await core.pendingDerivativeSourceFileURL(id: id)
+  }
+
+  func removePendingDerivativeSource(id: String) async throws {
+    try await core.removePendingDerivativeSource(id: id)
+  }
+
+  func derivativeSourceSummary(bookID: String) async throws -> DerivativeSourceSummary {
+    try await core.derivativeSourceSummary(bookID: bookID)
+  }
+
+  func embedDerivativeSource(
+    bookID: String,
+    onProgress: (@Sendable (SourceEmbeddingStatus) async -> Void)? = nil
+  ) async throws -> SourceEmbeddingStatus {
+    try await core.embedDerivativeSource(bookID: bookID, onProgress: onProgress)
   }
 
   func derivativeSourceEmbeddingStatus(bookID: String) async throws -> SourceEmbeddingStatus {
@@ -189,9 +220,14 @@ final class InkOSLibrary: @unchecked Sendable {
   /// checkpointed and a later call resumes where this one stopped.
   func extractDerivativeCanon(
     bookID: String,
-    maxBatches: Int = 0
+    maxBatches: Int = 0,
+    onProgress: (@Sendable (SourceCanonStatus) async -> Void)? = nil
   ) async throws -> SourceCanonStatus {
-    try await core.extractDerivativeCanon(bookID: bookID, maxBatches: maxBatches)
+    try await core.extractDerivativeCanon(
+      bookID: bookID,
+      maxBatches: maxBatches,
+      onProgress: onProgress
+    )
   }
 
   func extractDerivativeSettingsOverlay(

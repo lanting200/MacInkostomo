@@ -315,28 +315,102 @@ extension InkOSCore {
     // before each resolution so a replaced source cannot keep using the old axis.
     value.anchorMilestoneID = nil
     value.anchorSourceChapter = nil
-    let sourceMilestones = continuity.timeline.filter { $0.sourceChapter != nil }
-    var anchor: LongFormTimelineMilestone?
-    if let id = timeline.anchorMilestoneID?.trimmingCharacters(in: .whitespacesAndNewlines),
-      !id.isEmpty
-    {
-      anchor = sourceMilestones.first { $0.id == id }
-    }
-    if anchor == nil {
-      let label = timeline.anchorLabel.trimmingCharacters(in: .whitespacesAndNewlines)
-      if !label.isEmpty {
-        // Exact label first, then containment, because extraction tends to write a
-        // fuller sentence than the customer's shorthand.
-        anchor = sourceMilestones.first { $0.label == label }
-          ?? sourceMilestones.first {
-            $0.label.contains(label) || label.contains($0.label)
-          }
-      }
-    }
-    guard let anchor else { return value }
+    guard let anchor = matchingSourceTimelineAnchor(
+      label: timeline.anchorLabel,
+      milestoneID: timeline.anchorMilestoneID,
+      in: continuity.timeline
+    ) else { return value }
     value.anchorMilestoneID = anchor.id
     value.anchorSourceChapter = anchor.sourceChapter
     return value
+  }
+
+  /// How far into the original we look first for a shorthand match.
+  ///
+  /// A 诡秘-style opening label like `克莱恩穿越` also appears in late reveals
+  /// ("发现穿越真相"). Searching the whole book by token count binds the late
+  /// event; the customer named the clock origin while creating the book, which
+  /// is almost always in the first volume.
+  static let timelineAnchorEarlyWindow = 80
+
+  /// Resolves a customer-named origin onto an extracted source milestone.
+  ///
+  /// Order: stored id, exact label, containment either way, then the last two
+  /// characters of the shorthand as a required token (`穿越` / `聚会` / `成神`)
+  /// with any leftover prefix as a tie-break. Token search prefers the early
+  /// window, then the rest of the book, then the earliest chapter at the best
+  /// extra-token score. Overlay milestones without `sourceChapter` never win.
+  func matchingSourceTimelineAnchor(
+    label: String,
+    milestoneID: String? = nil,
+    in milestones: [LongFormTimelineMilestone]
+  ) -> LongFormTimelineMilestone? {
+    let sourceMilestones = milestones.filter { $0.sourceChapter != nil }
+    if let id = milestoneID?.trimmingCharacters(in: .whitespacesAndNewlines),
+      !id.isEmpty
+    {
+      if let match = sourceMilestones.first(where: { $0.id == id }) { return match }
+    }
+    let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    if let exact = sourceMilestones.first(where: { $0.label == trimmed }) { return exact }
+    if let contained = sourceMilestones.first(where: {
+      $0.label.contains(trimmed) || trimmed.contains($0.label)
+    }) {
+      return contained
+    }
+    return matchingSourceTimelineAnchorByTokens(trimmed, in: sourceMilestones)
+  }
+
+  private func matchingSourceTimelineAnchorByTokens(
+    _ label: String,
+    in milestones: [LongFormTimelineMilestone]
+  ) -> LongFormTimelineMilestone? {
+    guard let parts = timelineAnchorTokenParts(label) else { return nil }
+    let scored = milestones.compactMap { milestone -> (LongFormTimelineMilestone, Int, Int)? in
+      guard milestone.label.contains(parts.required),
+        let chapter = milestone.sourceChapter
+      else { return nil }
+      let extras = parts.extras.reduce(0) { $0 + (milestone.label.contains($1) ? 1 : 0) }
+      return (milestone, extras, chapter)
+    }
+    guard !scored.isEmpty else { return nil }
+    let early = scored.filter { $0.2 <= Self.timelineAnchorEarlyWindow }
+    let pool = early.isEmpty ? scored : early
+    let bestExtras = pool.map(\.1).max() ?? 0
+    return pool
+      .filter { $0.1 == bestExtras }
+      .min { lhs, rhs in
+        if lhs.2 != rhs.2 { return lhs.2 < rhs.2 }
+        if lhs.0.order != rhs.0.order { return lhs.0.order < rhs.0.order }
+        return lhs.0.label.count < rhs.0.label.count
+      }?
+      .0
+  }
+
+  /// Splits a create-book shorthand into the event verb (last two characters)
+  /// and any leftover name/place prefix. `克莱恩穿越` → (`穿越`, [`克莱恩`]).
+  private func timelineAnchorTokenParts(_ label: String) -> (required: String, extras: [String])? {
+    let separators = CharacterSet.whitespacesAndNewlines
+      .union(.punctuationCharacters)
+      .union(CharacterSet(charactersIn: "的了在与和之及·—-"))
+    let compact = label.unicodeScalars.reduce(into: "") { result, scalar in
+      if separators.contains(scalar) {
+        if !result.hasSuffix(" ") { result.append(" ") }
+      } else {
+        result.append(String(Character(scalar)))
+      }
+    }
+    let parts = compact.split(whereSeparator: \.isWhitespace).map(String.init).filter { $0.count >= 2 }
+    if parts.count >= 2, let last = parts.last {
+      return (last, Array(parts.dropLast()))
+    }
+    let blob = parts.first ?? compact.replacingOccurrences(of: " ", with: "")
+    guard blob.count >= 2 else { return nil }
+    if blob.count == 2 { return (blob, []) }
+    let required = String(blob.suffix(2))
+    let extra = String(blob.dropLast(2))
+    return (required, extra.count >= 2 ? [extra] : [])
   }
 
   /// True only when the resolved binding still names a source milestone in the

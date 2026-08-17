@@ -1,13 +1,28 @@
 import Foundation
 import Darwin
 
+enum InkOSCoreErrorOrigin: Sendable, Equatable {
+  case local
+  case requestConfiguration
+  case remoteResponse
+}
+
 struct InkOSCoreError: LocalizedError, Sendable {
   let message: String
   let statusCode: Int
+  /// Local validators, request setup, and HTTP responses all use HTTP-shaped
+  /// codes for typed UI errors. Callers that make retry decisions need the
+  /// origin as well as the number.
+  let origin: InkOSCoreErrorOrigin
 
-  init(_ message: String, statusCode: Int = 500) {
+  init(
+    _ message: String,
+    statusCode: Int = 500,
+    origin: InkOSCoreErrorOrigin = .local
+  ) {
     self.message = message
     self.statusCode = statusCode
+    self.origin = origin
   }
 
   var errorDescription: String? { message }

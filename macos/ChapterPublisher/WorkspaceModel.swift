@@ -42,6 +42,7 @@ final class WorkspaceModel: ObservableObject {
   /// calls, and the customer must be able to close the dialog and watch it from the
   /// library. `nil` means no pass has run this launch.
   @Published private(set) var derivativePreparation: DerivativePreparationState?
+  @Published private(set) var derivativeSourceSummary: DerivativeSourceSummary?
 
   var currentBook: BookSummary? {
     guard let currentBookID else { return nil }
@@ -95,6 +96,7 @@ final class WorkspaceModel: ObservableObject {
     clearError()
     await refreshBooks()
     await restoreIncompleteDerivativePreparation()
+    await restorePendingDerivativeIngestion()
     await loadInkOSConfig()
     await refreshActivity()
   }
@@ -120,6 +122,7 @@ final class WorkspaceModel: ObservableObject {
       await loadInkOSConfig()
       await loadBookSettings()
       await loadLongFormPlan()
+      await loadDerivativeSourceSummary()
     case .activity:
       await refreshActivity()
     }
@@ -195,9 +198,11 @@ final class WorkspaceModel: ObservableObject {
       selectedSettingContent = ""
       longFormPlan = nil
       isLongFormPlanUnavailable = false
+      derivativeSourceSummary = nil
     }
     guard id != nil else { return }
     await refreshChapters()
+    await loadDerivativeSourceSummary()
     if section == .settings {
       await loadBookSettings()
       await loadLongFormPlan()
@@ -431,7 +436,8 @@ final class WorkspaceModel: ObservableObject {
     sourceURL: URL,
     settingsText: String = "",
     maxCanonBatches: Int = 0,
-    embed: Bool = true
+    embed: Bool = true,
+    pendingSourceID: String? = nil
   ) async {
     var state = DerivativePreparationState(
       bookID: bookID,
@@ -450,7 +456,17 @@ final class WorkspaceModel: ObservableObject {
     derivativePreparation = state
 
     do {
-      let manifest = try await inkOS.importDerivativeSource(bookID: bookID, from: sourceURL)
+      let manifest = try await inkOS.importDerivativeSource(
+        bookID: bookID,
+        from: sourceURL,
+        onProgress: { [weak self] progress in
+          await self?.updateDerivativeImportProgress(bookID: bookID, progress: progress)
+        }
+      )
+      if let pendingSourceID {
+        try? await inkOS.removePendingDerivativeSource(id: pendingSourceID)
+        CreateBookDraftPersistence.clear()
+      }
       let settings = settingsText.trimmingCharacters(in: .whitespacesAndNewlines)
       _ = try await inkOS.saveDerivativePreparationIntent(
         bookID: bookID,
@@ -466,7 +482,10 @@ final class WorkspaceModel: ObservableObject {
 
       let canon = try await inkOS.extractDerivativeCanon(
         bookID: bookID,
-        maxBatches: maxCanonBatches
+        maxBatches: maxCanonBatches,
+        onProgress: { [weak self] status in
+          await self?.updateDerivativeCanonProgress(bookID: bookID, status: status)
+        }
       )
       state.canonChaptersDone = canon.extractedChapters
       state.canonComplete = canon.isComplete
@@ -496,7 +515,10 @@ final class WorkspaceModel: ObservableObject {
         // vectors. An unavailable on-device embedding model must not cost the
         // customer the canon extraction that just succeeded.
         do {
-          let embedding = try await inkOS.embedDerivativeSource(bookID: bookID)
+          let embedding = try await inkOS.embedDerivativeSource(bookID: bookID) {
+            [weak self] status in
+            await self?.updateDerivativeEmbeddingProgress(bookID: bookID, status: status)
+          }
           state.embeddedPassages = embedding.embedded
           state.totalPassages = embedding.total
           state.embeddingComplete = !embedding.semanticAvailable || embedding.isComplete
@@ -510,15 +532,18 @@ final class WorkspaceModel: ObservableObject {
       state.phase = state.isComplete ? "原著准备完成" : "原著准备已暂停，可继续处理"
       derivativePreparation = state
       await refreshWorkspaceAfterWorkflowCompletion()
+      await loadDerivativeSourceSummary()
     } catch is CancellationError {
-      state.isRunning = false
-      state.phase = "原著准备已取消"
-      derivativePreparation = state
+      var latest = derivativePreparation ?? state
+      latest.isRunning = false
+      latest.phase = "原著准备已取消"
+      derivativePreparation = latest
     } catch {
-      state.isRunning = false
-      state.phase = "原著准备失败"
-      state.failure = errorText(error)
-      derivativePreparation = state
+      var latest = derivativePreparation ?? state
+      latest.isRunning = false
+      latest.phase = "原著准备失败"
+      latest.failure = errorText(error)
+      derivativePreparation = latest
       setError(error)
     }
   }
@@ -561,7 +586,13 @@ final class WorkspaceModel: ObservableObject {
 
       state.phase = "正在继续抽取原著设定"
       derivativePreparation = state
-      let canon = try await inkOS.extractDerivativeCanon(bookID: bookID, maxBatches: maxBatches)
+      let canon = try await inkOS.extractDerivativeCanon(
+        bookID: bookID,
+        maxBatches: maxBatches,
+        onProgress: { [weak self] status in
+          await self?.updateDerivativeCanonProgress(bookID: bookID, status: status)
+        }
+      )
       state.sourceChapterCount = canon.chapterCount
       state.canonChaptersDone = canon.extractedChapters
       state.canonComplete = canon.isComplete
@@ -585,7 +616,10 @@ final class WorkspaceModel: ObservableObject {
         state.phase = "正在建立语义检索索引"
         derivativePreparation = state
         do {
-          let embedding = try await inkOS.embedDerivativeSource(bookID: bookID)
+          let embedding = try await inkOS.embedDerivativeSource(bookID: bookID) {
+            [weak self] status in
+            await self?.updateDerivativeEmbeddingProgress(bookID: bookID, status: status)
+          }
           state.embeddedPassages = embedding.embedded
           state.totalPassages = embedding.total
           state.embeddingComplete = !embedding.semanticAvailable || embedding.isComplete
@@ -601,20 +635,159 @@ final class WorkspaceModel: ObservableObject {
         : "原著准备已暂停，可继续处理"
       derivativePreparation = state
       await refreshWorkspaceAfterWorkflowCompletion()
+      await loadDerivativeSourceSummary()
     } catch is CancellationError {
-      state.isRunning = false
-      state.phase = "抽取已取消"
-      derivativePreparation = state
+      var latest = derivativePreparation ?? state
+      latest.isRunning = false
+      latest.phase = "抽取已取消"
+      derivativePreparation = latest
     } catch {
-      state.isRunning = false
-      state.phase = "抽取失败"
-      state.failure = errorText(error)
-      derivativePreparation = state
+      var latest = derivativePreparation ?? state
+      latest.isRunning = false
+      latest.phase = "抽取失败"
+      latest.failure = errorText(error)
+      derivativePreparation = latest
       setError(error)
     }
   }
 
-  /// Restores the first unfinished source-preparation job after an app relaunch.
+  private func updateDerivativeImportProgress(
+    bookID: String,
+    progress: SourceImportProgress
+  ) {
+    guard var current = derivativePreparation,
+      current.bookID == bookID,
+      current.isRunning
+    else { return }
+    switch progress.phase {
+    case .decoding:
+      current.phase = "正在识别原著编码"
+    case .splitting:
+      current.phase = "正在按章节切分原著"
+    case .indexing:
+      current.phase = progress.chapterCount > 0
+        ? "正在建立检索索引（已处理 \(progress.chaptersDone)/\(progress.chapterCount) 章）"
+        : "正在建立检索索引"
+      current.sourceChapterCount = max(current.sourceChapterCount, progress.chapterCount)
+    case .committing:
+      current.phase = "正在写入原著目录"
+    }
+    derivativePreparation = current
+  }
+
+  private func updateDerivativeCanonProgress(
+    bookID: String,
+    status: SourceCanonStatus
+  ) {
+    guard var current = derivativePreparation,
+      current.bookID == bookID,
+      current.isRunning
+    else { return }
+    current.sourceChapterCount = status.chapterCount
+    current.canonChaptersDone = status.extractedChapters
+    current.canonComplete = status.isComplete
+    current.entityCount = status.entityCount
+    current.timelineCount = status.timelineCount
+    current.phase = status.isComplete
+      ? "原著设定抽取完成"
+      : "正在抽取原著设定（已完成 \(status.extractedChapters)/\(status.chapterCount) 章）"
+    derivativePreparation = current
+  }
+
+  private func updateDerivativeEmbeddingProgress(
+    bookID: String,
+    status: SourceEmbeddingStatus
+  ) {
+    guard var current = derivativePreparation,
+      current.bookID == bookID,
+      current.isRunning
+    else { return }
+    current.embeddedPassages = status.embedded
+    current.totalPassages = status.total
+    current.embeddingComplete = !status.semanticAvailable || status.isComplete
+    current.phase = status.isComplete
+      ? "语义检索索引已建立"
+      : "正在建立语义检索索引（\(status.embedded)/\(status.total)）"
+    derivativePreparation = current
+  }
+
+  func stagePendingDerivativeSource(from fileURL: URL) async -> PendingDerivativeSource? {
+    do {
+      return try await inkOS.stagePendingDerivativeSource(from: fileURL)
+    } catch is CancellationError {
+      return nil
+    } catch {
+      setError(error)
+      return nil
+    }
+  }
+
+  func pendingDerivativeSourceFileURL(id: String) async -> URL? {
+    try? await inkOS.pendingDerivativeSourceFileURL(id: id)
+  }
+
+  func loadPendingDerivativeSource(id: String) async -> PendingDerivativeSource? {
+    do {
+      return try await inkOS.loadPendingDerivativeSource(id: id)
+    } catch {
+      return nil
+    }
+  }
+
+  func discardPendingDerivativeSource(_ id: String) async {
+    try? await inkOS.removePendingDerivativeSource(id: id)
+  }
+
+  func loadDerivativeSourceSummary() async {
+    guard let bookID = currentBookID else {
+      derivativeSourceSummary = nil
+      return
+    }
+    do {
+      let summary = try await inkOS.derivativeSourceSummary(bookID: bookID)
+      guard currentBookID == bookID else { return }
+      derivativeSourceSummary = summary.bookKind == .derivative ? summary : nil
+    } catch {
+      guard currentBookID == bookID else { return }
+      derivativeSourceSummary = nil
+    }
+  }
+
+  /// Continues ingest from a workspace-owned copy after a relaunch that happened
+  /// between book creation and `importDerivativeSource`.
+  private func restorePendingDerivativeIngestion() async {
+    guard derivativePreparation?.isRunning != true else { return }
+    let snapshot = CreateBookDraftPersistence.load()
+    guard let bookID = snapshot.pendingIngestionBookID,
+      let sourceID = snapshot.pendingSourceID,
+      books.contains(where: { $0.id == bookID })
+    else { return }
+    let summary = try? await inkOS.derivativeSourceSummary(bookID: bookID)
+    if summary?.hasSource == true {
+      CreateBookDraftPersistence.clear()
+      try? await inkOS.removePendingDerivativeSource(id: sourceID)
+      return
+    }
+    guard let fileURL = try? await inkOS.pendingDerivativeSourceFileURL(id: sourceID) else {
+      return
+    }
+    let settings = [
+      snapshot.request.creationGuide?.storyPremise,
+      snapshot.request.creationGuide?.protagonistProfile,
+      snapshot.request.creationGuide?.specialConstraints.joined(separator: "\n"),
+    ]
+    .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+    .filter { !$0.isEmpty }
+    .joined(separator: "\n")
+    let title = books.first { $0.id == bookID }?.title ?? snapshot.request.title
+    await prepareDerivativeSource(
+      bookID: bookID,
+      bookTitle: title,
+      sourceURL: fileURL,
+      settingsText: settings.isEmpty ? snapshot.request.constraints : settings,
+      pendingSourceID: sourceID
+    )
+  }
   /// The source, author settings and embedding intent all live in the book workspace,
   /// so this is a read-only scan and does not resume model calls automatically.
   private func restoreIncompleteDerivativePreparation() async {

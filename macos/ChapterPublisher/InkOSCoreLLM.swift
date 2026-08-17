@@ -151,7 +151,13 @@ extension InkOSCore {
     let suppliedKey = endpoint.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
     let storedKey = string(raw[keys.apiKey]).nonEmpty ?? string(raw["apiKey"])
     let key = suppliedKey.isEmpty ? storedKey : suppliedKey
-    guard !key.isEmpty else { throw InkOSCoreError("请先填写或保存 API Key", statusCode: 400) }
+    guard !key.isEmpty else {
+      throw InkOSCoreError(
+        "请先填写或保存 API Key",
+        statusCode: 400,
+        origin: .requestConfiguration
+      )
+    }
     let url = try endpointURL(baseURL: baseURL, suffix: "models")
     var request = URLRequest(url: url, timeoutInterval: 60)
     request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
@@ -1010,18 +1016,24 @@ extension InkOSCore {
           break
         }
         // The endpoint rejected the request itself (4xx other than rate
-        // limiting, which `requestLLM` already retried and gave up on). Re-issuing
-        // the same call cannot succeed, so spending the remaining rounds on it is
-        // pure churn — stop and let a human see the rejection.
+        // limiting, which `requestLLM` already retried and gave up on). Local
+        // validators intentionally use HTTP-shaped 4xx codes too, so origin must
+        // be explicit: treating every local 409/422 as a remote rejection killed
+        // the loop before its corrective note could reach the next round.
         if let coreError = outcome.error as? InkOSCoreError,
+           coreError.origin != .local,
            (400...499).contains(coreError.statusCode),
            coreError.statusCode != 429 {
+          let reason = coreError.origin == .requestConfiguration
+            ? "模型请求配置无效，继续重写正文不会修复配置，终止自动重试。"
+            : "请求被服务端拒绝，重试同一调用不会成功，终止自动重试。"
           recordDebug(scope: "craft", message: "chapter.revision.terminated", level: "warning", data: [
             "bookId": bookID,
             "chapterNumber": chapter.number,
             "round": round,
             "statusCode": coreError.statusCode,
-            "reason": "请求被服务端拒绝，重试同一调用不会成功，终止自动重试。",
+            "errorOrigin": coreError.origin == .requestConfiguration ? "requestConfiguration" : "remoteResponse",
+            "reason": reason,
           ])
           break
         }
@@ -2179,6 +2191,7 @@ extension InkOSCore {
       正文字数目标区间是 \(minWords) 至 \(maxWords) 字，验收上限 \(reviewCeiling) 字。低于 \(minWords) 字或高于 \(reviewCeiling) 字记为 hard；落在 \(maxWords) 与 \(reviewCeiling) 字之间只作为 soft 提醒，不阻断。
       章末必须停在节拍卡声明的选择、反转、倒计时或新信息上。若以总结、氛围淡出、格言独白或"安心睡去"式收尾收束全章，记为 hard。
       正文不得用清单、备忘录、条目化盘点或资料登记块承担叙事。主角本人的账本记录也只能以动作与判断混合的方式呈现，不能以并列条目铺陈，出现记为 hard。
+      正文不得以“第28天”“雨季第28天”这类绝对纪日标签开篇、另起段落或在句间替读者报日序，出现记为 hard；“第二天一早”等相对时间过渡，以及角色在对话、台账或物资心算中引用日期不在此限。
       第 1 至 3 章作为开篇段整体必须至少建立一次主角核心能力或金手指锚点：异常征兆、首次显现或章末触发均可。前章已经建立后，当前章无需重复；节拍卡明确禁止能力显现时，以禁止清单为准，不得为了重复锚点提前能力。仅在截至当前章整个开篇段仍完全没有锚点时记为 hard。
       环境状态与资源可用性必须前后一致：此前章节或本章前文确立的中断、不可用或耗尽状态（断信号、断电、断水、封路、资源耗尽、设施损坏等），后文不得在没有恢复、替代或解释的情况下当作可用。同章之内自相矛盾（如先说信号彻底没了、后文又收到群视频）同样记为 hard。
       \(derivative.reviewRule)
@@ -2781,8 +2794,20 @@ extension InkOSCore {
     let key = suppliedKey.nonEmpty
       ?? string(raw[keys.apiKey]).nonEmpty
       ?? string(raw["apiKey"])
-    guard !key.isEmpty else { throw InkOSCoreError("请先在设置中填写模型 API Key", statusCode: 400) }
-    guard !model.isEmpty else { throw InkOSCoreError("请先在设置中选择模型", statusCode: 400) }
+    guard !key.isEmpty else {
+      throw InkOSCoreError(
+        "请先在设置中填写模型 API Key",
+        statusCode: 400,
+        origin: .requestConfiguration
+      )
+    }
+    guard !model.isEmpty else {
+      throw InkOSCoreError(
+        "请先在设置中选择模型",
+        statusCode: 400,
+        origin: .requestConfiguration
+      )
+    }
 
     let url = try endpointURL(baseURL: baseURL, suffix: "chat/completions")
     var body: [String: Any] = [
@@ -2982,11 +3007,21 @@ extension InkOSCore {
       let host = components.host, !host.isEmpty,
       components.user == nil, components.password == nil,
       components.query == nil, components.fragment == nil
-    else { throw InkOSCoreError("模型地址格式错误", statusCode: 400) }
+    else {
+      throw InkOSCoreError(
+        "模型地址格式错误",
+        statusCode: 400,
+        origin: .requestConfiguration
+      )
+    }
     let allowInsecure = (existing["allowInsecureHttp"] as? Bool) == true
     let loopback = ["localhost", "127.0.0.1", "::1"].contains(host.lowercased())
     guard scheme == "https" || (scheme == "http" && (loopback || allowInsecure)) else {
-      throw InkOSCoreError("远程模型地址需使用 HTTPS", statusCode: 400)
+      throw InkOSCoreError(
+        "远程模型地址需使用 HTTPS",
+        statusCode: 400,
+        origin: .requestConfiguration
+      )
     }
     components.path = components.path.replacingOccurrences(of: "/+$", with: "", options: .regularExpression)
     return components.string ?? text
@@ -2994,7 +3029,11 @@ extension InkOSCore {
 
   func endpointURL(baseURL: String, suffix: String) throws -> URL {
     guard let url = URL(string: baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/" + suffix) else {
-      throw InkOSCoreError("模型地址格式错误", statusCode: 400)
+      throw InkOSCoreError(
+        "模型地址格式错误",
+        statusCode: 400,
+        origin: .requestConfiguration
+      )
     }
     return url
   }
@@ -3670,10 +3709,15 @@ extension InkOSCore {
     if unavailableModel {
       return InkOSCoreError(
         "\(prefix)：中转站没有可用于该模型的渠道。请在设置中改用中转站实际提供的模型。原始信息：\(message)",
-        statusCode: 404
+        statusCode: 404,
+        origin: .remoteResponse
       )
     }
-    return InkOSCoreError("\(prefix)：\(message)", statusCode: status)
+    return InkOSCoreError(
+      "\(prefix)：\(message)",
+      statusCode: status,
+      origin: .remoteResponse
+    )
   }
 
   private func secretPreview(_ value: String) -> String {

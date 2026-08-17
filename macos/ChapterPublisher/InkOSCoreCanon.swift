@@ -114,6 +114,19 @@ struct SourceCanonBatchPlan: Equatable, Sendable {
   var characterCount: Int { chapters.reduce(0) { $0 + $1.length } }
 }
 
+private struct SourceCanonBatchExtraction: Sendable {
+  let batch: SourceCanonBatchPlan
+  let normalizedDelta: ContinuityDelta
+  let model: String
+  let allowSourceDay: Bool
+}
+
+private enum SourceCanonBatchExtractionOutcome: Sendable {
+  case success(SourceCanonBatchExtraction)
+  case failure(batch: SourceCanonBatchPlan, message: String)
+  case cancelled
+}
+
 // MARK: - Extraction
 
 extension InkOSCore {
@@ -140,6 +153,15 @@ extension InkOSCore {
   /// Retries per batch before the pass gives up. The checkpoint is written after
   /// every batch, so giving up costs only the current batch.
   static let canonBatchAttempts = 2
+
+  /// Maximum model calls in flight for canon extraction.
+  ///
+  /// Responses are still merged and checkpointed in source order. The model's
+  /// cross-batch entity IDs are advisory because `canonicalCanonEntities` owns the
+  /// stable name-to-ID mapping at commit time, so a small stale roster window does
+  /// not change the resulting continuity. Three calls keeps relay pressure modest
+  /// while removing most of the reasoning-model idle wall time.
+  static let canonExtractionConcurrency = 3
 
   func canonProgressURL(_ bookID: String) throws -> URL {
     try sourceDirectoryURL(bookID).appendingPathComponent("canon-progress.json")
@@ -347,6 +369,7 @@ extension InkOSCore {
     // replace the source-owned projection. Use the post-migration plan for both
     // anchor validation and the chapter operation that follows this gate.
     let synchronizedPlan = try synchronizeContinuityProjection(bookID: bookID)
+    let configured = loadDerivativeTimeline(bookID: bookID)
     let timeline = resolvedDerivativeTimeline(
       bookID: bookID,
       continuity: synchronizedPlan.continuity
@@ -354,7 +377,13 @@ extension InkOSCore {
     guard timeline.isConfigured,
       hasResolvedDerivativeSourceAnchor(timeline, continuity: synchronizedPlan.continuity)
     else {
-      throw InkOSCoreError("原著时间锚点尚未绑定，请先完成正典抽取并确认开篇时间", statusCode: 409)
+      let named = configured.anchorLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+      throw InkOSCoreError(
+        named.isEmpty
+          ? "原著时间锚点尚未绑定，请先完成正典抽取并确认开篇时间"
+          : "原著时间锚点「\(named)」尚未对应到已抽取的原著事件，请确认开篇时间或把锚点改成更接近正文的说法",
+        statusCode: 409
+      )
     }
     return synchronizedPlan
   }
@@ -461,11 +490,12 @@ extension InkOSCore {
         isSourceCanon ? !$0.hasPrefix("chapter-") : !$0.hasPrefix("source-chapter-")
       }
       if !markers.contains(marker) { markers.append(marker) }
+      let resolved = resolvingKnowledgeKnowerOverlap(item)
       return LongFormKnowledgeBoundary(
-        factId: item.factId,
-        statement: item.statement,
-        allowedKnowers: item.allowedKnowers,
-        forbiddenKnowers: item.forbiddenKnowers,
+        factId: resolved.factId,
+        statement: resolved.statement,
+        allowedKnowers: resolved.allowedKnowers,
+        forbiddenKnowers: resolved.forbiddenKnowers,
         availableFromChapter: 1,
         revealByChapter: nil,
         markers: markers
@@ -520,6 +550,51 @@ extension InkOSCore {
       )
     }
     return delta
+  }
+
+  /// Extraction models often list the same person as both knower and
+  /// forbidden knower. `validated()` rejects that overlap, which would abort
+  /// a long 诡秘-style pass on one confused item. Allowed wins: a wrong
+  /// forbid is worse than under-blocking, the same rule as the timeline gate.
+  /// Chapter deltas still go through `validated()` unchanged.
+  private func resolvingKnowledgeKnowerOverlap(
+    _ item: LongFormKnowledgeBoundary
+  ) -> LongFormKnowledgeBoundary {
+    func cleaned(_ values: [String]) -> [String] {
+      var seen = Set<String>()
+      var result: [String] = []
+      for raw in values {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, seen.insert(value).inserted else { continue }
+        result.append(value)
+      }
+      return result
+    }
+    let allowed = cleaned(item.allowedKnowers)
+    let allowedSet = Set(allowed)
+    var dropped: [String] = []
+    let forbidden = cleaned(item.forbiddenKnowers).filter { value in
+      guard !allowedSet.contains(value) else {
+        dropped.append(value)
+        return false
+      }
+      return true
+    }
+    if !dropped.isEmpty {
+      recordDebug(scope: "canon", message: "canon.knowledge.knower_overlap", level: "warning", data: [
+        "factId": item.factId,
+        "keptInAllowed": dropped,
+      ])
+    }
+    return LongFormKnowledgeBoundary(
+      factId: item.factId,
+      statement: item.statement,
+      allowedKnowers: allowed,
+      forbiddenKnowers: forbidden,
+      availableFromChapter: item.availableFromChapter,
+      revealByChapter: item.revealByChapter,
+      markers: item.markers
+    )
   }
 
   private func canonExtractionPrompt(
@@ -598,6 +673,8 @@ extension InkOSCore {
       会被别的章节引用的那些。次要细节（器物尺寸、路人姓名、一次性场景）不要收录。\
       statement / description 每条不超过 60 字，不要展开成段落。
       9. 输出必须是完整闭合的 JSON。宁可少写几项，也不要写到一半被截断。
+      10. 同一人物不得同时出现在 allowedKnowers 和 forbiddenKnowers。已经知情的人只放 \
+      allowedKnowers，不要再写进 forbiddenKnowers。
 
       原著正文：
       \(body)
@@ -616,7 +693,8 @@ extension InkOSCore {
   @discardableResult
   func extractDerivativeCanon(
     bookID: String,
-    maxBatches: Int = 0
+    maxBatches: Int = 0,
+    onProgress: (@Sendable (SourceCanonStatus) async -> Void)? = nil
   ) async throws -> SourceCanonStatus {
     let manifest = try loadSourceManifest(bookID: bookID)
     _ = try validateSourceSearchIndex(bookID: bookID, manifest: manifest)
@@ -625,7 +703,9 @@ extension InkOSCore {
       recordDebug(scope: "canon", message: "canon.extract.already_complete", data: [
         "bookId": bookID, "chapterCount": manifest.chapterCount,
       ])
-      return canonStatus(progress)
+      let status = canonStatus(progress)
+      await onProgress?(status)
+      return status
     }
 
     var plan = try synchronizeContinuityProjection(bookID: bookID)
@@ -643,148 +723,223 @@ extension InkOSCore {
     if maxBatches > 0, plans.count > maxBatches {
       plans = Array(plans.prefix(maxBatches))
     }
-    guard !plans.isEmpty else { return canonStatus(progress) }
+    guard !plans.isEmpty else {
+      let status = canonStatus(progress)
+      await onProgress?(status)
+      return status
+    }
 
-    for batch in plans {
-      guard let first = batch.chapters.first, let last = batch.chapters.last else { continue }
-      let start = first.offset
-      let end = last.offset + last.length
-      guard start >= 0, end <= ns.length, start < end else {
-        throw InkOSCoreError("原著章节偏移越界，请重新导入原著", statusCode: 503)
-      }
-      let body = ns.substring(with: NSRange(location: start, length: end - start))
-      let prompt = canonExtractionPrompt(
-        title: sourceTitle.isEmpty ? bookID : sourceTitle,
-        batch: batch,
-        body: body,
-        known: plan.continuity,
-        timelineAnchorLabel: timelineAnchor
-      )
+    func extractionInput(
+      for batch: SourceCanonBatchPlan,
+      known: LongFormContinuity
+    ) throws -> (prompt: String, allowSourceDay: Bool) {
+        guard let first = batch.chapters.first, let last = batch.chapters.last else {
+          throw InkOSCoreError("原著抽取批次为空，请重新导入原著", statusCode: 503)
+        }
+        let start = first.offset
+        let end = last.offset + last.length
+        guard start >= 0, end <= ns.length, start < end else {
+          throw InkOSCoreError("原著章节偏移越界，请重新导入原著", statusCode: 503)
+        }
+        let body = ns.substring(with: NSRange(location: start, length: end - start))
+        let prompt = canonExtractionPrompt(
+          title: sourceTitle.isEmpty ? bookID : sourceTitle,
+          batch: batch,
+          body: body,
+          known: known,
+          timelineAnchorLabel: timelineAnchor
+        )
+        return (prompt, !timelineAnchor.isEmpty && body.contains(timelineAnchor))
+    }
 
-      var extracted: ContinuityDelta?
-      var model = ""
-      var lastError: Error?
-      for attempt in 1...Self.canonBatchAttempts {
-        do {
-          let result = try await requestLLM(
-            prompt: prompt,
-            role: .extraction,
-            json: true,
-            // A fresh sample on the retry: at the configured temperature the model
-            // re-emits the same malformed payload otherwise.
-            overrideTemperature: attempt == 1 ? nil : 0.4,
-            timeout: 600
+    recordDebug(scope: "canon", message: "canon.extract.window_started", data: [
+        "bookId": bookID,
+        "firstBatch": plans.first?.index ?? 0,
+        "lastBatch": plans.last?.index ?? 0,
+        "concurrency": Swift.min(Self.canonExtractionConcurrency, plans.count),
+    ])
+
+    try await withThrowingTaskGroup(
+      of: (Int, SourceCanonBatchExtractionOutcome).self
+    ) { group in
+      var nextToLaunch = 0
+      var nextToCommit = 0
+      var completed: [Int: SourceCanonBatchExtractionOutcome] = [:]
+
+      func launch(_ position: Int, known: LongFormContinuity) throws {
+        let batch = plans[position]
+        let input = try extractionInput(for: batch, known: known)
+        group.addTask {
+          let outcome = await self.extractCanonBatch(
+            bookID: bookID,
+            batch: batch,
+            prompt: input.prompt,
+            allowSourceDay: input.allowSourceDay
           )
-          model = result.model
-          guard let object = parseJSONObject(result.content) else {
-            // Truncation and malformed output need different fixes — raise the token
-            // ceiling versus reword the prompt — so they must not share one message.
-            // A reasoning model spends part of `max_tokens` thinking before it writes
-            // any JSON, so a budget that fits the answer can still cut it off: the
-            // first 诡秘之主 batch burned 12 056 reasoning tokens and lost the JSON at
-            // character 12 972 of a well-formed object.
-            if result.finishReason == "length" {
-              throw InkOSCoreError(
-                "原著抽取被输出上限截断（已输出 \(result.content.count) 字符，未闭合）。请在设置里提高最大输出 tokens，或改用非推理模型抽取",
-                statusCode: 422
-              )
-            }
-            throw InkOSCoreError(
-              "原著抽取返回的不是 JSON（finishReason=\(result.finishReason ?? "未知")，输出 \(result.content.count) 字符）",
-              statusCode: 422
-            )
-          }
-          // `chapterNumber: 1` supplies the defaults for any chapter field the
-          // model omitted; `canonicalizedExtractionDelta` then overrides every
-          // one of them, so the value only has to be in range.
-          let normalized = try normalizedConsistencyDelta(
-            object,
-            chapterNumber: 1,
-            allowSourceCoordinates: true
-          )
-          extracted = canonicalizedExtractionDelta(
-            normalized,
-            sourceRange: (batch.startChapter, batch.endChapter),
-            orderSeed: progress.delta.upsert.timeline.count,
-            // The prompt defines sourceDay against one global anchor. Defensively
-            // discard it when that anchor is not present in the supplied source
-            // slice, even if the model emitted a batch-local zero anyway.
-            allowSourceDay: !timelineAnchor.isEmpty && body.contains(timelineAnchor)
-          )
-          break
-        } catch is CancellationError {
-          throw CancellationError()
-        } catch {
-          lastError = error
-          recordDebug(scope: "canon", message: "canon.extract.batch_failed", level: "warning", data: [
-            "bookId": bookID,
-            "batch": batch.index,
-            "attempt": attempt,
-            "error": error.localizedDescription,
-          ])
+          return (position, outcome)
         }
       }
 
-      guard var delta = extracted else {
-        // The checkpoint already holds every completed batch, so surfacing the
-        // failure here loses only this batch.
-        try saveCanonProgress(progress)
-        throw InkOSCoreError(
-          "原著第\(batch.startChapter)-\(batch.endChapter)章抽取失败：\(lastError?.localizedDescription ?? "未知错误")；已保存前面批次的进度，可再次运行继续",
-          statusCode: 502
-        )
+      while nextToLaunch < Swift.min(Self.canonExtractionConcurrency, plans.count) {
+        try launch(nextToLaunch, known: plan.continuity)
+        nextToLaunch += 1
       }
 
-      let entityMerge = canonicalCanonEntities(
-        existing: progress.delta.upsert.entities,
-        additions: delta.upsert.entities
-      )
-      delta.upsert.entities = entityMerge.additions
-      let mergedDelta = mergedCanonDelta(progress.delta, delta)
-      let completedBatch = SourceCanonBatch(
-        index: batch.index,
-        startChapter: batch.startChapter,
-        endChapter: batch.endChapter,
-        characterCount: batch.characterCount,
-        canonCount: delta.upsert.immutableCanon.count,
-        worldRuleCount: delta.upsert.worldRules.count,
-        entityCount: delta.upsert.entities.count,
-        knowledgeCount: delta.upsert.knowledgeBoundaries.count,
-        timelineCount: delta.upsert.timeline.count,
-        hookCount: delta.upsert.hooks.count,
-        model: model,
-        completedAt: isoTimestamp()
-      )
+      while nextToCommit < plans.count,
+        let (position, outcome) = try await group.next()
+      {
+        completed[position] = outcome
+        // Responses may finish in any order. Only the continuous source prefix is
+        // allowed to touch projection/checkpoint state; completed later responses
+        // wait in memory behind the first unresolved batch.
+        while let ready = completed.removeValue(forKey: nextToCommit) {
+          switch ready {
+          case .cancelled:
+            throw CancellationError()
+          case .failure(let batch, let message):
+            group.cancelAll()
+            try saveCanonProgress(progress)
+            throw InkOSCoreError(
+              "原著第\(batch.startChapter)-\(batch.endChapter)章抽取失败：\(message)；已保存前面批次的进度，可再次运行继续",
+              statusCode: 502
+            )
+          case .success(let extraction):
+            var delta = canonicalizedExtractionDelta(
+              extraction.normalizedDelta,
+              sourceRange: (extraction.batch.startChapter, extraction.batch.endChapter),
+              orderSeed: progress.delta.upsert.timeline.count,
+              allowSourceDay: extraction.allowSourceDay
+            )
+            let entityMerge = canonicalCanonEntities(
+              existing: progress.delta.upsert.entities,
+              additions: delta.upsert.entities
+            )
+            delta.upsert.entities = entityMerge.additions
+            let mergedDelta = mergedCanonDelta(progress.delta, delta)
+            let completedBatch = SourceCanonBatch(
+              index: extraction.batch.index,
+              startChapter: extraction.batch.startChapter,
+              endChapter: extraction.batch.endChapter,
+              characterCount: extraction.batch.characterCount,
+              canonCount: delta.upsert.immutableCanon.count,
+              worldRuleCount: delta.upsert.worldRules.count,
+              entityCount: delta.upsert.entities.count,
+              knowledgeCount: delta.upsert.knowledgeBoundaries.count,
+              timelineCount: delta.upsert.timeline.count,
+              hookCount: delta.upsert.hooks.count,
+              model: extraction.model,
+              completedAt: isoTimestamp()
+            )
 
-      // Projection first, checkpoint second. If projection validation rejects this
-      // batch, the persisted cursor still points at it and a resume cannot skip
-      // canon that never landed. If the later checkpoint write fails, re-applying
-      // the keyed delta is idempotent.
-      plan = try mergeCanonIntoBaseContinuity(
-        bookID: bookID,
-        delta: delta,
-        source: "原著正典抽取（第\(batch.startChapter)-\(batch.endChapter)章）"
-      )
-      progress.delta = mergedDelta
-      progress.nextChapterIndex = Swift.max(progress.nextChapterIndex, batch.endChapter + 1)
-      if batch.chapters.contains(where: { $0.index == 0 }) {
-        progress.prefaceExtracted = true
+            // Projection first, checkpoint second. If projection validation rejects
+            // this batch, the cursor still points at it. Re-applying after a later
+            // checkpoint-write failure is safe because every section is keyed.
+            plan = try mergeCanonIntoBaseContinuity(
+              bookID: bookID,
+              delta: delta,
+              source: "原著正典抽取（第\(extraction.batch.startChapter)-\(extraction.batch.endChapter)章）"
+            )
+            progress.delta = mergedDelta
+            progress.nextChapterIndex = Swift.max(
+              progress.nextChapterIndex,
+              extraction.batch.endChapter + 1
+            )
+            if extraction.batch.chapters.contains(where: { $0.index == 0 }) {
+              progress.prefaceExtracted = true
+            }
+            progress.batches.append(completedBatch)
+            progress.updatedAt = isoTimestamp()
+            try saveCanonProgress(progress)
+            await onProgress?(canonStatus(progress))
+            recordCanonEntityTypeConflicts(
+              entityMerge.typeConflicts,
+              bookID: bookID,
+              batch: extraction.batch.index
+            )
+            recordDebug(scope: "canon", message: "canon.extract.batch", data: [
+              "bookId": bookID,
+              "batch": extraction.batch.index,
+              "startChapter": extraction.batch.startChapter,
+              "endChapter": extraction.batch.endChapter,
+              "characters": extraction.batch.characterCount,
+              "entities": delta.upsert.entities.count,
+              "canon": delta.upsert.immutableCanon.count,
+            ])
+          }
+
+          nextToCommit += 1
+          // If the next ordered result is already buffered, inspect it first. It
+          // may be a failure; launching another request before consuming that
+          // known result would spend an upstream call that can never be committed.
+          if completed[nextToCommit] == nil, nextToLaunch < plans.count {
+            try launch(nextToLaunch, known: plan.continuity)
+            nextToLaunch += 1
+          }
+        }
       }
-      progress.batches.append(completedBatch)
-      progress.updatedAt = isoTimestamp()
-      try saveCanonProgress(progress)
-      recordCanonEntityTypeConflicts(entityMerge.typeConflicts, bookID: bookID, batch: batch.index)
-      recordDebug(scope: "canon", message: "canon.extract.batch", data: [
-        "bookId": bookID,
-        "batch": batch.index,
-        "startChapter": batch.startChapter,
-        "endChapter": batch.endChapter,
-        "characters": batch.characterCount,
-        "entities": delta.upsert.entities.count,
-        "canon": delta.upsert.immutableCanon.count,
-      ])
     }
     return canonStatus(progress)
+  }
+
+  private func extractCanonBatch(
+    bookID: String,
+    batch: SourceCanonBatchPlan,
+    prompt: String,
+    allowSourceDay: Bool
+  ) async -> SourceCanonBatchExtractionOutcome {
+    var lastErrorMessage = "未知错误"
+    for attempt in 1...Self.canonBatchAttempts {
+      do {
+        let result = try await requestLLM(
+          prompt: prompt,
+          role: .extraction,
+          json: true,
+          // A fresh sample on the retry: at the configured temperature the model
+          // re-emits the same malformed payload otherwise.
+          overrideTemperature: attempt == 1 ? nil : 0.4,
+          timeout: 600
+        )
+        guard let object = parseJSONObject(result.content) else {
+          // Truncation and malformed output need different fixes. A reasoning model
+          // spends part of `max_tokens` before writing any JSON, so a cut-off object
+          // is a budget failure even when the prose portion would otherwise fit.
+          if result.finishReason == "length" {
+            throw InkOSCoreError(
+              "原著抽取被输出上限截断（已输出 \(result.content.count) 字符，未闭合）。请在设置里提高最大输出 tokens，或改用非推理模型抽取",
+              statusCode: 422
+            )
+          }
+          throw InkOSCoreError(
+            "原著抽取返回的不是 JSON（finishReason=\(result.finishReason ?? "未知")，输出 \(result.content.count) 字符）",
+            statusCode: 422
+          )
+        }
+        // `chapterNumber: 1` supplies defaults only. Source coordinates and all
+        // derivative chapter fields are canonicalized later, at ordered commit.
+        let normalized = try normalizedConsistencyDelta(
+          object,
+          chapterNumber: 1,
+          allowSourceCoordinates: true
+        )
+        return .success(SourceCanonBatchExtraction(
+          batch: batch,
+          normalizedDelta: normalized,
+          model: result.model,
+          allowSourceDay: allowSourceDay
+        ))
+      } catch is CancellationError {
+        return .cancelled
+      } catch {
+        lastErrorMessage = error.localizedDescription
+        recordDebug(scope: "canon", message: "canon.extract.batch_failed", level: "warning", data: [
+          "bookId": bookID,
+          "batch": batch.index,
+          "attempt": attempt,
+          "error": lastErrorMessage,
+        ])
+      }
+    }
+    return .failure(batch: batch, message: lastErrorMessage)
   }
 
   /// Extracts the customer's settings text as the authoritative overlay.
@@ -904,13 +1059,11 @@ extension InkOSCore {
     var clearedSourceDays = 0
     if coordinatesChanged {
       let configured = loadDerivativeTimeline(bookID: bookID)
-      let anchorLabel = configured.anchorLabel.trimmingCharacters(in: .whitespacesAndNewlines)
-      let matchedAnchor = progress.delta.upsert.timeline.first { milestone in
-        guard !anchorLabel.isEmpty else { return false }
-        return milestone.label == anchorLabel
-          || milestone.label.contains(anchorLabel)
-          || anchorLabel.contains(milestone.label)
-      }
+      let matchedAnchor = matchingSourceTimelineAnchor(
+        label: configured.anchorLabel,
+        milestoneID: configured.anchorMilestoneID,
+        in: progress.delta.upsert.timeline
+      )
       let anchorChapter = configured.anchorSourceChapter ?? matchedAnchor?.sourceChapter
       let anchorBatch = anchorChapter.flatMap { chapter in
         progress.batches.first { $0.startChapter <= chapter && chapter <= $0.endChapter }

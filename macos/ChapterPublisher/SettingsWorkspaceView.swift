@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import SwiftUI
+import UniformTypeIdentifiers
 
 @MainActor
 final class BookSettingDraftStore: ObservableObject {
@@ -327,6 +328,9 @@ struct SettingsWorkspaceView: View {
   @State private var chapterProbeRequest = UUID()
   @State private var reviewProbeRequest = UUID()
   @State private var extractionProbeRequest = UUID()
+  @State private var isChoosingReplacementSource = false
+  @State private var confirmReplaceSource = false
+  @State private var pendingReplacementURL: URL?
 
   var body: some View {
     VStack(spacing: 0) {
@@ -346,6 +350,9 @@ struct SettingsWorkspaceView: View {
       if model.longFormPlan == nil, !model.isLongFormPlanUnavailable {
         await model.loadLongFormPlan()
       }
+      if model.derivativeSourceSummary == nil {
+        await model.loadDerivativeSourceSummary()
+      }
       loadConfigDraft()
       syncEditorDraft()
       syncLongFormDraft()
@@ -354,6 +361,7 @@ struct SettingsWorkspaceView: View {
     .onChange(of: model.currentBookID) { _ in
       syncEditorDraft()
       resetLongFormDraft()
+      Task { await model.loadDerivativeSourceSummary() }
     }
     .onChange(of: model.selectedSettingPath) { _ in syncEditorDraft() }
     .onChange(of: model.selectedSettingContent) { _ in syncEditorDraft() }
@@ -489,6 +497,11 @@ struct SettingsWorkspaceView: View {
       .frame(height: NativeLayout.workspaceUtilityHeight)
 
       Divider()
+
+      if model.derivativeSourceSummary != nil {
+        derivativeSourceCard
+        Divider()
+      }
 
       switch bookSettingsMode {
       case .plan:
@@ -626,6 +639,110 @@ struct SettingsWorkspaceView: View {
     .padding(.horizontal, 12)
     .padding(.bottom, 8)
     .accessibilityElement(children: .combine)
+  }
+
+  private var derivativeSourceCard: some View {
+    let summary = model.derivativeSourceSummary
+    let running = model.derivativePreparation?.isRunning == true
+      && model.derivativePreparation?.bookID == model.currentBookID
+    return HStack(alignment: .center, spacing: 12) {
+      Image(systemName: summary?.hasSource == true ? "book.closed.fill" : "exclamationmark.triangle.fill")
+        .foregroundStyle(summary?.hasSource == true ? Color.accentColor : .orange)
+        .accessibilityHidden(true)
+      VStack(alignment: .leading, spacing: 2) {
+        Text(summary?.sourceTitle.isEmpty == false
+          ? "原著《\(summary?.sourceTitle ?? "")》"
+          : "同人原著")
+          .font(.callout.weight(.semibold))
+        Text(sourceSummaryLine(summary))
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .textSelection(.enabled)
+      }
+      Spacer(minLength: 8)
+      Button(summary?.hasSource == true ? "更换原著…" : "导入原著…") {
+        isChoosingReplacementSource = true
+      }
+      .disabled(running || model.currentBookID == nil)
+      .controlSize(.small)
+    }
+    .padding(.horizontal, 14)
+    .padding(.vertical, 10)
+    .fileImporter(
+      isPresented: $isChoosingReplacementSource,
+      allowedContentTypes: [.plainText],
+      allowsMultipleSelection: false
+    ) { result in
+      switch result {
+      case .success(let urls):
+        guard let url = urls.first else { return }
+        if summary?.hasSource == true {
+          pendingReplacementURL = url
+          confirmReplaceSource = true
+        } else {
+          importReplacementSource(url)
+        }
+      case .failure(let error):
+        model.errorMessage = "无法读取所选文件：\(error.localizedDescription)"
+      }
+    }
+    .confirmationDialog(
+      "更换原著会清空已抽取的原著正典，作者设定会保留。确定更换？",
+      isPresented: $confirmReplaceSource,
+      titleVisibility: .visible
+    ) {
+      Button("更换原著", role: .destructive) {
+        if let url = pendingReplacementURL {
+          importReplacementSource(url)
+        }
+        pendingReplacementURL = nil
+      }
+      Button("取消", role: .cancel) {
+        pendingReplacementURL = nil
+      }
+    }
+  }
+
+  private func sourceSummaryLine(_ summary: DerivativeSourceSummary?) -> String {
+    guard let summary else { return "尚未导入原著" }
+    guard summary.hasSource else { return "尚未导入原著，写作前需要先导入 txt 文件" }
+    var parts: [String] = []
+    parts.append("\(summary.chapterCount) 章")
+    if summary.characterCount > 0 {
+      parts.append("\(summary.characterCount) 字")
+    }
+    if !summary.encoding.isEmpty {
+      parts.append(summary.encoding)
+    }
+    if let strategy = summary.splitStrategy {
+      parts.append(strategy == .headings ? "按标题切章" : "按固定长度切段")
+    }
+    parts.append(
+      summary.canonComplete
+        ? "正典已完成"
+        : "正典 \(summary.extractedChapters)/\(summary.chapterCount) 章"
+    )
+    return parts.joined(separator: " · ")
+  }
+
+  private func importReplacementSource(_ url: URL) {
+    guard let bookID = model.currentBookID else { return }
+    let title = model.currentBook?.title ?? bookID
+    let accessed = url.startAccessingSecurityScopedResource()
+    Task {
+      defer {
+        if accessed { url.stopAccessingSecurityScopedResource() }
+      }
+      guard let staged = await model.stagePendingDerivativeSource(from: url),
+        let fileURL = await model.pendingDerivativeSourceFileURL(id: staged.id)
+      else { return }
+      await model.prepareDerivativeSource(
+        bookID: bookID,
+        bookTitle: title,
+        sourceURL: fileURL,
+        pendingSourceID: staged.id
+      )
+    }
   }
 
   @ViewBuilder

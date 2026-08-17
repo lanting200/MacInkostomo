@@ -1457,11 +1457,27 @@ struct DerivativePreparationState: Equatable, Sendable {
     return Swift.min(1, Double(canonChaptersDone) / Double(sourceChapterCount))
   }
 
+  /// Canon fill while chapters are still being extracted; vector fill once the
+  /// banner is waiting on the semantic index. Using chapter progress there is
+  /// what made a 22 000-passage embed look finished at 0/N.
+  var bannerProgress: Double {
+    if embedRequested, !embeddingComplete, totalPassages > 0 {
+      return Swift.min(1, Double(embeddedPassages) / Double(totalPassages))
+    }
+    return canonProgress
+  }
+
   var isComplete: Bool {
     canonComplete && overlayComplete && embeddingComplete
   }
 
   var needsResume: Bool { !isComplete }
+
+  /// Import itself never landed, so resume cannot help — the customer must pick
+  /// the original again.
+  var needsSourceFile: Bool {
+    !isRunning && sourceChapterCount == 0
+  }
 }
 
 // MARK: - Book kind
@@ -2528,11 +2544,18 @@ struct CreateBookDraftSnapshot: Codable, Equatable, Sendable {
   var request: CreateBookRequest
   var requirements: String
   var pendingCreationJobID: String?
+  /// Workspace-owned copy of the selected original. Unlike a user file path, this
+  /// id still resolves after a relaunch.
+  var pendingSourceID: String?
+  /// Book that was created but whose staged original has not yet been ingested.
+  var pendingIngestionBookID: String?
 
   static let empty = CreateBookDraftSnapshot(
     request: CreateBookRequest(),
     requirements: "",
-    pendingCreationJobID: nil
+    pendingCreationJobID: nil,
+    pendingSourceID: nil,
+    pendingIngestionBookID: nil
   )
 }
 
@@ -2566,14 +2589,36 @@ enum CreateBookDraftPersistence {
     requirements: String,
     defaults: UserDefaults = .standard
   ) {
-    save(
-      CreateBookDraftSnapshot(
-        request: request,
-        requirements: requirements,
-        pendingCreationJobID: jobID
-      ),
-      defaults: defaults
-    )
+    var snapshot = load(defaults: defaults)
+    snapshot.request = request
+    snapshot.requirements = requirements
+    snapshot.pendingCreationJobID = jobID
+    save(snapshot, defaults: defaults)
+  }
+
+  static func savePendingSourceID(
+    _ id: String?,
+    defaults: UserDefaults = .standard
+  ) {
+    var snapshot = load(defaults: defaults)
+    snapshot.pendingSourceID = id
+    save(snapshot, defaults: defaults)
+  }
+
+  static func markPendingIngestion(
+    bookID: String,
+    sourceID: String,
+    request: CreateBookRequest,
+    requirements: String,
+    defaults: UserDefaults = .standard
+  ) {
+    var snapshot = load(defaults: defaults)
+    snapshot.request = request
+    snapshot.requirements = requirements
+    snapshot.pendingCreationJobID = nil
+    snapshot.pendingIngestionBookID = bookID
+    snapshot.pendingSourceID = sourceID
+    save(snapshot, defaults: defaults)
   }
 
   @discardableResult
@@ -2590,8 +2635,13 @@ enum CreateBookDraftPersistence {
     }
 
     if job.status.lowercased() == "success" {
-      clear(defaults: defaults)
-      return .empty
+      snapshot.pendingCreationJobID = nil
+      if snapshot.pendingSourceID == nil, snapshot.pendingIngestionBookID == nil {
+        clear(defaults: defaults)
+        return .empty
+      }
+      save(snapshot, defaults: defaults)
+      return snapshot
     }
     if !job.isActive {
       snapshot.pendingCreationJobID = nil
@@ -2618,6 +2668,7 @@ struct CreateBookResponse: Codable, Sendable {
   let status: String
   let jobId: String
   let title: String
+  let bookId: String
 }
 
 struct CreateBookAssistRequest: Encodable, Sendable {

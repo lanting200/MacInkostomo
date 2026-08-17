@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct CreateBookSheet: View {
   private enum GuideStep: Int, CaseIterable, Identifiable {
@@ -30,10 +31,9 @@ struct CreateBookSheet: View {
   @State private var assistCompleted = false
   @State private var isSubmitting = false
   @State private var protagonistConfirmed = false
-  /// The uploaded original. Held only in view state, never in the persisted draft:
-  /// a file path saved across launches can point at a file that has since moved, and
-  /// silently importing the wrong bytes is worse than asking again.
-  @State private var sourceFileURL: URL?
+  /// Workspace-owned copy of the original. The picker URL is copied here immediately
+  /// so assist/create can take minutes without depending on a path that may move.
+  @State private var stagedSource: PendingDerivativeSource?
   @State private var isChoosingSource = false
 
   init(model: WorkspaceModel) {
@@ -47,6 +47,7 @@ struct CreateBookSheet: View {
       && !draft.request.volumePlan.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     _assistCompleted = State(initialValue: hasGeneratedPlan)
     _guideStep = State(initialValue: hasGeneratedPlan ? .review : .idea)
+    _stagedSource = State(initialValue: nil)
   }
 
   private var canSubmit: Bool {
@@ -74,7 +75,7 @@ struct CreateBookSheet: View {
       return "请填写小说暂定名"
     }
     if guide.kind == .derivative {
-      if sourceFileURL == nil {
+      if stagedSource == nil {
         return "同人小说需要先上传原著 txt 文件"
       }
       if guide.sourceTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -304,6 +305,13 @@ struct CreateBookSheet: View {
       } else if pendingCreationJobID != nil {
         Task { await model.refreshWorkflowJobs() }
       }
+      if stagedSource == nil,
+        let pendingID = CreateBookDraftPersistence.load().pendingSourceID
+      {
+        Task {
+          stagedSource = await model.loadPendingDerivativeSource(id: pendingID)
+        }
+      }
     }
     .onChange(of: request) { _ in scheduleDraftPersistence() }
     .onChange(of: guide) { _ in
@@ -430,9 +438,9 @@ struct CreateBookSheet: View {
           }
           dialogField("原著 txt 文件", required: true) {
             HStack(spacing: 8) {
-              Text(sourceFileURL?.lastPathComponent ?? "尚未选择")
+              Text(stagedSource?.originalFileName ?? "尚未选择")
                 .font(.caption)
-                .foregroundStyle(sourceFileURL == nil ? .secondary : .primary)
+                .foregroundStyle(stagedSource == nil ? .secondary : .primary)
                 .lineLimit(1)
                 .truncationMode(.middle)
               Spacer(minLength: 4)
@@ -477,7 +485,20 @@ struct CreateBookSheet: View {
     ) { result in
       switch result {
       case .success(let urls):
-        sourceFileURL = urls.first
+        guard let url = urls.first else { return }
+        let accessed = url.startAccessingSecurityScopedResource()
+        Task {
+          defer {
+            if accessed { url.stopAccessingSecurityScopedResource() }
+          }
+          if let previous = stagedSource {
+            await model.discardPendingDerivativeSource(previous.id)
+          }
+          if let staged = await model.stagePendingDerivativeSource(from: url) {
+            stagedSource = staged
+            CreateBookDraftPersistence.savePendingSourceID(staged.id)
+          }
+        }
       case .failure(let error):
         model.errorMessage = "无法读取所选文件：\(error.localizedDescription)"
       }
@@ -720,52 +741,53 @@ struct CreateBookSheet: View {
     // Read off the request before the success path resets it, and hold the ingestion
     // inputs in locals: the pass is handed to the model and outlives this view.
     let ingestionKind = request.kind
-    let ingestionURL = sourceFileURL
+    let ingestionSource = stagedSource
     let ingestionTitle = request.title
     let ingestionSettings = derivativeSettingsText
+    let ingestionRequest = request
     isSubmitting = true
     Task {
-      let response = await model.createBook(request, requirements: requirements)
+      let response = await model.createBook(ingestionRequest, requirements: requirements)
       isSubmitting = false
-      if let response {
-        let acceptedJob = model.workflowJobs?.creationJobs.first { $0.jobId == response.jobId }
-        if acceptedJob?.status.lowercased() == "success" {
-          draftPersistenceTask?.cancel()
-          draftPersistenceTask = nil
-          pendingCreationJobID = nil
-          request = .init()
-          guide = .init()
-          requirements = ""
-          assistCompleted = false
-          protagonistConfirmed = false
-          sourceFileURL = nil
-          CreateBookDraftPersistence.clear()
-          // Only now does the book have a `long-form-plan.json` for canon to merge into.
-          if ingestionKind == .derivative, let ingestionURL {
-            // `bookId` is optional on the job record. Falling back to the title match
-            // beats skipping ingestion, which would leave a 同人 book with no canon at
-            // all and no sign of why.
-            let resolvedID =
-              acceptedJob?.bookId.flatMap { $0.isEmpty ? nil : $0 }
-              ?? model.books.first { $0.title == ingestionTitle }?.id
-            if let resolvedID {
-              Task {
-                await model.prepareDerivativeSource(
-                  bookID: resolvedID,
-                  bookTitle: ingestionTitle,
-                  sourceURL: ingestionURL,
-                  settingsText: ingestionSettings
-                )
-              }
-            } else {
-              model.errorMessage = "小说已创建，但没能定位到它的目录，原著未导入。请在书籍列表中选中它后重新导入原著。"
+      if let response, response.status.lowercased() == "success" {
+        draftPersistenceTask?.cancel()
+        draftPersistenceTask = nil
+        pendingCreationJobID = nil
+        request = .init()
+        guide = .init()
+        requirements = ""
+        assistCompleted = false
+        protagonistConfirmed = false
+        stagedSource = nil
+        // Only now does the book have a `long-form-plan.json` for canon to merge into.
+        if ingestionKind == .derivative, let ingestionSource {
+          CreateBookDraftPersistence.markPendingIngestion(
+            bookID: response.bookId,
+            sourceID: ingestionSource.id,
+            request: ingestionRequest,
+            requirements: ingestionSettings
+          )
+          Task {
+            guard let fileURL = await model.pendingDerivativeSourceFileURL(id: ingestionSource.id)
+            else {
+              model.errorMessage = "小说已创建，但原著暂存丢失，请在设置页重新导入原著。"
+              return
             }
+            await model.prepareDerivativeSource(
+              bookID: response.bookId,
+              bookTitle: ingestionTitle,
+              sourceURL: fileURL,
+              settingsText: ingestionSettings,
+              pendingSourceID: ingestionSource.id
+            )
           }
         } else {
-          pendingCreationJobID = CreateBookDraftPersistence.load().pendingCreationJobID
+          CreateBookDraftPersistence.clear()
         }
-        dismiss()
+      } else if response != nil {
+        pendingCreationJobID = CreateBookDraftPersistence.load().pendingCreationJobID
       }
+      dismiss()
     }
   }
 

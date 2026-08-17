@@ -241,7 +241,8 @@ extension InkOSCore {
       message: "原生 InkOSCore 已创建小说",
       status: "success",
       jobId: jobID,
-      title: title
+      title: title,
+      bookId: bookID
     )
   }
 

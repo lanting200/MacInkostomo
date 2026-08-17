@@ -18,7 +18,7 @@ extension InkOSCore {
   static let craftKernel = """
     【写法内核·不可关闭】
     1 场景纪律：本章由具体场景构成，每个场景要有地点、在场人物、可被观察的动作和对话。禁止用叙述性总结代替关键场景。禁止出现“两个小时后”“战斗持续了两个多小时，最终对方退去”“接下来的时间他几乎没停”这类把冲突压缩成结论的写法。决定写的冲突就完整写出过程，不打算写的冲突不要在本章提起。
-    2 入场：从一个具体时刻、动作或对话切入。禁止以天气综述、世界背景讲解或人物履历开场。人物的身份、职业和特长通过行动、选择、对话和他人反应透出，禁止成段的简历式介绍。
+    2 入场：从一个具体时刻、动作或对话切入。禁止以天气综述、世界背景讲解或人物履历开场。禁止以「第N天」「雨季第N天」这类绝对纪日标注开篇或在叙述中替读者数日子；故事时间通过场景、动作与作息自然呈现（天刚擦亮、晌午、第二天一早），角色查看台账、心算物资时提到日期不在此限。人物的身份、职业和特长通过行动、选择、对话和他人反应透出，禁止成段的简历式介绍。
     3 信息节奏：单章新引入的具名人物不得超过节拍卡允许的数量，每个新人物必须有一次能被记住的具体行为或台词。禁止在同一章同时铺开多条新线索。
     4 对话承载：关键的分歧、说服、交易、命令和情绪转折必须落在对话和即时反应上。禁止由旁白替角色下结论，禁止用“他说话不重，却带着压迫感”这类评语代替能产生压迫感的台词本身。
     5 场面完成度：本章主要冲突必须在场景内被看见发生，并且至少包含一次挫折、失败或代价。禁止提出问题后一次到位地解决。
@@ -436,7 +436,7 @@ extension InkOSCore {
 
       字段含义：
       \(derivative.rules)字段含义：
-      number 章号；volumeNumber 卷号；goal 本章要解决或推进的一个具体问题；openingHook 开场的具体时刻或动作，不是背景介绍；scenes 本章 1 至 3 个场景，每项写清地点、在场人物和现场冲突；requiredEvents 本章必须在正文里被看见发生的事，2 至 4 条，写成可验证的具体事件；forbiddenElements 本章禁止提前出现或提前解决的内容，3 至 6 条，逐条点名具体剧情、人物、物品或能力；endingHook 章末停留的选择、反转、倒计时或新信息；focusCharacters 本章出场并有作用的人物，含新引入者；newNamedCharacters 本章新引入的具名人物数量；timeSpan 本章覆盖的故事时间跨度（可选：仅当时间有明显跳跃时填写，连续剧情可留空）；storyDays 本章消耗的故事天数，整数，供系统累加推算故事日期：当天内发生填 0，跨一夜填 1，"三天后"这类跳跃填实际天数，不确定就省略该字段（系统按每章 1 天计）；setback 本章必须出现的挫折、代价或失败；notes 给写作模型的补充提醒。
+      number 章号；volumeNumber 卷号；goal 本章要解决或推进的一个具体问题；openingHook 开场的具体时刻或动作，不是背景介绍；scenes 本章 1 至 3 个场景，每项写清地点、在场人物和现场冲突；requiredEvents 本章必须在正文里被看见发生的事，2 至 4 条，写成可验证的具体事件；forbiddenElements 本章禁止提前出现或提前解决的内容，3 至 6 条，逐条点名具体剧情、人物、物品或能力；endingHook 章末停留的选择、反转、倒计时或新信息；focusCharacters 本章出场并有作用的人物，含新引入者；newNamedCharacters 本章新引入的具名人物数量；timeSpan 本章覆盖的故事时间跨度（可选：仅当时间有明显跳跃时填写，连续剧情可留空；写跨度不写绝对纪日——用"一夜之间""连下三天"，不要"第28天""雨季第28天"，纪日账由系统推算）；storyDays 本章消耗的故事天数，整数，供系统累加推算故事日期：当天内发生填 0，跨一夜填 1，"三天后"这类跳跃填实际天数，不确定就省略该字段（系统按每章 1 天计）；setback 本章必须出现的挫折、代价或失败；notes 给写作模型的补充提醒。
 
       只输出 JSON：
       {"beats":[{"number":\(range.start),"volumeNumber":\(range.volume),"goal":"","openingHook":"","scenes":[""],"requiredEvents":[""],"forbiddenElements":[""],"endingHook":"","focusCharacters":[""],"newNamedCharacters":0,"timeSpan":"","storyDays":1,"setback":"","notes":""}]}
@@ -813,6 +813,7 @@ extension InkOSCore {
     openingContext: String = ""
   ) throws {
     try rejectLedgerBlocks(content, chapterNumber: chapterNumber, label: label)
+    try rejectAbsoluteDayLabels(content, chapterNumber: chapterNumber, label: label)
     try rejectAphoristicEnding(content, chapterNumber: chapterNumber, label: label)
     if chapterNumber <= 3 {
       let openingArc = [openingContext, content]
@@ -820,6 +821,53 @@ extension InkOSCore {
         .joined(separator: "\n")
       try requireOpeningAbilityAnchor(openingArc, chapterNumber: chapterNumber, label: label)
     }
+  }
+
+  /// Diary-like day counters at a narration boundary make the system's internal
+  /// story clock leak into the prose. Keep this deliberately narrow: numeric day
+  /// labels and named-era counters at the start of a paragraph or sentence are
+  /// rejected, while relative transitions such as “第二天一早” and dates quoted
+  /// from a character's ledger remain valid.
+  private func rejectAbsoluteDayLabels(
+    _ content: String,
+    chapterNumber: Int,
+    label: String
+  ) throws {
+    let numeral = #"(?:[0-9０-９]{1,4}|[零〇一二三四五六七八九十百千两]{1,8})"#
+    let era = #"(?:雨季|灾变|末日|暴雨|封城|封锁|停电|断水|围城|感染|降临)"#
+    let numericBoundary = #"(?:^|[\n。！？!?])\s*第\s*[0-9０-９]{1,4}\s*天(?:\s|[，,。:：；;]|清晨|凌晨|早上|上午|中午|下午|傍晚|晚上|夜里|夜间|天亮|天黑)"#
+    let eraBoundary = #"(?:^|[\n。！？!?])\s*"# + era + #"\s*第\s*"# + numeral
+      + #"\s*天(?:\s|[，,。:：；;]|清晨|凌晨|早上|上午|中午|下午|傍晚|晚上|夜里|夜间|天亮|天黑)"#
+    let patterns = [numericBoundary, eraBoundary]
+    guard !patterns.contains(where: { containsNarratedDayLabel(in: content, pattern: $0) }) else {
+      throw InkOSCoreError(
+        "第\(chapterNumber)章\(label)使用了“第N天”式绝对纪日标签。故事时钟由系统内部累计；正文请用场景、作息或“第二天一早”等相对时间自然过渡，不要写成逐日记录。角色在对话、台账或物资心算中引用日期可以保留。",
+        statusCode: 422
+      )
+    }
+  }
+
+  private func containsNarratedDayLabel(in content: String, pattern: String) -> Bool {
+    var cursor = content.startIndex
+    while cursor < content.endIndex,
+      let match = content.range(
+        of: pattern,
+        options: .regularExpression,
+        range: cursor..<content.endIndex
+      )
+    {
+      let introduction = String(content[..<match.lowerBound].suffix(40))
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      let ledgerIntroductions = [
+        "台账：", "账本：", "挂历：", "标签：", "纸条：",
+        "台账上写着：", "账本上记着：", "挂历上标着：", "标签上写着：",
+      ]
+      if !ledgerIntroductions.contains(where: { introduction.hasSuffix($0) }) {
+        return true
+      }
+      cursor = match.upperBound
+    }
+    return false
   }
 
   func openingAbilityAnchorContext(bookID: String, before chapterNumber: Int) throws -> String {

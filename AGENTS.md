@@ -54,13 +54,19 @@ of the build or runtime. The only build system is the Xcode project.
     creation, chapter upload and replacement.
   - `InkOSCoreDerivative.swift`: original-work retrieval for derivative writing —
     encoding detection, chapter splitting, and hybrid BM25 + on-device semantic
-    search fused by reciprocal rank. `derivativeGenerationSections` is called from
-    generation, full revision, and independent review prompts, so retrieved canon
-    and the source timeline reach all three chapter-stage model calls;
-    `CreateBookSheet` uploads the original and `WorkspaceModel`
-    `prepareDerivativeSource` ingests it right after the book is created. Retrieval
-    keys include registered canon entities named in the beat goal, scenes and
-    required events, not only `focusCharacters`.
+    search fused by reciprocal rank. A selected txt is copied into
+    `data/pending-sources/` before the book exists so ingest does not depend on the
+    picker path. Splitter wrappers (`====` / `【】`) are stripped from titles, and a
+    leading table of contents is collapsed into the later same-ordinal chapter.
+    `CreateBookResponse.bookId` is what `CreateBookSheet` uses to start
+    `prepareDerivativeSource`; the settings page can replace the source on an
+    existing 同人 book. Retrieval keys include registered canon entities named in
+    the beat goal, scenes and required events, not only `focusCharacters`.
+    `derivativeGenerationSections` is called from generation, full revision, and
+    independent review prompts, so retrieved canon and the source timeline reach
+    all three chapter-stage model calls. `embedDerivativeSource` commits vectors
+    in batches and reports coverage so the banner can leave `0/total` before the
+    whole novel is indexed.
   - `InkOSCoreCanon.swift`: turns an imported original into continuity — batched
     extraction of canon, world rules, entities, knowledge boundaries, timeline and
     hooks, including a retained index-0 preface, checkpointed per batch so a bounded
@@ -237,6 +243,11 @@ half-built features read as done.
   earlier opening chapter establishes the anomaly, later opening chapters do
   not repeat it, and a chapter beat's forbidden list takes precedence over
   inserting another ability manifestation.
+- Diary-like absolute day labels are blocked at narration boundaries by the
+  deterministic craft validator and by the review prompt as `[hard][prose]`.
+  Relative transitions such as `第二天一早` and dates cited by a character from
+  dialogue, a ledger, or resource arithmetic remain valid; the story clock is
+  owned by `storyDays`, not exposed as narrator-maintained day numbers.
 - Local rules validate cross-chapter order, entity admission, deletion targets, and
   immutable conflicts before an independent model jointly reviews the text, the
   candidate delta, and the post-application continuity index. The review prompt
@@ -264,7 +275,16 @@ half-built features read as done.
   remaining rounds: a second verbatim-identical rewrite (the first one retries
   with an escalated instruction and a raised temperature), and a 4xx rejection
   from the endpoint other than 429, which `requestLLM` has already retried —
-  re-issuing an request the server refused cannot succeed. When a stall ends the
+  re-issuing an request the server refused cannot succeed. The 4xx exit covers
+  endpoint rejections only: `InkOSCoreError.origin` distinguishes local
+  validation, request configuration, and remote HTTP responses, so a local
+  length/craft/Delta miss keeps its own 4xx-shaped UI status and is folded into
+  the next round's note, because
+  it is the one error the word-gap instructions are built to converge — chapter
+  30 of 《渊雨浩劫》 died after a single round at 2 415 words when the local
+  422 was read as a server refusal, and the chapter ping-ponged
+  4000 → 2415 → 4029 across manual resubmits that each ran exactly one round.
+  When a stall ends the
   loop, the recorded failure reason is the standing blocking finding rather than
   the mechanical "输出与原文完全相同", which gives a human nothing to act on.
   A manual rejection (`reviseChapter`) joins the same loop — round one uses the
@@ -322,6 +342,12 @@ MACINKOSTOMO_WORKSPACE=$(mktemp -d) \
 
 - Exec the binary inside the bundle directly. Do not use `open -a` — it drops the
   workspace variable and the app falls back to the real Debug workspace.
+- Do not keep a GUI launch as a child of the agent shell. A tracked `exec` dies
+  with the shell, the window vanishes, and there is no `.ips` — it looks like an
+  app crash. Detach (`setsid` / a new session) and log stdout/stderr to a file.
+- Command-line Debug builds must pass `ENABLE_DEBUG_DYLIB=NO`. Xcode's stub
+  executor (`MacInkostomo.debug.dylib`) is for the debugger; running it standalone
+  can exit without a crash report when the window becomes frontmost.
 - Confirm the isolation actually took effect by checking the temporary directory
   is non-empty afterward. Do not assume the variable applied.
 - Scope `lsof` to the app's PID with `-a`; without it the selection filters are
@@ -391,6 +417,12 @@ projection's `baseContinuity`.
   chapter 1 (canon is available from the start) and keeps source provenance in
   `markers` as `source-chapter-N`. Skipping this fails validation on the first
   knowledge entry and the error reads like a model fault.
+- **Knower lists are de-overlapped.** A knowledge item that lists the same
+  person in both `allowedKnowers` and `forbiddenKnowers` fails `validated()`
+  and would abort a long extraction on one confused object. Extraction drops
+  the overlap from `forbiddenKnowers` (allowed wins: a wrong forbid is worse
+  than under-blocking) and records `canon.knowledge.knower_overlap`. Chapter
+  deltas still throw.
 - **`remove` and `policy` are dropped** from extraction output. The pass only
   contributes facts; letting it delete canon or rewrite policy would give the
   model authority over entries the settings text owns.
@@ -413,6 +445,22 @@ projection's `baseContinuity`.
   book synthesizes a resumable intent from its manifest, existing cursor, and
   index; the unavailable author-settings text becomes an empty overlay and the
   source canon/embedding work continues without re-importing the original.
+- **Extraction is bounded-concurrent, commit is ordered.** Up to
+  `canonExtractionConcurrency` (currently 3) adjacent batches issue their model
+  calls in a sliding window. A newly opened slot uses the latest committed
+  continuity, while other calls already in flight retain the roster they started
+  with. Results are committed strictly in source order: entity canonicalization,
+  timeline order seeding, projection validation, and `canon-progress.json` writes
+  still happen one batch at a time. After the atomic checkpoint write, the core's
+  typed progress callback updates `WorkspaceModel.derivativePreparation`; do not
+  wait for the full extraction invocation to return before refreshing the banner.
+  The prompt's entity roster is only advisory;
+  `canonicalCanonEntities` is the authority and deterministically maps same-name
+  entities from a stale in-wave roster back to the first ID/type. If a batch fails,
+  later tasks are cancelled or discarded and the durable cursor remains at that
+  gap, so resume never skips source canon. Do not replace this with unordered
+  projection writes or advance `nextChapterIndex` from whichever response returns
+  first.
 - **Writing is gated on preparation.** `generateChapter`, `reviseChapter`, and
   `approveChapter` all call `validateDerivativePreparationForWriting` before a job
   or approval starts. Canon and the settings overlay must be complete, a requested
@@ -507,8 +555,11 @@ correct, only its timing is wrong.
   `future` and are forbidden outright.
 - **The anchor binds at read time.** The customer names it in prose while creating
   the book, before any extraction exists, so no milestone ID can be stored.
-  `resolvedAnchor` matches by ID, then exact label, then containment, and fills
-  `anchorSourceChapter` from whatever it matched.
+  `resolvedAnchor` matches by ID, then exact label, then containment, then the
+  last two characters of the shorthand as a required token (`克莱恩穿越` → `穿越`)
+  with any leftover prefix as a tie-break. Token search looks at source chapters
+  1–80 first so a late-book “穿越真相” cannot steal an opening clock, then the
+  rest of the book, and fills `anchorSourceChapter` from whatever it matched.
 - **The timeline limits RAG at the SQL boundary.** Before day 0, retrieval may read
   at most `anchorSourceChapter - 1`; at or after the anchor it may read through the
   latest placed past event. The maximum is threaded through BM25/FTS and semantic

@@ -1,4 +1,5 @@
 import Foundation
+import Accelerate
 import NaturalLanguage
 import SQLite3
 import CryptoKit
@@ -49,6 +50,52 @@ struct SourceManifest: Codable, Equatable, Sendable {
   let ingestedAt: String
 
   static let currentVersion = 2
+}
+
+/// A workspace-owned copy of a user-selected original, taken at pick time.
+///
+/// The create-book wizard can sit for minutes on `assistCreateBook` before the
+/// book directory exists. Holding the original path across that wait is how a
+/// moved USB stick or a dismissed security-scoped bookmark produces a 同人 book
+/// with no source. The staged bytes live under `data/pending-sources/` and are
+/// what `importDerivativeSource` reads.
+struct PendingDerivativeSource: Codable, Equatable, Sendable {
+  let id: String
+  let originalFileName: String
+  let byteCount: Int
+  let stagedAt: String
+}
+
+/// Progress of the local ingest half of source preparation: decode, split, index,
+/// commit. Canon extraction has its own status type because it is a different
+/// timescale — this is the part that used to leave the banner stuck on
+/// "正在读取原著文件" for a full-length novel.
+struct SourceImportProgress: Equatable, Sendable {
+  enum Phase: String, Sendable {
+    case decoding
+    case splitting
+    case indexing
+    case committing
+  }
+
+  let phase: Phase
+  let chaptersDone: Int
+  let chapterCount: Int
+}
+
+/// Settings-page snapshot of an imported original. `hasSource` is false when the
+/// book is derivative but ingest never landed, which is the re-import affordance.
+struct DerivativeSourceSummary: Equatable, Sendable {
+  let bookKind: BookKind
+  let sourceTitle: String
+  let hasSource: Bool
+  let encoding: String
+  let chapterCount: Int
+  let characterCount: Int
+  let splitStrategy: SourceSplitStrategy?
+  let ingestedAt: String?
+  let extractedChapters: Int
+  let canonComplete: Bool
 }
 
 private struct SourceLayoutFingerprint: Encodable {
@@ -183,15 +230,18 @@ extension InkOSCore {
   /// structural label rather than a chapter and stays inside the adjacent chapter
   /// body; indexing it as a chapter creates a manifest entry with no passage when
   /// the next real chapter heading immediately follows.
+  /// Decorative wrappers (`====第一章====`, `【第一章】`) are common in web-novel
+  /// dumps. They sit outside capture group 1 so the stored title can be trimmed
+  /// without shifting the body offset past the wrapper.
   private static let sourceHeadingPattern = try? NSRegularExpression(
-    pattern: #"(?m)^[ \t　]{0,8}("#
+    pattern: #"(?m)^[ \t　]{0,8}(?:[=＊*_~─—\-━═＝★☆]{2,24}[ \t　]*)?(?:[\[【])?("#
       + #"第[〇零一二三四五六七八九十百千万\d]{1,12}[章回节折][^\n]{0,60}"#
       + #"|第[〇零一二三四五六七八九十百千万\d]{1,12}幕(?:[ \t　]+[^\n]{1,60}|[：:·—－-][^\n]{1,60}|[ \t　]*)"#
       + #"|[Cc]hapter[ \t]+\d{1,6}[^\n]{0,60}"#
       + #"|[序尾终][章幕][^\n]{0,60}"#
       + #"|楔子[^\n]{0,60}"#
       + #"|番外[^\n]{0,60}"#
-      + #")[ \t]*$"#
+      + #")(?:[\]】])?[ \t　]*(?:[=＊*_~─—\-━═＝★☆]{2,24})?[ \t]*$"#
   )
 
   /// Block size for the fallback split. Small enough that a retrieved unit is
@@ -207,9 +257,26 @@ extension InkOSCore {
   func splitSourceChapters(_ text: String) -> (chapters: [SourceChapter], strategy: SourceSplitStrategy) {
     let headings = sourceHeadingMatches(text)
     if headings.count >= 3 {
-      let chapters = sourceChaptersFromHeadings(text, headings: headings)
+      let ns = text as NSString
+      let chapters = collapsingSourceTableOfContents(
+        sourceChaptersFromHeadings(text, headings: headings),
+        text: ns
+      )
       let averageLength = chapters.reduce(0) { $0 + $1.length } / Swift.max(1, chapters.count)
-      if averageLength < 60_000 {
+      let numbered = chapters.filter { $0.index > 0 }
+      let substantial = numbered.filter {
+        sourceChapterBodyLength($0, text: ns) >= 200
+      }.count
+      let stubs = numbered.filter {
+        sourceChapterBodyLength($0, text: ns) < 80
+      }.count
+      // A dump that is only a table of contents still has many headings and a
+      // small average span. Short three-chapter fixtures and real short stories
+      // must keep heading splits; only a long stub-majority run falls back.
+      let looksLikeTableOfContents = numbered.count >= 8
+        && stubs * 2 >= numbered.count
+        && substantial < 3
+      if averageLength < 60_000, !looksLikeTableOfContents {
         return (chapters, .headings)
       }
     }
@@ -224,10 +291,30 @@ extension InkOSCore {
     return matches.compactMap { match in
       let range = match.range
       guard range.location != NSNotFound else { return nil }
-      let title = ns.substring(with: range).trimmingCharacters(in: .whitespacesAndNewlines)
+      let titleRange = match.range(at: 1)
+      let rawTitle = titleRange.location != NSNotFound
+        ? ns.substring(with: titleRange)
+        : ns.substring(with: range)
+      let title = cleanedSourceHeadingTitle(rawTitle)
       guard !title.isEmpty else { return nil }
       return (range.location, range.location + range.length, title)
     }
+  }
+
+  /// Strips dump wrappers and trailing page-number leaders from a heading line.
+  func cleanedSourceHeadingTitle(_ raw: String) -> String {
+    let decorations = CharacterSet(charactersIn: "=＊*_~─—-━═＝★☆【】[]")
+      .union(.whitespacesAndNewlines)
+    var title = raw.trimmingCharacters(in: decorations)
+    if let regex = try? NSRegularExpression(pattern: #"[ \t　\.·。．…]+[\d〇零一二三四五六七八九十百千]+$"#) {
+      let ns = title as NSString
+      let range = NSRange(location: 0, length: ns.length)
+      if let match = regex.firstMatch(in: title, range: range), match.range.location > 0 {
+        title = ns.substring(to: match.range.location)
+          .trimmingCharacters(in: decorations)
+      }
+    }
+    return title
   }
 
   private func sourceChaptersFromHeadings(
@@ -263,6 +350,143 @@ extension InkOSCore {
       ))
     }
     return chapters
+  }
+
+  /// Drops a leading table of contents and duplicate ordinals that a dump often
+  /// prefixes onto the real chapters. The preface (index 0) is never a TOC line.
+  private func collapsingSourceTableOfContents(
+    _ chapters: [SourceChapter],
+    text: NSString
+  ) -> [SourceChapter] {
+    let preface = chapters.filter { $0.index == 0 }
+    var numbered = chapters.filter { $0.index > 0 }
+    guard numbered.count >= 3 else { return chapters }
+
+    var kept: [SourceChapter] = []
+    var ordinalIndex: [String: (position: Int, length: Int)] = [:]
+    for chapter in numbered {
+      let length = sourceChapterBodyLength(chapter, text: text)
+      guard let key = sourceHeadingOrdinalKey(chapter.title) else {
+        kept.append(chapter)
+        continue
+      }
+      if let existing = ordinalIndex[key] {
+        if length > existing.length {
+          kept[existing.position] = chapter
+          ordinalIndex[key] = (existing.position, length)
+        }
+        continue
+      }
+      ordinalIndex[key] = (kept.count, length)
+      kept.append(chapter)
+    }
+    numbered = kept
+
+    let lengths = numbered.map { sourceChapterBodyLength($0, text: text) }
+    let median = lengths.sorted()[lengths.count / 2]
+    let threshold = min(120, max(40, median / 20))
+    var drop = 0
+    while drop < numbered.count,
+      sourceChapterBodyLength(numbered[drop], text: text) < threshold
+    {
+      drop += 1
+    }
+    if drop >= 5, drop < numbered.count {
+      numbered = Array(numbered.dropFirst(drop))
+    }
+    return reindexedSourceChapters(preface + numbered)
+  }
+
+  private func reindexedSourceChapters(_ chapters: [SourceChapter]) -> [SourceChapter] {
+    var result: [SourceChapter] = []
+    var next = 1
+    for chapter in chapters {
+      if chapter.index == 0 {
+        result.append(chapter)
+        continue
+      }
+      result.append(SourceChapter(
+        index: next,
+        title: chapter.title,
+        offset: chapter.offset,
+        length: chapter.length
+      ))
+      next += 1
+    }
+    return result
+  }
+
+  private func sourceChapterBodyLength(_ chapter: SourceChapter, text: NSString) -> Int {
+    let range = NSRange(location: chapter.offset, length: chapter.length)
+    guard range.location >= 0,
+      range.location + range.length <= text.length
+    else { return 0 }
+    return text.substring(with: range)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .count
+  }
+
+  /// Stable key for "第一章" / "第1章" / "Chapter 1" so a TOC line and the real
+  /// chapter collapse to one entry.
+  func sourceHeadingOrdinalKey(_ title: String) -> String? {
+    let cleaned = cleanedSourceHeadingTitle(title)
+    let ns = cleaned as NSString
+    let full = NSRange(location: 0, length: ns.length)
+    if let regex = try? NSRegularExpression(pattern: #"(?i)^chapter[ \t]+(\d+)"#),
+      let match = regex.firstMatch(in: cleaned, range: full),
+      match.range(at: 1).location != NSNotFound
+    {
+      return "chapter:\(ns.substring(with: match.range(at: 1)))"
+    }
+    if let regex = try? NSRegularExpression(
+      pattern: #"^第([〇零一二三四五六七八九十百千万\d]+)([章回节折幕])"#
+    ),
+      let match = regex.firstMatch(in: cleaned, range: full),
+      match.range(at: 1).location != NSNotFound,
+      match.range(at: 2).location != NSNotFound
+    {
+      let numeral = ns.substring(with: match.range(at: 1))
+      let kind = ns.substring(with: match.range(at: 2))
+      let number = parseSourceHeadingNumeral(numeral).map(String.init) ?? numeral
+      return "\(kind):\(number)"
+    }
+    if cleaned.hasPrefix("楔子") { return "preface:楔子" }
+    if cleaned.hasPrefix("序章") || cleaned.hasPrefix("序幕") { return "preface:序" }
+    return nil
+  }
+
+  private func parseSourceHeadingNumeral(_ text: String) -> Int? {
+    if let value = Int(text) { return value }
+    let digits: [Character: Int] = [
+      "〇": 0, "零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+      "六": 6, "七": 7, "八": 8, "九": 9,
+    ]
+    var total = 0
+    var current = 0
+    for character in text {
+      if character == "十" {
+        current = current == 0 ? 10 : current * 10
+        total += current
+        current = 0
+      } else if character == "百" {
+        current = current == 0 ? 100 : current * 100
+        total += current
+        current = 0
+      } else if character == "千" {
+        current = current == 0 ? 1000 : current * 1000
+        total += current
+        current = 0
+      } else if character == "万" {
+        current = (total + (current == 0 ? 1 : current)) * 10_000
+        total = current
+        current = 0
+      } else if let digit = digits[character] {
+        current = current * 10 + digit
+      } else {
+        return nil
+      }
+    }
+    return total + current
   }
 
   /// Segments Chinese text into space-delimited words for the `unicode61` mirror
@@ -1009,6 +1233,146 @@ extension InkOSCore {
     return integrity
   }
 
+  /// Reads the original bytes, including a security-scoped file-importer URL.
+  /// `startAccessing` is a no-op (returns false) on an ordinary path.
+  func readSourceFileData(_ fileURL: URL) throws -> Data {
+    let accessed = fileURL.startAccessingSecurityScopedResource()
+    defer {
+      if accessed { fileURL.stopAccessingSecurityScopedResource() }
+    }
+    do {
+      let data = try Data(contentsOf: fileURL)
+      guard !data.isEmpty else {
+        throw InkOSCoreError("原著文件为空", statusCode: 400)
+      }
+      return data
+    } catch let error as InkOSCoreError {
+      throw error
+    } catch {
+      throw InkOSCoreError("无法读取原著文件：\(error.localizedDescription)", statusCode: 400)
+    }
+  }
+
+  func pendingDerivativeSourcesDirectoryURL() -> URL {
+    dataURL.appendingPathComponent("pending-sources", isDirectory: true)
+  }
+
+  private func validatedPendingSourceID(_ id: String) throws -> String {
+    let allowed = CharacterSet(charactersIn: "0123456789abcdefABCDEF-")
+    guard id.count == 36, id.unicodeScalars.allSatisfy({ allowed.contains($0) }) else {
+      throw InkOSCoreError("原著暂存编号无效", statusCode: 400)
+    }
+    return id
+  }
+
+  func pendingDerivativeSourceDirectoryURL(id: String) throws -> URL {
+    let validated = try validatedPendingSourceID(id)
+    return pendingDerivativeSourcesDirectoryURL().appendingPathComponent(
+      validated,
+      isDirectory: true
+    )
+  }
+
+  func pendingDerivativeSourceFileURL(id: String) throws -> URL {
+    try pendingDerivativeSourceDirectoryURL(id: id).appendingPathComponent("source.bin")
+  }
+
+  /// Copies the selected original into the workspace before the book exists.
+  func stagePendingDerivativeSource(from fileURL: URL) throws -> PendingDerivativeSource {
+    let data = try readSourceFileData(fileURL)
+    let pending = PendingDerivativeSource(
+      id: UUID().uuidString,
+      originalFileName: fileURL.lastPathComponent,
+      byteCount: data.count,
+      stagedAt: isoTimestamp()
+    )
+    let directory = try pendingDerivativeSourceDirectoryURL(id: pending.id)
+    try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+    try atomicWrite(data, to: directory.appendingPathComponent("source.bin"))
+    try atomicWrite(try encoder.encode(pending), to: directory.appendingPathComponent("meta.json"))
+    recordDebug(scope: "derivative", message: "source.staged", data: [
+      "pendingId": pending.id,
+      "byteCount": pending.byteCount,
+      "fileName": pending.originalFileName,
+    ])
+    return pending
+  }
+
+  func loadPendingDerivativeSource(id: String) throws -> PendingDerivativeSource {
+    let url = try pendingDerivativeSourceDirectoryURL(id: id).appendingPathComponent("meta.json")
+    guard fileManager.fileExists(atPath: url.path) else {
+      throw InkOSCoreError("原著暂存已失效，请重新选择文件", statusCode: 404)
+    }
+    do {
+      let pending = try decoder.decode(PendingDerivativeSource.self, from: Data(contentsOf: url))
+      let fileURL = try pendingDerivativeSourceFileURL(id: pending.id)
+      guard fileManager.fileExists(atPath: fileURL.path) else {
+        throw InkOSCoreError("原著暂存已失效，请重新选择文件", statusCode: 404)
+      }
+      return pending
+    } catch let error as InkOSCoreError {
+      throw error
+    } catch {
+      throw InkOSCoreError("原著暂存记录损坏，请重新选择文件", statusCode: 503)
+    }
+  }
+
+  func removePendingDerivativeSource(id: String) throws {
+    let directory = try pendingDerivativeSourceDirectoryURL(id: id)
+    if fileManager.fileExists(atPath: directory.path) {
+      try fileManager.removeItem(at: directory)
+    }
+  }
+
+  /// Settings-page view of whether this book has an ingested original.
+  func derivativeSourceSummary(bookID: String) throws -> DerivativeSourceSummary {
+    let kind = bookKind(bookID: bookID)
+    let sourceTitle = bookSourceTitle(bookID: bookID)
+    guard kind == .derivative else {
+      return DerivativeSourceSummary(
+        bookKind: kind,
+        sourceTitle: sourceTitle,
+        hasSource: false,
+        encoding: "",
+        chapterCount: 0,
+        characterCount: 0,
+        splitStrategy: nil,
+        ingestedAt: nil,
+        extractedChapters: 0,
+        canonComplete: false
+      )
+    }
+    do {
+      let manifest = try loadSourceManifest(bookID: bookID)
+      let canon = try derivativeCanonStatus(bookID: bookID)
+      return DerivativeSourceSummary(
+        bookKind: kind,
+        sourceTitle: sourceTitle,
+        hasSource: true,
+        encoding: manifest.detectedEncoding,
+        chapterCount: manifest.chapterCount,
+        characterCount: manifest.characterCount,
+        splitStrategy: manifest.splitStrategy,
+        ingestedAt: manifest.ingestedAt,
+        extractedChapters: canon.extractedChapters,
+        canonComplete: canon.isComplete
+      )
+    } catch {
+      return DerivativeSourceSummary(
+        bookKind: kind,
+        sourceTitle: sourceTitle,
+        hasSource: false,
+        encoding: "",
+        chapterCount: 0,
+        characterCount: 0,
+        splitStrategy: nil,
+        ingestedAt: nil,
+        extractedChapters: 0,
+        canonComplete: false
+      )
+    }
+  }
+
   /// Imports an original work: detects encoding, splits chapters, stores a
   /// normalized UTF-8 copy, and builds the BM25 index.
   ///
@@ -1019,12 +1383,10 @@ extension InkOSCore {
   func importDerivativeSource(
     bookID: String,
     from fileURL: URL,
-    testingFailureAfterInstalledFiles: Int? = nil
-  ) throws -> SourceManifest {
-    let data = try Data(contentsOf: fileURL)
-    guard !data.isEmpty else {
-      throw InkOSCoreError("原著文件为空", statusCode: 400)
-    }
+    testingFailureAfterInstalledFiles: Int? = nil,
+    onProgress: (@Sendable (SourceImportProgress) async -> Void)? = nil
+  ) async throws -> SourceManifest {
+    let data = try readSourceFileData(fileURL)
     let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     let sourceURL = try sourceDirectoryURL(bookID)
     let manifestURL = sourceURL.appendingPathComponent("manifest.json")
@@ -1049,12 +1411,14 @@ extension InkOSCore {
       return existing
     }
 
+    await onProgress?(SourceImportProgress(phase: .decoding, chaptersDone: 0, chapterCount: 0))
     let decoded = try decodeSourceText(data)
     // Normalize line endings before offsets are computed, so every recorded
     // offset indexes the text that actually gets written.
     let text = decoded.text
       .replacingOccurrences(of: "\r\n", with: "\n")
       .replacingOccurrences(of: "\r", with: "\n")
+    await onProgress?(SourceImportProgress(phase: .splitting, chaptersDone: 0, chapterCount: 0))
     let split = splitSourceChapters(text)
     guard !split.chapters.isEmpty else {
       throw InkOSCoreError("原著文本无法切分出章节", statusCode: 400)
@@ -1088,11 +1452,12 @@ extension InkOSCore {
       try? fileManager.removeItem(at: stagingURL)
     }
     try atomicWrite(text, to: stagingURL.appendingPathComponent("original.txt"))
-    try buildSourceSearchIndex(
+    try await buildSourceSearchIndex(
       sourceURL: stagingURL,
       text: text,
       chapters: split.chapters,
-      manifest: manifest
+      manifest: manifest,
+      onProgress: onProgress
     )
     try atomicWrite(
       try encoder.encode(manifest),
@@ -1143,6 +1508,13 @@ extension InkOSCore {
 
     var didExchangeSourceDirectory = false
     do {
+      await onProgress?(
+        SourceImportProgress(
+          phase: .committing,
+          chaptersDone: split.chapters.count,
+          chapterCount: split.chapters.count
+        )
+      )
       if testingFailureAfterInstalledFiles == 1 {
         throw InkOSCoreError("原著导入测试故障注入", statusCode: 500)
       }
@@ -1273,8 +1645,9 @@ extension InkOSCore {
     sourceURL: URL,
     text: String,
     chapters: [SourceChapter],
-    manifest: SourceManifest
-  ) throws {
+    manifest: SourceManifest,
+    onProgress: (@Sendable (SourceImportProgress) async -> Void)? = nil
+  ) async throws {
     let index = try SourceSearchIndex(
       path: sourceURL.appendingPathComponent("passages.sqlite").path,
       reset: true
@@ -1287,17 +1660,24 @@ extension InkOSCore {
       layoutDigest: manifest.layoutDigest ?? "",
       contentDigest: sourceContentDigest(text)
     )
-    for chapter in chapters {
+    for (position, chapter) in chapters.enumerated() {
       let body = ns.substring(with: NSRange(location: chapter.offset, length: chapter.length))
-      for (position, passage) in mergedParagraphs(body).enumerated() {
+      for (passageIndex, passage) in mergedParagraphs(body).enumerated() {
         try index.insert(SourceSearchIndex.Row(
           chapterIndex: chapter.index,
           chapterTitle: chapter.title,
-          paragraphIndex: position,
+          paragraphIndex: passageIndex,
           text: passage,
           segmented: segmentChineseForSearch(passage)
         ))
       }
+      await onProgress?(
+        SourceImportProgress(
+          phase: .indexing,
+          chaptersDone: position + 1,
+          chapterCount: chapters.count
+        )
+      )
     }
     try index.commitTransaction()
     try index.checkpoint()
@@ -1484,6 +1864,12 @@ final class SourceEmbedder {
 
   /// L2-normalized mean of the token vectors. Normalizing here is what lets
   /// `semanticSearch` rank by a plain dot product.
+  ///
+  /// The token loop is the measured hot path: a Debug `-Onone` `enumerated()`
+  /// add over 512 dimensions made a 22 000-passage 诡秘 index look frozen for
+  /// hours. `vDSP.add` stays in Accelerate even when the rest of the target
+  /// is unoptimized.
+  @_optimize(speed)
   func vector(for text: String) throws -> [Float] {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !trimmed.isEmpty else {
@@ -1493,8 +1879,17 @@ final class SourceEmbedder {
     var sum = [Double](repeating: 0, count: dimension)
     var tokens = 0
     result.enumerateTokenVectors(in: trimmed.startIndex..<trimmed.endIndex) { vector, _ in
-      for (index, value) in vector.enumerated() where index < sum.count {
-        sum[index] += value
+      if vector.count == sum.count {
+        vDSP.add(vector, sum, result: &sum)
+      } else {
+        let count = min(vector.count, sum.count)
+        vector.withUnsafeBufferPointer { source in
+          sum.withUnsafeMutableBufferPointer { destination in
+            for index in 0..<count {
+              destination[index] += source[index]
+            }
+          }
+        }
       }
       tokens += 1
       return true
@@ -1524,24 +1919,33 @@ extension InkOSCore {
   ///
   /// Resumable by construction: `vector IS NULL` is the work queue, so an
   /// interrupted pass continues where it stopped and a completed pass is a no-op.
+  /// Each committed batch reports coverage; without that the banner stays at
+  /// `0/total` for the whole multi-hour Debug pass.
   @discardableResult
-  func embedDerivativeSource(bookID: String, batchSize: Int = 200) throws -> SourceEmbeddingStatus {
+  func embedDerivativeSource(
+    bookID: String,
+    batchSize: Int = 200,
+    onProgress: (@Sendable (SourceEmbeddingStatus) async -> Void)? = nil
+  ) async throws -> SourceEmbeddingStatus {
     let manifest = try loadSourceManifest(bookID: bookID)
     _ = try validateSourceSearchIndex(bookID: bookID, manifest: manifest)
     let index = try SourceSearchIndex(path: try sourceIndexURL(bookID).path, reset: false)
     defer { index.close() }
+    func status(embedded: Int, total: Int, available: Bool) -> SourceEmbeddingStatus {
+      SourceEmbeddingStatus(embedded: embedded, total: total, semanticAvailable: available)
+    }
     guard #available(macOS 14.0, *) else {
       let coverage = try index.vectorCoverage()
       recordDebug(scope: "derivative", message: "source.semantic_unsupported", level: "warning", data: [
         "bookId": bookID,
         "reason": "语义模型需要 macOS 14 及以上，检索退化为纯 BM25。",
       ])
-      return SourceEmbeddingStatus(
-        embedded: coverage.embedded,
-        total: coverage.total,
-        semanticAvailable: false
-      )
+      let result = status(embedded: coverage.embedded, total: coverage.total, available: false)
+      await onProgress?(result)
+      return result
     }
+    var coverage = try index.vectorCoverage()
+    await onProgress?(status(embedded: coverage.embedded, total: coverage.total, available: true))
     let embedder = try SourceEmbedder()
     var embedded = 0
     var failed = 0
@@ -1570,8 +1974,11 @@ extension InkOSCore {
         )
       }
       try index.commitTransaction()
+      coverage = try index.vectorCoverage()
+      await onProgress?(status(embedded: coverage.embedded, total: coverage.total, available: true))
+      await Task.yield()
     }
-    let coverage = try index.vectorCoverage()
+    coverage = try index.vectorCoverage()
     recordDebug(scope: "derivative", message: "source.embedded", data: [
       "bookId": bookID,
       "embeddedThisPass": embedded,
@@ -1579,11 +1986,9 @@ extension InkOSCore {
       "coverage": "\(coverage.embedded)/\(coverage.total)",
       "dimension": embedder.dimension,
     ])
-    return SourceEmbeddingStatus(
-      embedded: coverage.embedded,
-      total: coverage.total,
-      semanticAvailable: true
-    )
+    let result = status(embedded: coverage.embedded, total: coverage.total, available: true)
+    await onProgress?(result)
+    return result
   }
 
   func derivativeSourceEmbeddingStatus(bookID: String) throws -> SourceEmbeddingStatus {
