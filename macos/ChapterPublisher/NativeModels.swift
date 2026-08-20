@@ -515,6 +515,12 @@ struct DebugEventsResponse: Codable, Sendable {
 // MARK: - InkOS model configuration
 
 struct InkOSConfig: Codable, Equatable, Sendable {
+  static let defaultContextWindow = 200_000
+  static let defaultMaxTokens = 16_384
+  static let minimumContextWindow = 4_096
+  static let maximumContextWindow = 2_000_000
+  static let minimumMaxTokens = 256
+
   let provider: String
   let model: String
   let reviewModel: String
@@ -525,7 +531,8 @@ struct InkOSConfig: Codable, Equatable, Sendable {
   let apiFormat: String
   let stream: Bool?
   let temperature: Double?
-  let maxTokens: Int?
+  let contextWindow: Int
+  let maxTokens: Int
   let thinkingBudget: Int
   let source: String?
   let hasApiKey: Bool
@@ -543,7 +550,7 @@ struct InkOSConfig: Codable, Equatable, Sendable {
   private enum CodingKeys: String, CodingKey {
     case provider, model, reviewModel, extractionModel, baseUrl, reviewBaseUrl
     case extractionBaseUrl, apiFormat, stream
-    case temperature, maxTokens, thinkingBudget, source, hasApiKey, apiKeyPreview
+    case temperature, contextWindow, maxTokens, thinkingBudget, source, hasApiKey, apiKeyPreview
     case hasReviewApiKey, reviewApiKeyPreview, hasExtractionApiKey, extractionApiKeyPreview
     case apiKey, reviewApiKey, extractionApiKey
   }
@@ -560,7 +567,9 @@ struct InkOSConfig: Codable, Equatable, Sendable {
     apiFormat = try values.decodeIfPresent(String.self, forKey: .apiFormat) ?? "chat"
     stream = try values.decodeIfPresent(Bool.self, forKey: .stream)
     temperature = try values.decodeIfPresent(Double.self, forKey: .temperature)
-    maxTokens = try values.decodeIfPresent(Int.self, forKey: .maxTokens)
+    contextWindow =
+      try values.decodeIfPresent(Int.self, forKey: .contextWindow) ?? Self.defaultContextWindow
+    maxTokens = try values.decodeIfPresent(Int.self, forKey: .maxTokens) ?? Self.defaultMaxTokens
     thinkingBudget = try values.decodeIfPresent(Int.self, forKey: .thinkingBudget) ?? 0
     source = try values.decodeIfPresent(String.self, forKey: .source)
     hasApiKey = try values.decodeIfPresent(Bool.self, forKey: .hasApiKey) ?? false
@@ -589,7 +598,8 @@ struct InkOSConfig: Codable, Equatable, Sendable {
     try values.encode(apiFormat, forKey: .apiFormat)
     try values.encodeIfPresent(stream, forKey: .stream)
     try values.encodeIfPresent(temperature, forKey: .temperature)
-    try values.encodeIfPresent(maxTokens, forKey: .maxTokens)
+    try values.encode(contextWindow, forKey: .contextWindow)
+    try values.encode(maxTokens, forKey: .maxTokens)
     try values.encode(thinkingBudget, forKey: .thinkingBudget)
     try values.encodeIfPresent(source, forKey: .source)
     try values.encode(hasApiKey, forKey: .hasApiKey)
@@ -617,6 +627,7 @@ struct InkOSConfigUpdate: Encodable, Sendable, CustomStringConvertible {
   let stream: Bool
   let thinkingBudget: Int
   let temperature: Double?
+  let contextWindow: Int?
   let maxTokens: Int?
 
   init(
@@ -632,6 +643,7 @@ struct InkOSConfigUpdate: Encodable, Sendable, CustomStringConvertible {
     stream: Bool = false,
     thinkingBudget: Int = 0,
     temperature: Double? = nil,
+    contextWindow: Int? = nil,
     maxTokens: Int? = nil
   ) {
     self.model = model
@@ -646,6 +658,7 @@ struct InkOSConfigUpdate: Encodable, Sendable, CustomStringConvertible {
     self.stream = stream
     self.thinkingBudget = thinkingBudget
     self.temperature = temperature
+    self.contextWindow = contextWindow
     self.maxTokens = maxTokens
   }
 

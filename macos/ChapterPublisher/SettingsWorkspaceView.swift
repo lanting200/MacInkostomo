@@ -310,6 +310,8 @@ struct SettingsWorkspaceView: View {
   @State private var stream = false
   @State private var thinkingBudget = 0
   @State private var temperature = 0.2
+  @State private var contextWindow = InkOSConfig.defaultContextWindow
+  @State private var maxTokens = InkOSConfig.defaultMaxTokens
   @State private var chapterModels: [RemoteModel] = []
   @State private var reviewModels: [RemoteModel] = []
   @State private var extractionModels: [RemoteModel] = []
@@ -851,6 +853,46 @@ struct SettingsWorkspaceView: View {
 
         Divider()
 
+        NativeSectionHeader("请求预算")
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 10) {
+          GridRow {
+            Text("上下文窗口").frame(width: 92, alignment: .trailing)
+            HStack(spacing: 8) {
+              TextField(
+                "200000",
+                value: $contextWindow,
+                format: IntegerFormatStyle<Int>().grouping(.never)
+              )
+              .textFieldStyle(.roundedBorder)
+              .frame(width: 120)
+              Text("tokens")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+          }
+          GridRow {
+            Text("最大输出").frame(width: 92, alignment: .trailing)
+            HStack(spacing: 8) {
+              TextField(
+                "16384",
+                value: $maxTokens,
+                format: IntegerFormatStyle<Int>().grouping(.never)
+              )
+              .textFieldStyle(.roundedBorder)
+              .frame(width: 120)
+              Text("tokens")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+          }
+        }
+        Text("默认 200000 / 16384。上下文按剩余输入预算裁剪提示词；最大输出写入请求的 max_tokens。空回复会按现有规则加倍重试，不超过 65536。")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+
+        Divider()
+
         HStack(spacing: 22) {
           Toggle("流式输出", isOn: $stream)
           Stepper("思考预算 \(thinkingBudget)", value: $thinkingBudget, in: 0...100_000, step: 128)
@@ -1240,6 +1282,8 @@ struct SettingsWorkspaceView: View {
     stream = config.stream ?? false
     thinkingBudget = config.thinkingBudget
     temperature = config.temperature ?? 0.2
+    contextWindow = config.contextWindow
+    maxTokens = config.maxTokens
     apiKey = ""
     reviewAPIKey = ""
     extractionAPIKey = ""
@@ -1373,7 +1417,9 @@ struct SettingsWorkspaceView: View {
       extractionApiKey: extractionAPIKey,
       stream: stream,
       thinkingBudget: thinkingBudget,
-      temperature: temperature
+      temperature: temperature,
+      contextWindow: contextWindow,
+      maxTokens: maxTokens
     )
     Task { _ = await model.saveInkOSConfig(update) }
   }
@@ -1389,7 +1435,11 @@ struct SettingsWorkspaceView: View {
       !chapter.baseURL.isEmpty,
       !chapter.model.isEmpty,
       !review.baseURL.isEmpty,
-      !review.model.isEmpty
+      !review.model.isEmpty,
+      contextWindow >= InkOSConfig.minimumContextWindow,
+      contextWindow <= InkOSConfig.maximumContextWindow,
+      maxTokens >= InkOSConfig.minimumMaxTokens,
+      maxTokens < contextWindow
     else { return false }
 
     guard let config = model.inkOSConfig else {

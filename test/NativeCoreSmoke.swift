@@ -738,7 +738,8 @@ struct NativeCoreSmoke {
     precondition(paddedRejected, "punctuation-padded chapter must fail the density floor")
 
     // Deterministic craft checks reject ledger blocks, diary-like absolute day
-    // labels, fade-out endings and ability-free openings before the review pass.
+    // labels, fade-out endings, stacked AI-prose tics, and ability-free openings
+    // before the review pass.
     var ledgerRejected = false
     do {
       try await core.validateChapterCraft(
@@ -864,6 +865,58 @@ struct NativeCoreSmoke {
       chapterNumber: 4,
       label: "正文"
     )
+
+    // Tieba / NGA AI-prose tics: stacked 不是……而是…… in narration is a tell;
+    // a single use, or the same cadence inside quoted speech, is not.
+    var negationCorrectionRejected = false
+    do {
+      try await core.validateChapterCraft(
+        "这不是混乱，而是秩序重新形成前的失控。\n他握紧的不是剑，而是十年的执念。\n"
+          + String(repeating: "字", count: 300),
+        chapterNumber: 4,
+        label: "正文"
+      )
+    } catch {
+      negationCorrectionRejected = true
+    }
+    precondition(negationCorrectionRejected, "stacked 不是……而是…… in narration must be rejected")
+
+    try await core.validateChapterCraft(
+      "这不是混乱，而是他听错了风声。\n" + String(repeating: "字", count: 300),
+      chapterNumber: 4,
+      label: "正文"
+    )
+    try await core.validateChapterCraft(
+      "她说：“这不是混乱，而是你想太多。”他又说：“不是怕，而是还没想好。”\n"
+        + String(repeating: "字", count: 300),
+      chapterNumber: 4,
+      label: "正文"
+    )
+
+    var atmosphereRejected = false
+    do {
+      try await core.validateChapterCraft(
+        "空气仿佛凝固。他心中暗道：完了。\n" + String(repeating: "字", count: 300),
+        chapterNumber: 4,
+        label: "正文"
+      )
+    } catch {
+      atmosphereRejected = true
+    }
+    precondition(atmosphereRejected, "stacked atmosphere clichés must be rejected")
+
+    var intensifierRejected = false
+    do {
+      try await core.validateChapterCraft(
+        "极其安静，极其缓慢，极其清楚，极其沉重，极其多余。\n"
+          + String(repeating: "字", count: 300),
+        chapterNumber: 4,
+        label: "正文"
+      )
+    } catch {
+      intensifierRejected = true
+    }
+    precondition(intensifierRejected, "极其 stacking must be rejected")
 
     // Runtime state files must reflect approved progress, not the creation-time
     // placeholders.
@@ -1161,6 +1214,14 @@ struct NativeCoreSmoke {
       )
       precondition(!inherited.hasExtractionApiKey)
       precondition(inherited.extractionApiKeyPreview.isEmpty)
+      precondition(
+        inherited.contextWindow == InkOSConfig.defaultContextWindow,
+        "an unset context window must report 200000"
+      )
+      precondition(
+        inherited.maxTokens == InkOSConfig.defaultMaxTokens,
+        "an unset maxTokens must report 16384"
+      )
 
       let applied = try await extractionCore.updateInkOSConfig(
         InkOSConfigUpdate(
@@ -1219,6 +1280,8 @@ struct NativeCoreSmoke {
       )
       print("Extraction model role probe passed")
     }
+
+    try await assertLLMRequestBudgetConfig(root: root)
 
     do {
       let automaticRoot = root.appendingPathComponent("automatic-revision", isDirectory: true)
@@ -3892,6 +3955,86 @@ struct NativeCoreSmoke {
 
     print("Canon extraction probe passed: preface + 3 batches, entity de-dup + resume + overlay precedence")
     _ = try await core.deleteBook(id: bookID)
+  }
+
+  /// Context window and max output tokens are shared LLM settings. Missing file
+  /// keys must surface as 200 000 / 16 384, persist when saved, shrink story
+  /// context on a tight window, and send `max_tokens: 16384` even when the file
+  /// never stored the key — omitting it used to leave the request unbounded.
+  private static func assertLLMRequestBudgetConfig(root: URL) async throws {
+    precondition(
+      InkOSCore.resolvedContextWindow([:]) == InkOSConfig.defaultContextWindow
+    )
+    precondition(InkOSCore.resolvedMaxTokens([:]) == InkOSConfig.defaultMaxTokens)
+    precondition(
+      InkOSCore.storyContextCharacterBudget(base: 60_000, raw: [:]) == 60_000,
+      "a 200k window must keep the historical 60k story-context share"
+    )
+    let tight: [String: Any] = ["contextWindow": 32_000, "maxTokens": 16_000]
+    precondition(
+      InkOSCore.storyContextCharacterBudget(base: 100_000, raw: tight) == 9_600,
+      "a 32k window with 16k output must cap story context to 60% of remaining input"
+    )
+    let overflow: [String: Any] = ["contextWindow": 8_192, "maxTokens": 16_384]
+    precondition(
+      InkOSCore.resolvedMaxTokens(overflow) == 8_192 - 1_024,
+      "output must leave prompt room inside the context window"
+    )
+
+    let emptyRoot = root.appendingPathComponent("llm-budget-defaults", isDirectory: true)
+    let emptyCore = InkOSCore(rootURL: emptyRoot)
+    let fetched = try await emptyCore.fetchInkOSConfig()
+    precondition(fetched.contextWindow == InkOSConfig.defaultContextWindow)
+    precondition(fetched.maxTokens == InkOSConfig.defaultMaxTokens)
+
+    let applied = try await emptyCore.updateInkOSConfig(
+      InkOSConfigUpdate(
+        model: "writer-test",
+        reviewModel: "reviewer-test",
+        baseUrl: "https://example.invalid/v1",
+        reviewBaseUrl: "https://example.invalid/v1",
+        contextWindow: 128_000,
+        maxTokens: 8_192
+      )
+    )
+    precondition(applied.ok)
+    precondition(applied.fields.contains("contextWindow"))
+    precondition(applied.fields.contains("maxTokens"))
+    let saved = try await emptyCore.fetchInkOSConfig()
+    precondition(saved.contextWindow == 128_000)
+    precondition(saved.maxTokens == 8_192)
+
+    let requestRoot = root.appendingPathComponent("llm-budget-default-request", isDirectory: true)
+    let requestCore = InkOSCore(rootURL: requestRoot)
+    let config: [String: Any] = [
+      "provider": "openai",
+      "model": "writer-test",
+      "reviewModel": "reviewer-test",
+      "baseUrl": "http://127.0.0.1:8765/v1",
+      "reviewBaseUrl": "http://127.0.0.1:8765/v1",
+      "apiKey": "test-key",
+      "reviewApiKey": "test-key",
+      "stream": false,
+      "thinkingBudget": 0,
+      "apiFormat": "chat",
+    ]
+    try JSONSerialization.data(withJSONObject: config)
+      .write(to: requestRoot.appendingPathComponent("data/inkos-config.json"), options: .atomic)
+
+    URLProtocol.registerClass(AutomatedRevisionLLMProtocol.self)
+    defer {
+      URLProtocol.unregisterClass(AutomatedRevisionLLMProtocol.self)
+      AutomatedRevisionLLMProtocol.configure([])
+    }
+    AutomatedRevisionLLMProtocol.configure([
+      AutomatedRevisionStubResponse(content: "{\"ok\":true}", stream: false),
+    ])
+    _ = try await requestCore.requestLLM(prompt: "只输出 ok", role: .primary, json: true)
+    precondition(
+      AutomatedRevisionLLMProtocol.observedMaxTokens() == [InkOSConfig.defaultMaxTokens],
+      "unset maxTokens must still send 16384, saw \(AutomatedRevisionLLMProtocol.observedMaxTokens())"
+    )
+    print("LLM request budget config probe passed")
   }
 
   /// A completion that ran out of budget — no prose at all, or JSON cut off

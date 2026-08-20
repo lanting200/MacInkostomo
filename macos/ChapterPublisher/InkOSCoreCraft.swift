@@ -11,6 +11,12 @@ extension InkOSCore {
   static let chapterBeatOpenHookLimit = 24
   static let chapterBeatOpenHooksMaxCharacters = 4_800
   static let chapterBeatOpenHookDescriptionMaxCharacters = 180
+  /// Narration-only density caps for the AI-prose tics readers on Tieba/NGA
+  /// treat as an immediate tell. One occurrence is human; repeating them in a
+  /// single chapter is the fingerprint.
+  static let aiNegationCorrectionLimit = 2
+  static let aiStockClichéLimit = 2
+  static let aiIntensifierLimit = 5
 
   /// Non-removable craft rules. The editable per-book file can extend these but
   /// never replace them, because these are the constraints that keep a chapter
@@ -28,6 +34,7 @@ extension InkOSCore {
     9 篇幅：正文字数必须落在本章计划区间内。靠场景展开、对话和细节达到字数，禁止靠编号清单、条目化盘点、备忘录正文和资料登记堆字数；此类内容单章合计不超过 200 字。
     10 排期：只写本章节拍卡列出的内容。节拍卡未列出的后续剧情、副本、任务、地点、人物、物品和能力，不得提前出现、提前获得或提前解决。
     11 主角情感显影：主角每章至少要有一个与推进剧情无关的情绪泄底时刻——恐惧、疲惫、犹豫、馋、疼、想念、自嘲或没来由的恼火，篇幅可以很小但不能没有。情绪只用三种载体呈现：生理反应（胃部收紧、后颈出汗、手指发抖）、动作泄底（反复检查、把东西摆了又摆、话到嘴边改口）、对话失态（音量变化、说半句停住、开不合时宜的玩笑）。禁止用“他很害怕”“他很难过”这类情绪标签直接命名。主角不能全程最优解：每章至少一次让情绪压过理性判断半步，代价可以很小，但必须是他“忍不住”。冷幽默是主角的防御机制，不是情感的替代品——玩笑落地时，要让读者看见他在防什么。
+    12 去 AI 腔：叙述里禁止反复使用「不是X，而是Y / 不仅仅是X，更是Y」否定修正句，禁止堆「空气凝固」「时间静止」「心中暗道/一凛」「宛如投石」套喻，禁止把「极其」当形容词刷屏。直接写发生了什么。对白里角色这样说可以保留；否定修正句和套喻叙述偶发一次可以、两次及以上退稿，「极其」五次及以上退稿。
     """
 
   /// Extra constraints for the first chapters, where the failure mode is
@@ -55,6 +62,7 @@ extension InkOSCore {
     - 以动作、对话和可感知细节推进，形容词和评语克制。
     - 人物说话符合其身份、处境和情绪，不同角色的语言习惯要能区分。
     - 避免成语堆砌、口号式收尾和对主角的直接夸赞。
+    - 叙述避免「不是……而是……」对照句和空气凝固一类套喻；对白不受此限。
 
     ## 禁止
     - 禁止用清单、表格、备忘录和资料登记块承担叙事功能。
@@ -815,6 +823,7 @@ extension InkOSCore {
     try rejectLedgerBlocks(content, chapterNumber: chapterNumber, label: label)
     try rejectAbsoluteDayLabels(content, chapterNumber: chapterNumber, label: label)
     try rejectAphoristicEnding(content, chapterNumber: chapterNumber, label: label)
+    try rejectAIProseTells(content, chapterNumber: chapterNumber, label: label)
     if chapterNumber <= 3 {
       let openingArc = [openingContext, content]
         .filter { !$0.isEmpty }
@@ -946,6 +955,76 @@ extension InkOSCore {
         statusCode: 422
       )
     }
+  }
+
+  /// Reader-facing AI tells collected from Tieba / NGA / 刺猬猫吧: the
+  /// negation-correction cadence, frozen atmosphere similes, and 极其-stacking.
+  /// Counted in narration only — quoted speech keeps ordinary argument.
+  private func rejectAIProseTells(
+    _ content: String,
+    chapterNumber: Int,
+    label: String
+  ) throws {
+    let narration = narrationWithoutDialogue(content)
+    let corrections = countNegationCorrections(in: narration)
+    if corrections >= Self.aiNegationCorrectionLimit {
+      throw InkOSCoreError(
+        "第\(chapterNumber)章\(label)叙述中反复使用「不是……而是……」否定修正句（\(corrections) 处）。读者把这种句式当成 AI 口癖；请改成直接陈述发生了什么。对白里角色这样说可以保留。",
+        statusCode: 422
+      )
+    }
+    let cliches = countStockAtmosphereCliches(in: narration)
+    if cliches >= Self.aiStockClichéLimit {
+      throw InkOSCoreError(
+        "第\(chapterNumber)章\(label)叙述中堆叠了空气凝固、时间静止、心中暗道/一凛、宛如投石一类套喻（\(cliches) 处）。请改成可观察的动作或环境细节。",
+        statusCode: 422
+      )
+    }
+    let intensifiers = countRegularExpressionMatches(in: narration, pattern: "极其")
+    if intensifiers >= Self.aiIntensifierLimit {
+      throw InkOSCoreError(
+        "第\(chapterNumber)章\(label)叙述中「极其」出现 \(intensifiers) 次。这是贴吧读者点名的 AI 刷词；请删掉或换成具体程度。",
+        statusCode: 422
+      )
+    }
+  }
+
+  /// Drops quoted speech so a character arguing “不是A，而是B” does not trip
+  /// the narration density cap.
+  private func narrationWithoutDialogue(_ content: String) -> String {
+    var text = content
+    let patterns = [#"「[^」]*」"#, #"『[^』]*』"#, #"“[^”]*”"#, #""[^"]*""#]
+    for pattern in patterns {
+      text = text.replacingOccurrences(of: pattern, with: " ", options: .regularExpression)
+    }
+    return text
+  }
+
+  private func countNegationCorrections(in text: String) -> Int {
+    let patterns = [
+      #"不是.{0,30}(?:而是|，是|。是|，却是)"#,
+      #"并非.{0,24}而是"#,
+      #"不仅仅是.{0,24}(?:更是|而是)"#,
+      #"不只是.{0,24}(?:更是|而是)"#,
+    ]
+    return patterns.reduce(0) { $0 + countRegularExpressionMatches(in: text, pattern: $1) }
+  }
+
+  private func countStockAtmosphereCliches(in text: String) -> Int {
+    let patterns = [
+      #"空气(?:仿佛|好像)?(?:瞬间)?(?:为之一)?(?:凝固|静得)"#,
+      #"时间(?:仿佛|好像)?(?:静止|停(?:滞|住|了))"#,
+      #"心中(?:暗道|暗想|一凛|猛地一凛)"#,
+      #"(?:宛如|如同|好似)投石"#,
+      #"投石(?:问路|入水|入湖)"#,
+    ]
+    return patterns.reduce(0) { $0 + countRegularExpressionMatches(in: text, pattern: $1) }
+  }
+
+  private func countRegularExpressionMatches(in text: String, pattern: String) -> Int {
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return 0 }
+    let range = NSRange(text.startIndex..., in: text)
+    return regex.numberOfMatches(in: text, options: [], range: range)
   }
 
   /// The opening arc must establish the protagonist's core ability at least

@@ -248,6 +248,13 @@ half-built features read as done.
   Relative transitions such as `第二天一早` and dates cited by a character from
   dialogue, a ledger, or resource arithmetic remain valid; the story clock is
   owned by `storyDays`, not exposed as narrator-maintained day numbers.
+- AI-prose tics that Tieba / NGA readers treat as an immediate tell are blocked
+  the same way, counted in narration only: two or more `不是…而是…` /
+  `不仅仅是…更是…` negation-corrections, two or more frozen atmosphere
+  templates (`空气凝固`, `时间静止`, `心中暗道`/`一凛`, `宛如投石`), or five or
+  more `极其`. Quoted speech is stripped first so a character arguing the
+  cadence does not fail the chapter. The review prompt repeats these as
+  `[hard][prose]`.
 - Local rules validate cross-chapter order, entity admission, deletion targets, and
   immutable conflicts before an independent model jointly reviews the text, the
   candidate delta, and the post-application continuity index. The review prompt
@@ -385,6 +392,13 @@ exist: `chapter`/`primary`, `review`, and `extraction`.
 - `extraction` backs the RAG model setting and is consumed by
   `extractDerivativeCanon` and `extractDerivativeSettingsOverlay` in
   `InkOSCoreCanon.swift`. Nothing else issues `role: .extraction`.
+- **Context window and max output tokens are shared, not per-role.** Defaults
+  are 200 000 (`contextWindow`) and 16 384 (`maxTokens`). `fetchInkOSConfig`
+  reports those defaults when the file omits the keys; `updateInkOSConfig` and
+  the settings page persist both. `requestLLM` always sends `max_tokens` — a
+  missing file key uses 16 384 rather than omitting the field. `storyContext`
+  keeps the historical 60k/80k/100k character shares on a 200k window, and
+  shrinks them when remaining input tokens cannot hold that share.
 
 - **An empty completion is retried at a doubled `max_tokens`, not at the same one.**
   A reasoning model bills `reasoning_content` against the same ceiling as the prose

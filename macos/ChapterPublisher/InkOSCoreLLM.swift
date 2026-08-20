@@ -27,6 +27,32 @@ extension InkOSCore {
   /// prompt was 16 383 tokens with roughly 10 000 tokens of JSON still to write.
   static let maxTokensRetryCeiling = 65_536
 
+  static func resolvedContextWindow(_ raw: [String: Any]) -> Int {
+    let value = integer(raw["contextWindow"]) ?? 0
+    if value <= 0 { return InkOSConfig.defaultContextWindow }
+    return min(max(value, InkOSConfig.minimumContextWindow), InkOSConfig.maximumContextWindow)
+  }
+
+  /// Output ceiling sent as `max_tokens`. Missing or invalid values become 16 384.
+  /// Capped so at least 1 024 tokens remain for the prompt inside `contextWindow`.
+  static func resolvedMaxTokens(_ raw: [String: Any]) -> Int {
+    let window = resolvedContextWindow(raw)
+    let value = integer(raw["maxTokens"]) ?? 0
+    let requested = value > 0 ? value : InkOSConfig.defaultMaxTokens
+    let cap = max(InkOSConfig.minimumMaxTokens, window - 1_024)
+    return min(max(requested, InkOSConfig.minimumMaxTokens), cap)
+  }
+
+  /// Caps the historical story-context character share against remaining input
+  /// tokens. Chinese-heavy prompts are treated as ~1 character per token so a
+  /// small window cannot overfill the model; a 200k window leaves the existing
+  /// 60k/80k/100k bases unchanged.
+  static func storyContextCharacterBudget(base: Int, raw: [String: Any]) -> Int {
+    let inputTokens = max(2_048, resolvedContextWindow(raw) - resolvedMaxTokens(raw))
+    let cap = inputTokens * 6 / 10
+    return max(4_000, min(base, cap))
+  }
+
   enum LLMRole: Sendable {
     case primary
     case review
@@ -83,7 +109,8 @@ extension InkOSCore {
       "apiFormat": "chat",
       "stream": (raw["stream"] as? Bool) ?? false,
       "temperature": raw["temperature"] ?? NSNull(),
-      "maxTokens": raw["maxTokens"] ?? NSNull(),
+      "contextWindow": Self.resolvedContextWindow(raw),
+      "maxTokens": Self.resolvedMaxTokens(raw),
       "thinkingBudget": 0,
       "source": "native-inkos-core",
       "hasApiKey": !primaryKey.isEmpty,
@@ -126,15 +153,21 @@ extension InkOSCore {
         .trimmingCharacters(in: .whitespacesAndNewlines)
     }
     if let temperature = input.temperature { raw["temperature"] = temperature }
+    if let contextWindow = input.contextWindow { raw["contextWindow"] = contextWindow }
     if let maxTokens = input.maxTokens { raw["maxTokens"] = maxTokens }
+    raw["contextWindow"] = Self.resolvedContextWindow(raw)
+    raw["maxTokens"] = Self.resolvedMaxTokens(raw)
     try writeJSON(raw, to: configURL, privateFile: true)
     recordDebug(scope: "config", message: "llm.config.updated", data: [
       "model": string(raw["model"]), "reviewModel": string(raw["reviewModel"]),
       "extractionModel": string(raw["extractionModel"]),
+      "contextWindow": raw["contextWindow"] ?? NSNull(),
+      "maxTokens": raw["maxTokens"] ?? NSNull(),
     ])
     let fields = [
       "model", "reviewModel", "extractionModel", "baseUrl", "reviewBaseUrl",
-      "extractionBaseUrl", "stream", "thinkingBudget", "temperature", "maxTokens",
+      "extractionBaseUrl", "stream", "thinkingBudget", "temperature",
+      "contextWindow", "maxTokens",
     ]
     return InkOSConfigApplyResponse(ok: true, applied: fields.count, fields: fields, errors: [])
   }
@@ -658,6 +691,7 @@ extension InkOSCore {
       #"正文[^。；\n]{0,20}(时间|时刻|时序)[^。；\n]{0,12}(超出|不符|错|矛盾|推后|提前)"#,
       #"(时间|时刻|时序)[^。；\n]{0,12}(口径)?[^。；\n]{0,8}不一致"#,
       #"(清单|条目化|备忘录|盘点块)[^。；\n]{0,12}(叙事|承担|铺陈|呈现)"#,
+      #"(不是.{0,8}而是|否定修正|空气凝固|时间静止|心中暗道|心中一凛)"#,
     ]
     if structuralCraftPatterns.contains(where: {
       lowered.range(of: $0, options: .regularExpression) != nil
@@ -1504,7 +1538,11 @@ extension InkOSCore {
           + "必须用真实的场景、动作与对话补足，不能靠标点、空行或符号堆砌。"
         : "另需保证中文字符不少于 \(bodyFloor) 个（当前 \(currentBodyCount) 个），标点与空行不计入密度。"
       let craft = try craftDirectives(bookID: bookID, chapterNumber: baseChapter.number)
-      let context = try storyContext(bookID: bookID, maxCharacters: 60_000, plan: plan)
+      let context = try storyContext(
+        bookID: bookID,
+        maxCharacters: try storyContextCharacterBudget(base: 60_000),
+        plan: plan
+      )
       // Include the tail of the preceding chapter so the model can see the
       // continuity anchor it must connect to. Generation prompts have always
       // carried the full previous chapter; revision prompts historically did
@@ -2166,7 +2204,11 @@ extension InkOSCore {
     // the revision prompt only "suggested" trimming that range.
     let reviewCeiling = maxWords + max(200, maxWords / 10)
     let previous = chapterNumber > 1 ? (try? readChapterText(bookID: bookID, number: chapterNumber - 1)) ?? "" : ""
-    let context = try storyContext(bookID: bookID, maxCharacters: 80_000, plan: plan)
+    let context = try storyContext(
+      bookID: bookID,
+      maxCharacters: try storyContextCharacterBudget(base: 80_000),
+      plan: plan
+    )
     let craft = try craftDirectives(bookID: bookID, chapterNumber: chapterNumber)
     let deltaJSON = String(data: try encoder.encode(candidateDelta), encoding: .utf8) ?? "{}"
     let projectedJSON = String(data: try encoder.encode(projected), encoding: .utf8) ?? "{}"
@@ -2192,12 +2234,13 @@ extension InkOSCore {
       章末必须停在节拍卡声明的选择、反转、倒计时或新信息上。若以总结、氛围淡出、格言独白或"安心睡去"式收尾收束全章，记为 hard。
       正文不得用清单、备忘录、条目化盘点或资料登记块承担叙事。主角本人的账本记录也只能以动作与判断混合的方式呈现，不能以并列条目铺陈，出现记为 hard。
       正文不得以“第28天”“雨季第28天”这类绝对纪日标签开篇、另起段落或在句间替读者报日序，出现记为 hard；“第二天一早”等相对时间过渡，以及角色在对话、台账或物资心算中引用日期不在此限。
+      叙述中「不是……而是……」「不仅仅是……更是……」否定修正句，或空气凝固、时间静止、心中暗道/一凛、宛如投石一类套喻，单章出现两次及以上记为 hard；「极其」在叙述中出现五次及以上同样记为 hard。对白里角色口吻可保留。
       第 1 至 3 章作为开篇段整体必须至少建立一次主角核心能力或金手指锚点：异常征兆、首次显现或章末触发均可。前章已经建立后，当前章无需重复；节拍卡明确禁止能力显现时，以禁止清单为准，不得为了重复锚点提前能力。仅在截至当前章整个开篇段仍完全没有锚点时记为 hard。
       环境状态与资源可用性必须前后一致：此前章节或本章前文确立的中断、不可用或耗尽状态（断信号、断电、断水、封路、资源耗尽、设施损坏等），后文不得在没有恢复、替代或解释的情况下当作可用。同章之内自相矛盾（如先说信号彻底没了、后文又收到群视频）同样记为 hard。
       \(derivative.reviewRule)
       以上任一问题输出前缀 [hard]，并紧跟一个修复范围标签，二者只能选一个：
       [delta]：只需改候选 consistencyDelta 就能消除该问题，正文不必改动一个字。正文写对了、只是没登记进 Delta（如实体 attributes 为空、漏登 upsert、时间线 order 排序错误、删除目标不存在、type 取值不规范）都属于此类；即使你在描述中引用正文作为"应当登记什么"的依据，只要正文本身无需修改，就必须标 [delta]。
-      [prose]：必须改动正文才能消除该问题（字数不足或超限、章末收尾方式违规、条目化叙事、节拍卡禁止内容、正文与既有设定直接冲突、正文数字与已登记消耗不符、正文写了无依据的细节）。
+      [prose]：必须改动正文才能消除该问题（字数不足或超限、章末收尾方式违规、条目化叙事、否定修正句或空气凝固一类 AI 套话、节拍卡禁止内容、正文与既有设定直接冲突、正文数字与已登记消耗不符、正文写了无依据的细节）。
       标签决定系统走"只补登记"还是"重写正文"：把只需补登记的问题标成 [prose]，会让系统重写一篇本来正确的正文，属于严重误导。
 
       第二类：写法质量（不阻断）。依据下方写法内核与本书写法约束检查：
@@ -2477,7 +2520,11 @@ extension InkOSCore {
       \(entityIDRegistryText(plan.continuity))
 
       【权威设定与当前状态】
-      \(try storyContext(bookID: bookID, maxCharacters: 100_000, plan: plan))\(derivative.source)
+      \(try storyContext(
+        bookID: bookID,
+        maxCharacters: try storyContextCharacterBudget(base: 100_000),
+        plan: plan
+      ))\(derivative.source)
 
       【上一章全文】
       \(previous)
@@ -2708,6 +2755,10 @@ extension InkOSCore {
     return sections.joined(separator: "\n\n")
   }
 
+  private func storyContextCharacterBudget(base: Int) throws -> Int {
+    Self.storyContextCharacterBudget(base: base, raw: try loadRawConfig())
+  }
+
   func persistConsistencyDelta(
     bookID: String,
     chapterNumber: Int,
@@ -2827,16 +2878,12 @@ extension InkOSCore {
       body["temperature"] = temperature.doubleValue
     }
     // `buildRequest` owns the `max_tokens` key so a retry can raise it.
-    let configuredMaxTokens = integer(raw["maxTokens"]).flatMap { $0 > 0 ? $0 : nil }
+    let configuredMaxTokens = Self.resolvedMaxTokens(raw)
     if json { body["response_format"] = ["type": "json_object"] }
 
-    func buildRequest(maxTokens: Int?) throws -> URLRequest {
+    func buildRequest(maxTokens: Int) throws -> URLRequest {
       var body = body
-      if let maxTokens {
-        body["max_tokens"] = maxTokens
-      } else {
-        body.removeValue(forKey: "max_tokens")
-      }
+      body["max_tokens"] = maxTokens
       var request = URLRequest(url: url, timeoutInterval: timeout)
       request.httpMethod = "POST"
       request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -2959,14 +3006,14 @@ extension InkOSCore {
         // Chapter 1 of 《灰雾之前》 failed three times with `stop` and 11k-14k
         // characters of reasoning, took the transient path, and re-ran at the
         // identical ceiling all three times.
-        let raisable = lastAttemptNeedsMoreBudget && budget != nil
+        let raisable = lastAttemptNeedsMoreBudget
         guard transient || raisable, attempt < maxAttempts else { throw error }
         var raisedTo: Int? = nil
-        if raisable, let current = budget {
-          let raised = Swift.min(current * 2, Self.maxTokensRetryCeiling)
+        if raisable {
+          let raised = Swift.min(budget * 2, Self.maxTokensRetryCeiling)
           // Already at the ceiling: doubling changes nothing, so stop rather than
           // spend another full reasoning pass on the identical request.
-          guard raised > current else { throw error }
+          guard raised > budget else { throw error }
           budget = raised
           raisedTo = raised
         }
@@ -2990,6 +3037,8 @@ extension InkOSCore {
         "provider": "openai", "model": "gpt-5.6-terra", "reviewModel": "gpt-5.6-terra",
         "baseUrl": "", "reviewBaseUrl": "", "apiKey": "", "reviewApiKey": "",
         "stream": false, "thinkingBudget": 0, "apiFormat": "chat",
+        "contextWindow": InkOSConfig.defaultContextWindow,
+        "maxTokens": InkOSConfig.defaultMaxTokens,
       ]
     }
     return try readObject(configURL)
@@ -3652,8 +3701,8 @@ extension InkOSCore {
     if reasoningCharacters > 0 { message += "，推理另占 \(reasoningCharacters) 字符" }
     message += "）。"
     message += reasoningCharacters > 0
-      ? "该模型是推理模型，reasoning_content 与正文共用同一预算；请在设置中调大「最大 token」，或改用非推理模型。"
-      : "请在设置中调大「最大 token」。"
+      ? "该模型是推理模型，reasoning_content 与正文共用同一预算；请在设置中调大「最大输出 token」，或改用非推理模型。"
+      : "请在设置中调大「最大输出 token」。"
     return InkOSCoreError(message, statusCode: 422)
   }
 
@@ -3685,8 +3734,8 @@ extension InkOSCore {
     if let maxTokens { message += "（\(maxTokens)）" }
     message += " 处被截断。"
     message += reasoningCharacters > 0
-      ? "该模型是推理模型，reasoning_content 与正文共用同一预算；请在设置中调大「最大 token」，或改用非推理模型。"
-      : "请在设置中调大「最大 token」。"
+      ? "该模型是推理模型，reasoning_content 与正文共用同一预算；请在设置中调大「最大输出 token」，或改用非推理模型。"
+      : "请在设置中调大「最大输出 token」。"
     // 422 keeps this out of the transient retry set below: the outcome is fixed
     // by the prompt and the budget, so a second attempt only burns time.
     return InkOSCoreError(message, statusCode: 422)
